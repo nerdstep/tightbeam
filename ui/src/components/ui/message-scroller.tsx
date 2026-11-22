@@ -40,7 +40,9 @@ function MessageScrollerViewport({
     <MessageScrollerPrimitive.Viewport
       data-slot="message-scroller-viewport"
       className={cn(
-        'size-full min-h-0 min-w-0 scroll-fade-b scrollbar-thin scrollbar-gutter-stable overflow-y-auto overscroll-contain contain-content data-autoscrolling:scrollbar-thumb-transparent data-autoscrolling:scrollbar-track-transparent data-pending-scroll:invisible',
+        // Tightbeam: the scrollbar stays visible during auto-scroll (upstream hides it,
+        // which flashes when sending).
+        'size-full min-h-0 min-w-0 scroll-fade-b scrollbar-thin scrollbar-gutter-stable overflow-y-auto overscroll-contain contain-content data-pending-scroll:invisible',
         className,
       )}
       {...props}
@@ -71,7 +73,9 @@ function MessageScrollerItem({
       data-slot="message-scroller-item"
       scrollAnchor={scrollAnchor}
       className={cn(
-        'min-w-0 shrink-0 [contain-intrinsic-size:auto_10rem] [content-visibility:auto]',
+        // Tightbeam: no content-visibility. It skips painting off-screen rows, so a fast
+        // wheel flick shows blank rows until they catch up.
+        'min-w-0 shrink-0',
         className,
       )}
       {...props}

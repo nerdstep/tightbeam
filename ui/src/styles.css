@@ -1,7 +1,8 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/geist";
+@import "@fontsource-variable/oxanium";
+@import "@fontsource-variable/dm-sans";
 
 /* Dark mode follows the system setting. */
 @custom-variant dark (@media (prefers-color-scheme: dark));
@@ -32,6 +33,8 @@
   --ring: #1f6f8b;
   --success: #1f9d6b;
   --warning: #b7791f;
+  --scrollbar-thumb: #c5c9d8;
+  --scrollbar-thumb-hover: #a6abc2;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -56,12 +59,14 @@
     --ring: #7fe3ff;
     --success: #4fd6a0;
     --warning: #ffb86b;
+    --scrollbar-thumb: #2e3354;
+    --scrollbar-thumb-hover: #454c7a;
   }
 }
 
 @theme inline {
-  --font-sans: "Geist Variable", system-ui, sans-serif;
-  --font-heading: var(--font-sans);
+  --font-sans: "DM Sans Variable", system-ui, sans-serif;
+  --font-heading: "Oxanium Variable", var(--font-sans);
   --font-mono: ui-monospace, "Cascadia Mono", Menlo, monospace;
 
   --color-background: var(--background);
@@ -105,5 +110,34 @@
   }
   body {
     @apply overflow-hidden bg-background font-sans text-foreground antialiased;
+  }
+  h1,
+  h2,
+  h3 {
+    @apply font-heading;
+  }
+
+  /* Scrollbars in the theme's colors. Chromium (Windows) uses the standard property;
+     WebKit on macOS doesn't support it yet, so it gets the -webkit- pseudo-elements. */
+  * {
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+  }
+  @supports not (scrollbar-color: auto) {
+    ::-webkit-scrollbar {
+      width: 10px;
+      height: 10px;
+    }
+    ::-webkit-scrollbar-track {
+      background: transparent;
+    }
+    ::-webkit-scrollbar-thumb {
+      border: 3px solid transparent;
+      border-radius: 9999px;
+      background-color: var(--scrollbar-thumb);
+      background-clip: content-box;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background-color: var(--scrollbar-thumb-hover);
+    }
   }
 }

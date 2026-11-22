@@ -1,4 +1,5 @@
 import { shallow, useSelector } from '@tanstack/react-store'
+import { useVirtualizer } from '@tanstack/react-virtual'
 import { memo, useEffect, useRef, useState } from 'react'
 
 import { api, type Message as ChatMessage } from '@/api'
@@ -21,7 +22,6 @@ import {
   MessageScroller,
   MessageScrollerButton,
   MessageScrollerContent,
-  MessageScrollerItem,
   MessageScrollerProvider,
   MessageScrollerViewport,
   useMessageScroller,
@@ -33,7 +33,7 @@ import { addMessage, loadOlder, messageKey, run, store } from '@/store'
 /** Paired: the conversation. */
 export function Chat() {
   return (
-    <MessageScrollerProvider autoScroll defaultScrollPosition="end">
+    <MessageScrollerProvider defaultScrollPosition="end">
       <section className="flex h-full flex-col">
         <Header />
         <Transcript />
@@ -80,31 +80,6 @@ function Transcript() {
     }),
     { compare: shallow },
   )
-  const viewportRef = useRef<HTMLDivElement>(null)
-  const sentinelRef = useRef<HTMLDivElement>(null)
-
-  // Load older pages as the top comes into view (600px early, so it's usually ready
-  // before you get there).
-  const topVisibleRef = useRef(false)
-  useEffect(() => {
-    const sentinel = sentinelRef.current
-    if (!sentinel || !hasOlder) return undefined
-    const observer = new IntersectionObserver(
-      (entries) => {
-        topVisibleRef.current = entries.some((e) => e.isIntersecting)
-        if (topVisibleRef.current) void loadOlder()
-      },
-      { root: viewportRef.current, rootMargin: '600px 0px 0px 0px' },
-    )
-    observer.observe(sentinel)
-    return () => observer.disconnect()
-  }, [hasOlder])
-
-  // The observer only reports changes, so if a page finished loading and the top is
-  // still in view (a short page, or a tall window), load the next one.
-  useEffect(() => {
-    if (!loadingOlder && hasOlder && topVisibleRef.current) void loadOlder()
-  }, [loadingOlder, hasOlder])
 
   if (messages.length === 0) {
     return (
@@ -113,66 +88,162 @@ function Transcript() {
       </div>
     )
   }
+  return (
+    <VirtualTranscript
+      messages={messages}
+      hasOlder={hasOlder}
+      loadingOlder={loadingOlder}
+      myId={myId}
+      peerHas={peerHas}
+    />
+  )
+}
+
+/** Rows within this many of the oldest loaded one trigger loading the previous page. */
+const LOAD_OLDER_WITHIN = 15
+
+/**
+ * The transcript, virtualized: only the rows on screen (plus `overscan` either side)
+ * are in the DOM, so a long scroll-back costs the same as a short one.
+ *
+ * TanStack Virtual owns the rows: `anchorTo: 'end'` keeps the row you're reading in
+ * place when older pages are added above, and `followOnAppend` follows new messages
+ * while you're at the bottom. The Message Scroller provides the frame: the initial
+ * jump to the end and the jump-to-latest button.
+ */
+function VirtualTranscript({
+  messages,
+  hasOlder,
+  loadingOlder,
+  myId,
+  peerHas,
+}: {
+  messages: ChatMessage[]
+  hasOlder: boolean
+  loadingOlder: boolean
+  myId: string
+  peerHas: number
+}) {
+  const viewportRef = useRef<HTMLDivElement>(null)
+  // Ignore the first renders: before the initial jump to the end, the top rows are
+  // "visible" and would trigger a pointless page load.
+  const scrolledRef = useRef(false)
+
+  // useVirtualizer returns a mutable instance by design. That only matters to the React
+  // Compiler (not used here); the memoized rows get plain values, never the instance.
+  // oxlint-disable-next-line react/incompatible-library
+  const virtualizer = useVirtualizer({
+    count: messages.length,
+    getScrollElement: () => viewportRef.current,
+    estimateSize: () => 48,
+    getItemKey: (index) => messageKey(messages[index]),
+    overscan: 12,
+    anchorTo: 'end',
+    followOnAppend: true,
+  })
+  const items = virtualizer.getVirtualItems()
+  const firstIndex = items[0]?.index ?? 0
+
+  useEffect(() => {
+    if (scrolledRef.current && hasOlder && !loadingOlder && firstIndex < LOAD_OLDER_WITHIN) {
+      void loadOlder()
+    }
+  }, [firstIndex, hasOlder, loadingOlder])
 
   return (
     <MessageScroller className="flex-1">
-      <MessageScrollerViewport ref={viewportRef}>
-        <MessageScrollerContent className="gap-1 px-4 py-4">
-          {hasOlder && (
-            <div ref={sentinelRef} className="flex justify-center py-2">
-              {loadingOlder && <Spinner className="text-muted-foreground" />}
-            </div>
-          )}
-          {messages.map((m, i) => (
-            <MessageScrollerItem key={messageKey(m)} messageId={messageKey(m)}>
-              <Row
-                message={m}
-                mine={m.author === myId}
-                delivered={m.author === myId && m.seq <= peerHas}
-                newDay={i === 0 || dayOf(messages[i - 1]) !== dayOf(m)}
-              />
-            </MessageScrollerItem>
-          ))}
+      <MessageScrollerViewport
+        ref={viewportRef}
+        preserveScrollOnPrepend={false}
+        onScroll={() => (scrolledRef.current = true)}
+      >
+        <MessageScrollerContent className="block min-h-full px-4 pt-2 pb-4">
+          <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+            {items.map((item) => {
+              const m = messages[item.index]
+              const prev = messages[item.index - 1]
+              const next = messages[item.index + 1]
+              return (
+                <div
+                  key={item.key}
+                  ref={virtualizer.measureElement}
+                  data-index={item.index}
+                  className="absolute start-0 top-0 w-full"
+                  style={{ transform: `translateY(${item.start}px)` }}
+                >
+                  <Row
+                    message={m}
+                    mine={m.author === myId}
+                    delivered={m.author === myId && m.seq <= peerHas}
+                    newDay={!prev || dayOf(prev) !== dayOf(m)}
+                    groupStart={!prev || !sameGroup(prev, m)}
+                    groupEnd={!next || !sameGroup(m, next)}
+                  />
+                </div>
+              )
+            })}
+          </div>
         </MessageScrollerContent>
       </MessageScrollerViewport>
+      {loadingOlder && (
+        <Spinner className="absolute top-3 left-1/2 -translate-x-1/2 text-muted-foreground" />
+      )}
       <MessageScrollerButton />
     </MessageScroller>
   )
 }
 
-/** One message. Memoized: re-renders only when its own props change. */
+/** Consecutive messages from one person, close together in time, form a group. */
+const GROUP_GAP_MS = 5 * 60_000
+const sameGroup = (a: ChatMessage, b: ChatMessage) =>
+  a.author === b.author && b.ts - a.ts < GROUP_GAP_MS && dayOf(a) === dayOf(b)
+
+/**
+ * One message. Memoized: re-renders only when its own props change (for example its
+ * group ending because a new message arrived, or its delivery state).
+ */
 const Row = memo(function Row({
   message,
   mine,
   delivered,
   newDay,
+  groupStart,
+  groupEnd,
 }: {
   message: ChatMessage
   mine: boolean
   delivered: boolean
   newDay: boolean
+  /** First in its group: space above it. */
+  groupStart: boolean
+  /** Last in its group: show the time and delivery state under it. */
+  groupEnd: boolean
 }) {
   const when = new Date(message.ts)
   const align = mine ? 'end' : 'start'
   return (
-    <>
+    <div className={groupStart ? 'pt-3' : 'pt-0.5'}>
       {newDay && (
-        <Marker variant="separator" className="my-3 justify-center text-xs">
+        <Marker variant="separator" className="mt-1 mb-3 justify-center text-xs">
           {when.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })}
         </Marker>
       )}
       <Message align={align}>
-        <MessageContent className="gap-0.5">
+        <MessageContent className="gap-1">
           <Bubble variant={mine ? 'default' : 'secondary'} align={align}>
-            <BubbleContent className="whitespace-pre-wrap">{message.text}</BubbleContent>
+            <BubbleContent className="whitespace-pre-wrap" title={when.toLocaleString()}>
+              {message.text}
+            </BubbleContent>
           </Bubble>
-          <MessageFooter className="text-[11px] font-normal">
-            {when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
-            {mine && (delivered ? ' · delivered' : ' · waiting')}
-          </MessageFooter>
+          {groupEnd && (
+            <MessageFooter className="text-[11px] font-normal">
+              {when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+              {mine && (delivered ? ' · delivered' : ' · waiting')}
+            </MessageFooter>
+          )}
         </MessageContent>
       </Message>
-    </>
+    </div>
   )
 })
 
@@ -221,7 +292,7 @@ function Composer() {
         maxLength={4000}
         placeholder="Message"
         aria-label="Message"
-        className="max-h-36 min-h-9 resize-none"
+        className="max-h-36 min-h-9 resize-none py-1.5 text-sm"
         value={text}
         onChange={(e) => {
           setText(e.target.value)
@@ -234,7 +305,9 @@ function Composer() {
           }
         }}
       />
-      <Button type="submit">Send</Button>
+      <Button type="submit" size="lg">
+        Send
+      </Button>
     </form>
   )
 }

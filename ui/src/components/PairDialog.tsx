@@ -34,7 +34,7 @@ export function PairDialog({ prompt }: { prompt: PairPrompt }) {
               : 'Check that their screen shows this code, then they’ll accept.'}
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <div className="py-2 text-center font-mono text-3xl font-semibold tracking-[0.2em]">
+        <div className="py-2 text-center font-heading text-4xl font-semibold tracking-[0.15em] tabular-nums">
           {prompt.code}
         </div>
         <AlertDialogFooter>
