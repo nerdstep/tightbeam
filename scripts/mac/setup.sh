@@ -14,8 +14,6 @@ if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
 fi
 # shellcheck disable=SC1091
 source "$HOME/.cargo/env"
-# Both chips, so one universal app runs on Apple Silicon and Intel.
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
 if [ ! -x "$HOME/.bun/bin/bun" ]; then
   echo "Installing bun..."

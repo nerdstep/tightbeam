@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds a universal Tightbeam.app and puts it in /Users/Shared.
+# Builds Tightbeam.app for Apple Silicon and puts it in /Users/Shared.
 # Run from Windows with scripts/build-mac.ps1, or here with: bash scripts/mac/build.sh [branch]
 set -euo pipefail
 
@@ -16,9 +16,9 @@ echo "Building $(git log -1 --format='%h %s')"
 
 bun install --frozen-lockfile
 # .app only: making a .dmg needs the logged-in desktop session, which SSH doesn't have.
-bun tauri build --target universal-apple-darwin --bundles app
+bun tauri build --bundles app
 
-app="src-tauri/target/universal-apple-darwin/release/bundle/macos/Tightbeam.app"
+app="src-tauri/target/release/bundle/macos/Tightbeam.app"
 rm -rf /Users/Shared/Tightbeam.app
 cp -R "$app" /Users/Shared/
 echo

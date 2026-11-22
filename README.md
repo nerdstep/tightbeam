@@ -55,6 +55,6 @@ bun run fmt            # format
 
 ## Building for macOS
 
-Tauri can't build Mac apps from Windows. Mac builds run on a Mac over SSH: `scripts/setup-mac.ps1` prepares it once, and `scripts/build-mac.ps1` builds a universal `.app` from GitHub. Both expect an SSH alias named `mac-mini`.
+Tauri can't build Mac apps from Windows. Mac builds run on a Mac over SSH: `scripts/setup-mac.ps1` prepares it once, and `scripts/build-mac.ps1` builds the `.app` (Apple Silicon) from GitHub. Both expect an SSH alias named `mac-mini`.
 
 `src-tauri/Info.plist` declares the mDNS service and a Local Network usage reason. Without them, macOS silently blocks discovery.
