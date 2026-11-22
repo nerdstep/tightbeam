@@ -53,8 +53,8 @@ bun run fmt            # format
 
 **Start over.** Delete the app's data folder: `%APPDATA%\chat.tightbeam.desktop` on Windows, `~/Library/Application Support/chat.tightbeam.desktop` on macOS.
 
-## macOS notes
+## Building for macOS
 
-- The Mac version has to be built on a Mac. Tauri can't build it from Windows.
-- `src-tauri/Info.plist` declares the mDNS service and a Local Network usage reason. Without them, macOS silently blocks discovery.
-- The app is unsigned, so the first launch needs right-click → Open.
+Tauri can't build Mac apps from Windows. Mac builds run on a Mac over SSH: `scripts/setup-mac.ps1` prepares it once, and `scripts/build-mac.ps1` builds a universal `.app` from GitHub. Both expect an SSH alias named `mac-mini`.
+
+`src-tauri/Info.plist` declares the mDNS service and a Local Network usage reason. Without them, macOS silently blocks discovery.
