@@ -1,0 +1,44 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [
+    "eslint",
+    "typescript",
+    "unicorn",
+    "oxc",
+    "import",
+    "react",
+    "jsx-a11y"
+  ],
+  "categories": {
+    "correctness": "error",
+    //"nursery": "warn",
+    //"pedantic": "warn",
+    //"perf": "warn",
+    //"restriction": "warn",
+    //"style": "warn",
+    "suspicious": "error"
+  },
+  "options": {
+    "reportUnusedDisableDirectives": "error",
+    // Type information comes from tsrs. One run lets disable directives for
+    // type-aware rules count as used.
+    "typeAware": true
+  },
+  "rules": {
+    // Preact's automatic JSX runtime: no React import needed.
+    "react/react-in-jsx-scope": "off",
+    // Desktop app: we only move focus on first launch or right after the user asked
+    // (clicking "change"), which is what people expect.
+    "jsx-a11y/no-autofocus": "off",
+    // Vite loads stylesheets through side-effect imports (`import './styles.css'`).
+    "import/no-unassigned-import": ["error", { "allow": ["**/*.css"] }]
+  },
+  "env": {
+    "builtin": true,
+    "browser": true
+  },
+  "ignorePatterns": [
+    "dist/**",
+    "src-tauri/**"
+  ]
+}

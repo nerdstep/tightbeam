@@ -1,0 +1,29 @@
+{
+  "name": "tightbeam",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "lint": "oxlint",
+    "fmt": "oxfmt ui vite.config.ts",
+    "fmt:check": "oxfmt --check ui vite.config.ts",
+    "check": "tsc --noEmit && oxlint && oxfmt --check ui vite.config.ts",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@preact/signals": "^2.11.4",
+    "@tauri-apps/api": "^2.12.5",
+    "preact": "^11.2.0"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
+    "@tailwindcss/vite": "^4.3.5",
+    "oxfmt": "^0.79.0",
+    "oxlint": "^1.94.0",
+    "tailwindcss": "^4.3.5",
+    "tsrs": "7.1.0-beta.tsrs4",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  }
+}

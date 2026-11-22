@@ -18,23 +18,34 @@ Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https:/
 ## Layout
 
 ```text
-ui/                  the interface (plain HTML/CSS/JS, no build step)
-src-tauri/src/chat.rs  the engine: discovery, pairing, protocol, sync
-src-tauri/src/db.rs    SQLite storage
-src-tauri/src/lib.rs   Tauri commands and events
-src-tauri/tests/       two real engines pairing and chatting on one machine
-prototype/           the original Node/browser proof of concept
+ui/src/api.ts           typed wrappers for the Rust commands, plus the shared types
+ui/src/store.ts         app state (Preact signals), fed by events from Rust
+ui/src/components/      the screens: Setup, Pair, Chat, PairDialog, Notice
+src-tauri/src/chat.rs   the engine: discovery, pairing, protocol, sync
+src-tauri/src/db.rs     SQLite storage
+src-tauri/src/lib.rs    Tauri commands and events
+src-tauri/tests/        two real engines pairing and chatting on one machine
 ```
+
+The UI is Preact + TypeScript + Tailwind v4, built with Vite. Theme colors are tokens in `ui/src/styles.css` (`bg-canvas`, `text-ink`, `border-line`, …), with dark-mode values that follow the system.
 
 ## Develop
 
-Needs Rust (via rustup) and the Tauri CLI (`cargo install tauri-cli --version "^2" --locked`).
+Needs Rust (via rustup), the Tauri CLI (`cargo install tauri-cli --version "^2" --locked`) and bun.
 
 ```powershell
+bun install            # once
 cd src-tauri
-cargo tauri dev        # run the app
+cargo tauri dev        # run the app; the UI hot-reloads as you edit
 cargo test             # run the two-peer test (about 5 seconds)
 cargo tauri build      # make an installer in target/release/bundle/
+```
+
+For the TypeScript, from the project root:
+
+```powershell
+bun run check          # type-check, lint (oxlint) and format check (oxfmt)
+bun run fmt            # format
 ```
 
 **Two copies on one PC.** From the project root, run `.\scripts\two-windows.ps1` (add `-Fresh` to start over). It gives each copy its own data folder and uses loopback, because Windows refuses to send from a machine's LAN address to that same address. Close any running Tightbeam first.

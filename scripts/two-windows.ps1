@@ -14,7 +14,9 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 Push-Location (Join-Path $root 'src-tauri')
 try {
-    cargo build
+    # Builds the UI (bun run build) and a debug app that loads it from disk rather than
+    # the Vite dev server, so the windows work on their own.
+    cargo tauri build --debug --no-bundle
     if ($LASTEXITCODE) { throw 'Build failed (is Tightbeam still running?)' }
 } finally {
     Pop-Location

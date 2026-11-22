@@ -4,10 +4,12 @@
   "version": "0.1.0",
   "identifier": "chat.tightbeam.desktop",
   "build": {
-    "frontendDist": "../ui"
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist",
+    "beforeDevCommand": "bun run dev",
+    "beforeBuildCommand": "bun run build"
   },
   "app": {
-    "withGlobalTauri": true,
     "windows": [
       {
         "title": "Tightbeam",
@@ -18,7 +20,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost"
+      "csp": "default-src 'self' ipc: http://ipc.localhost",
+      "devCsp": "default-src 'self' ipc: http://ipc.localhost ws://localhost:1420; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {
