@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the macOS app bundle by Tauri. Without these, macOS silently blocks
+     local network discovery. -->
+<plist version="1.0">
+<dict>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Tightbeam finds and talks to the person you've paired with on this network.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_tightbeam._udp</string>
+  </array>
+</dict>
+</plist>

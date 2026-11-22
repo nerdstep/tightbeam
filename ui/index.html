@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tightbeam</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div id="notice" class="notice" hidden>
+    <span id="notice-text"></span>
+    <button id="notice-close" class="link" aria-label="Dismiss">Dismiss</button>
+  </div>
+
+  <!-- 1. First launch: choose a name -->
+  <section id="setup" class="screen center" hidden>
+    <img src="icon.svg" alt="" class="logo">
+    <h1>Tightbeam</h1>
+    <p class="muted">A private line between two people on the same network.</p>
+    <form id="name-form" class="stack">
+      <label for="name-input">Your name</label>
+      <input id="name-input" maxlength="40" autocomplete="nickname" required>
+      <button class="primary">Continue</button>
+    </form>
+  </section>
+
+  <!-- 2. Not paired yet: find the other person -->
+  <section id="pair" class="screen" hidden>
+    <header class="bar">
+      <h1>Pair</h1>
+      <span class="muted small">You're <b id="pair-me"></b> · <button id="rename" class="link">change</button></span>
+    </header>
+    <div class="pad">
+      <p class="muted">Ask the other person to open Tightbeam on the same network. They'll appear here.</p>
+      <ul id="nearby" class="nearby"></ul>
+      <p id="nearby-empty" class="searching">Looking for people nearby…</p>
+    </div>
+  </section>
+
+  <!-- 3. Paired: chat -->
+  <section id="chat" class="screen" hidden>
+    <header class="bar">
+      <div>
+        <h1 id="peer-name"></h1>
+        <span id="link" class="link-status"></span>
+      </div>
+      <button id="unpair" class="link small">Unpair</button>
+    </header>
+    <main id="log" class="log" aria-live="polite"></main>
+    <form id="compose" class="compose">
+      <textarea id="text" rows="1" maxlength="4000" placeholder="Message" required></textarea>
+      <button class="primary" aria-label="Send">Send</button>
+    </form>
+  </section>
+
+  <!-- Pairing prompt (either direction) -->
+  <div id="dialog" class="overlay" hidden>
+    <div class="dialog stack" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+      <h2 id="dialog-title"></h2>
+      <p id="dialog-body" class="muted"></p>
+      <div id="dialog-code" class="code"></div>
+      <div class="row">
+        <button id="dialog-no"></button>
+        <button id="dialog-yes" class="primary">Pair</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
