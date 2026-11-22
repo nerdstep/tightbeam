@@ -1,9 +1,14 @@
-import { render } from 'preact'
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
 
 import { App } from './App'
-import { error, start } from './store'
+import { start, store } from './store'
 
 import './styles.css'
 
-render(<App />, document.getElementById('app')!)
-start().catch((e) => (error.value = String(e)))
+createRoot(document.getElementById('app')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+start().catch((e) => store.setState((s) => ({ ...s, error: String(e) })))

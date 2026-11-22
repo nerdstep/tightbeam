@@ -30,7 +30,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::db::{Db, Message};
+use crate::db::{Cursor, Db, Message, Page};
 
 pub const ALPN: &[u8] = b"tightbeam/1";
 /// mDNS service name, so we only see other Tightbeam apps (`_tightbeam._udp.local`).
@@ -247,8 +247,13 @@ impl Core {
         }
     }
 
+    /// The whole history, oldest first. The UI uses `page` instead.
     pub fn messages(&self) -> Result<Vec<Message>> {
         self.db().all()
+    }
+
+    pub fn page(&self, before: Option<&Cursor>, limit: usize) -> Result<Page> {
+        self.db().page(before, limit)
     }
 
     // ---- Actions from the UI -------------------------------------------------------

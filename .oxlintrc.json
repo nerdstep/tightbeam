@@ -38,6 +38,7 @@
     "browser": true
   },
   "ignorePatterns": [
+    "ui/src/components/ui/**",
     "dist/**",
     "src-tauri/**"
   ]

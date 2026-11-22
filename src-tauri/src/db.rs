@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Message {
@@ -15,6 +15,22 @@ pub struct Message {
     /// Milliseconds since the Unix epoch, from the author's clock.
     pub ts: i64,
     pub text: String,
+}
+
+/// A position in display order (`ts`, then `author`, then `seq`): page before this message.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Cursor {
+    pub ts: i64,
+    pub author: String,
+    pub seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Page {
+    /// Oldest first.
+    pub messages: Vec<Message>,
+    /// Whether there are messages older than the first one here.
+    pub has_more: bool,
 }
 
 pub struct Db(Connection);
@@ -34,9 +50,34 @@ impl Db {
                  ts     INTEGER NOT NULL,
                  text   TEXT    NOT NULL,
                  PRIMARY KEY (author, seq)
-             );",
+             );
+             -- Display order, for paging through history.
+             CREATE INDEX IF NOT EXISTS messages_by_time ON messages (ts, author, seq);",
         )?;
         Ok(Self(conn))
+    }
+
+    /// Up to `limit` messages before `before` in display order (or the newest, if `None`),
+    /// returned oldest first, plus whether anything older remains.
+    pub fn page(&self, before: Option<&Cursor>, limit: usize) -> Result<Page> {
+        let fetch = limit as i64 + 1; // one extra row tells us whether there's more
+        let mut messages = match before {
+            Some(c) => self.query(
+                "SELECT author, seq, ts, text FROM messages
+                 WHERE (ts, author, seq) < (?1, ?2, ?3)
+                 ORDER BY ts DESC, author DESC, seq DESC LIMIT ?4",
+                params![c.ts, c.author, c.seq as i64, fetch],
+            )?,
+            None => self.query(
+                "SELECT author, seq, ts, text FROM messages
+                 ORDER BY ts DESC, author DESC, seq DESC LIMIT ?1",
+                params![fetch],
+            )?,
+        };
+        let has_more = messages.len() > limit;
+        messages.truncate(limit);
+        messages.reverse();
+        Ok(Page { messages, has_more })
     }
 
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -81,6 +122,14 @@ impl Db {
             params![m.author, m.seq as i64, m.ts, m.text],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Stores many messages in one transaction (for tests and seeding).
+    pub fn insert_many(&self, messages: &[Message]) -> Result<()> {
+        self.0.execute_batch("BEGIN")?;
+        let result = messages.iter().try_for_each(|m| self.insert(m).map(drop));
+        self.0.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+        result
     }
 
     /// Messages by `author` with a sequence number above `after`, oldest first.

@@ -4,7 +4,7 @@ pub mod db;
 use std::{path::PathBuf, sync::Arc};
 
 use chat::{Core, Emit, Status};
-use db::Message;
+use db::{Cursor, Message, Page};
 use tauri::{Emitter, Manager, State};
 
 type CoreState<'a> = State<'a, Arc<Core>>;
@@ -18,9 +18,11 @@ fn get_status(core: CoreState) -> Status {
     core.status()
 }
 
+/// A page of history: the newest messages, or those before `before`. Oldest first.
 #[tauri::command]
-fn get_messages(core: CoreState) -> Result<Vec<Message>, String> {
-    core.messages().map_err(err)
+fn get_messages(core: CoreState, before: Option<Cursor>, limit: Option<usize>) -> Result<Page, String> {
+    let limit = limit.unwrap_or(200).clamp(1, 1000);
+    core.page(before.as_ref(), limit).map_err(err)
 }
 
 #[tauri::command]

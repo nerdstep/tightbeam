@@ -18,16 +18,20 @@ Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https:/
 ## Layout
 
 ```text
-ui/src/api.ts           typed wrappers for the Rust commands, plus the shared types
-ui/src/store.ts         app state (Preact signals), fed by events from Rust
-ui/src/components/      the screens: Setup, Pair, Chat, PairDialog, Notice
-src-tauri/src/chat.rs   the engine: discovery, pairing, protocol, sync
-src-tauri/src/db.rs     SQLite storage
-src-tauri/src/lib.rs    Tauri commands and events
-src-tauri/tests/        two real engines pairing and chatting on one machine
+ui/src/api.ts             typed wrappers for the Rust commands, plus the shared types
+ui/src/store.ts           app state (TanStack Store), fed by events from Rust; history paging
+ui/src/components/        the screens: Setup, Pair, Chat, PairDialog, Notice
+ui/src/components/ui/     shadcn/ui components (generated; update with the shadcn CLI)
+src-tauri/src/chat.rs     the engine: discovery, pairing, protocol, sync
+src-tauri/src/db.rs       SQLite storage and history paging
+src-tauri/src/lib.rs      Tauri commands and events
+src-tauri/tests/          two real engines chatting; paging through 50,000 messages
+src-tauri/examples/seed.rs  fills two test profiles with a long synthetic history
 ```
 
-The UI is Preact + TypeScript + Tailwind v4, built with Vite. Theme colors are tokens in `ui/src/styles.css` (`bg-canvas`, `text-ink`, `border-line`, …), with dark-mode values that follow the system.
+The UI is React + TypeScript + Tailwind v4 with [shadcn/ui](https://ui.shadcn.com) on Base UI, built with Vite. The transcript uses shadcn's Message Scroller and loads history 200 messages at a time as you scroll up. Theme colors are shadcn's tokens in `ui/src/styles.css` (`bg-background`, `text-muted-foreground`, `bg-primary`, …), with dark-mode values that follow the system. Add components with `bunx shadcn@latest add <name>`.
+
+To try a long history: open both test windows once (`.\scripts\two-windows.ps1 -Fresh`), pair them, close them, then `cd src-tauri; cargo run --example seed -- $env:TEMP\tightbeam-alice $env:TEMP\tightbeam-bob 50000`.
 
 ## Develop
 

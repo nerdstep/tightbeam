@@ -37,11 +37,22 @@ export interface Message {
   text: string
 }
 
+/** A position in display order; a page loads the messages before it. */
+export type Cursor = Pick<Message, 'ts' | 'author' | 'seq'>
+
+export interface Page {
+  /** Oldest first. */
+  messages: Message[]
+  /** Whether there are messages older than the first one. */
+  has_more: boolean
+}
+
 export type CoreEvent = { kind: 'status'; data: Status } | { kind: 'message'; data: Message }
 
 export const api = {
   getStatus: () => invoke<Status>('get_status'),
-  getMessages: () => invoke<Message[]>('get_messages'),
+  getMessages: (before?: Cursor, limit?: number) =>
+    invoke<Page>('get_messages', { before: before ?? null, limit: limit ?? null }),
   setName: (name: string) => invoke<void>('set_name', { name }),
   sendMessage: (text: string) => invoke<Message>('send_message', { text }),
   pairWith: (id: string) => invoke<void>('pair_with', { id }),

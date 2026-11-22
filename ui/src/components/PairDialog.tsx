@@ -1,52 +1,51 @@
-import { useEffect, useRef } from 'preact/hooks'
-
-import { api, type PairPrompt } from '../api'
-import { run } from '../store'
+import { api, type PairPrompt } from '@/api'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { run } from '@/store'
 
 /** Pairing in progress, either direction. Both sides show the same code. Esc declines. */
 export function PairDialog({ prompt }: { prompt: PairPrompt }) {
-  const dialogRef = useRef<HTMLDialogElement>(null)
   const who = prompt.name || 'Someone'
 
-  useEffect(() => {
-    const dialog = dialogRef.current
-    dialog?.showModal()
-    return () => dialog?.close()
-  }, [])
-
   return (
-    <dialog
-      ref={dialogRef}
-      aria-labelledby="pair-title"
-      class="m-auto w-[calc(100%-2rem)] max-w-85 rounded-2xl border border-line bg-panel p-5 text-ink backdrop:bg-black/45"
-      onCancel={(e) => {
-        e.preventDefault()
-        void run(api.answerPair(false))
+    <AlertDialog
+      open
+      onOpenChange={(open) => {
+        // Cancel, Decline and Esc all close the dialog.
+        if (!open) void run(api.answerPair(false))
       }}
     >
-      <div class="flex flex-col gap-2.5">
-        <h2 id="pair-title" class="text-lg font-semibold">
-          {prompt.incoming ? `${who} wants to pair` : `Waiting for ${who}`}
-        </h2>
-        <p class="text-muted">
-          {prompt.incoming
-            ? 'Only accept if their screen shows the same code.'
-            : 'Check that their screen shows this code, then they’ll accept.'}
-        </p>
-        <div class="py-2.5 text-center font-mono text-3xl font-semibold tracking-[3px]">
+      <AlertDialogContent size="sm">
+        <AlertDialogHeader>
+          <AlertDialogTitle>
+            {prompt.incoming ? `${who} wants to pair` : `Waiting for ${who}`}
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            {prompt.incoming
+              ? 'Only accept if their screen shows the same code.'
+              : 'Check that their screen shows this code, then they’ll accept.'}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <div className="py-2 text-center font-mono text-3xl font-semibold tracking-[0.2em]">
           {prompt.code}
         </div>
-        <div class="flex justify-end gap-2">
-          <button class="btn" onClick={() => void run(api.answerPair(false))}>
-            {prompt.incoming ? 'Decline' : 'Cancel'}
-          </button>
+        <AlertDialogFooter>
+          <AlertDialogCancel>{prompt.incoming ? 'Decline' : 'Cancel'}</AlertDialogCancel>
           {prompt.incoming && (
-            <button class="btn-primary" autoFocus onClick={() => void run(api.answerPair(true))}>
+            <AlertDialogAction autoFocus onClick={() => void run(api.answerPair(true))}>
               Pair
-            </button>
+            </AlertDialogAction>
           )}
-        </div>
-      </div>
-    </dialog>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   )
 }

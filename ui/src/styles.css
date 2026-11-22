@@ -1,71 +1,109 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
 
-/* Light theme values; dark overrides below. Use as bg-canvas, text-ink, border-line, … */
-@theme {
-  --color-canvas: #f5f6fa;
-  --color-panel: #ffffff;
-  --color-ink: #171a2c;
-  --color-muted: #6b6f85;
-  --color-line: #e1e3ec;
-  --color-theirs: #ffffff;
-  --color-mine: #1f6f8b;
-  --color-on-mine: #ffffff;
-  --color-accent: #1f6f8b;
-  --color-on-accent: #ffffff;
-  --color-ok: #1f9d6b;
-  --color-warn: #b7791f;
+/* Dark mode follows the system setting. */
+@custom-variant dark (@media (prefers-color-scheme: dark));
 
-  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+/* shadcn tokens, with Tightbeam's palette. `primary` is also the color of your own
+   bubbles; `success` and `warning` are ours. */
+:root {
+  color-scheme: light dark;
+  --radius: 0.75rem;
+
+  --background: #f5f6fa;
+  --foreground: #171a2c;
+  --card: #ffffff;
+  --card-foreground: #171a2c;
+  --popover: #ffffff;
+  --popover-foreground: #171a2c;
+  --primary: #1f6f8b;
+  --primary-foreground: #ffffff;
+  --secondary: #ffffff;
+  --secondary-foreground: #171a2c;
+  --muted: #eceef4;
+  --muted-foreground: #6b6f85;
+  --accent: #e4eff3;
+  --accent-foreground: #171a2c;
+  --destructive: #c4322b;
+  --border: #e1e3ec;
+  --input: #d9dce7;
+  --ring: #1f6f8b;
+  --success: #1f9d6b;
+  --warning: #b7791f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0b0d1a;
+    --foreground: #e8eaf5;
+    --card: #14172b;
+    --card-foreground: #e8eaf5;
+    --popover: #14172b;
+    --popover-foreground: #e8eaf5;
+    --primary: #2b7a96;
+    --primary-foreground: #f4fbff;
+    --secondary: #1b1f38;
+    --secondary-foreground: #e8eaf5;
+    --muted: #1b1f38;
+    --muted-foreground: #8c90aa;
+    --accent: #1f2645;
+    --accent-foreground: #e8eaf5;
+    --destructive: #ff6b5e;
+    --border: #262a45;
+    --input: #2e3354;
+    --ring: #7fe3ff;
+    --success: #4fd6a0;
+    --warning: #ffb86b;
+  }
+}
+
+@theme inline {
+  --font-sans: "Geist Variable", system-ui, sans-serif;
+  --font-heading: var(--font-sans);
   --font-mono: ui-monospace, "Cascadia Mono", Menlo, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
 }
 
 @layer base {
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --color-canvas: #0b0d1a;
-      --color-panel: #14172b;
-      --color-ink: #e8eaf5;
-      --color-muted: #8c90aa;
-      --color-line: #262a45;
-      --color-theirs: #1b1f38;
-      --color-mine: #2b7a96;
-      --color-on-mine: #f4fbff;
-      --color-accent: #7fe3ff;
-      --color-on-accent: #0b0d1a;
-      --color-ok: #4fd6a0;
-      --color-warn: #ffb86b;
-    }
+  * {
+    @apply border-border outline-ring/50;
   }
-
-  :root {
-    color-scheme: light dark;
-  }
-
   html,
   body,
   #app {
     height: 100%;
   }
-
   body {
-    @apply bg-canvas text-ink font-sans text-[15px] leading-normal overflow-hidden;
+    @apply overflow-hidden bg-background font-sans text-foreground antialiased;
   }
-
-  :focus-visible {
-    @apply outline-2 outline-offset-2 outline-accent;
-  }
-}
-
-/* Shared controls. @utility (not @layer) so they compose with other utilities. */
-@utility btn {
-  @apply rounded-lg border border-line bg-panel px-3.5 py-2 cursor-pointer disabled:opacity-50 disabled:cursor-default;
-}
-@utility btn-primary {
-  @apply btn border-accent bg-accent text-on-accent font-semibold;
-}
-@utility btn-link {
-  @apply cursor-pointer text-accent hover:underline;
-}
-@utility field {
-  @apply w-full rounded-lg border border-line bg-panel px-3 py-2;
 }

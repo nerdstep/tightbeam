@@ -1,42 +1,68 @@
-import { useState } from 'preact/hooks'
+import { shallow, useSelector } from '@tanstack/react-store'
+import { useState } from 'react'
 
-import { api } from '../api'
-import { run, status } from '../store'
+import { api } from '@/api'
+import { Button } from '@/components/ui/button'
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
+import { Input } from '@/components/ui/input'
+import { Item, ItemActions, ItemContent, ItemGroup, ItemTitle } from '@/components/ui/item'
+import { Spinner } from '@/components/ui/spinner'
+import { run, store } from '@/store'
 
 /** Not paired yet: show who's nearby. */
 export function Pair() {
-  const s = status.value!
+  const { myName, nearby, busy } = useSelector(
+    store,
+    (s) => ({
+      myName: s.status?.me.name ?? '',
+      nearby: s.status?.nearby ?? [],
+      busy: !!s.status?.pairing,
+    }),
+    { compare: shallow },
+  )
 
   return (
-    <section class="flex h-full flex-col">
-      <header class="flex items-center justify-between gap-3 border-b border-line bg-panel px-4 py-3">
-        <h1 class="text-[17px] font-semibold">Pair</h1>
-        <Rename name={s.me.name} />
+    <section className="flex h-full flex-col">
+      <header className="flex items-center justify-between gap-3 border-b bg-card px-4 py-3">
+        <h1 className="font-semibold">Pair</h1>
+        <Rename name={myName} />
       </header>
-      <div class="flex flex-col gap-3.5 p-4">
-        <p class="text-muted">
-          Ask the other person to open Tightbeam on the same network. They’ll appear here.
-        </p>
-        <ul class="flex flex-col gap-2">
-          {s.nearby.map((p) => (
-            <li
-              key={p.id}
-              class="flex items-center justify-between rounded-xl border border-line bg-panel px-3 py-2.5"
-            >
-              <span>{p.name || 'Unnamed'}</span>
-              <button class="btn" disabled={!!s.pairing} onClick={() => run(api.pairWith(p.id))}>
-                Pair
-              </button>
-            </li>
-          ))}
-        </ul>
-        {s.nearby.length === 0 && (
-          <p class="flex items-center gap-2 text-muted">
-            <span class="size-2 animate-pulse rounded-full bg-accent" />
-            Looking for people nearby…
-          </p>
-        )}
-      </div>
+      {nearby.length === 0 ? (
+        <Empty>
+          <EmptyHeader>
+            <EmptyMedia>
+              <Spinner className="size-5" />
+            </EmptyMedia>
+            <EmptyTitle>Looking for people nearby</EmptyTitle>
+            <EmptyDescription>
+              Ask the other person to open Tightbeam on the same network. They’ll appear here.
+            </EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : (
+        <div className="flex flex-col gap-3 p-4">
+          <p className="text-sm text-muted-foreground">Nearby on this network:</p>
+          <ItemGroup className="gap-2">
+            {nearby.map((p) => (
+              <Item key={p.id} variant="outline" className="bg-card">
+                <ItemContent>
+                  <ItemTitle>{p.name || 'Unnamed'}</ItemTitle>
+                </ItemContent>
+                <ItemActions>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => void run(api.pairWith(p.id))}
+                  >
+                    Pair
+                  </Button>
+                </ItemActions>
+              </Item>
+            ))}
+          </ItemGroup>
+        </div>
+      )}
     </section>
   )
 }
@@ -48,40 +74,44 @@ function Rename({ name }: { name: string }) {
 
   if (!editing) {
     return (
-      <span class="text-[13px] text-muted">
-        You’re <b class="text-ink">{name}</b> ·{' '}
-        <button
-          class="btn-link"
+      <span className="text-sm text-muted-foreground">
+        You’re <b className="font-medium text-foreground">{name}</b> ·{' '}
+        <Button
+          variant="link"
+          size="sm"
+          className="h-auto px-0"
           onClick={() => {
             setDraft(name)
             setEditing(true)
           }}
         >
           change
-        </button>
+        </Button>
       </span>
     )
   }
 
   return (
     <form
-      class="flex items-center gap-2"
+      className="flex items-center gap-2"
       onSubmit={async (e) => {
         e.preventDefault()
         await run(api.setName(draft))
         setEditing(false)
       }}
     >
-      <input
-        class="field w-36 py-1 text-[13px]"
+      <Input
+        className="h-7 w-36"
         maxLength={40}
         autoFocus
         required
         value={draft}
-        onInput={(e) => setDraft(e.currentTarget.value)}
+        onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => e.key === 'Escape' && setEditing(false)}
       />
-      <button class="btn-link text-[13px]">Save</button>
+      <Button type="submit" size="sm">
+        Save
+      </Button>
     </form>
   )
 }

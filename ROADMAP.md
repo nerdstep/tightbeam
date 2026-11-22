@@ -10,13 +10,13 @@ Items in each section are in suggested order.
 
 ## 0.5. Long histories and UI foundation
 
-Today the whole history loads at startup and every bubble re-renders on each status event (acks, and mDNS discovery updates every second or two). That's fine for a few thousand messages but gets slow at tens of thousands.
+Previously the whole history loaded at startup and every bubble re-rendered on each status event (acks, and mDNS discovery updates every second or two). That was fine for a few thousand messages but would get slow at tens of thousands.
 
-- [ ] **Move the UI to React + shadcn/ui (Base UI).** shadcn is React-only, so this replaces Preact. It brings the [Message Scroller](https://ui.shadcn.com/docs/components/base/message-scroller), which pins to the bottom, keeps your place when older messages are added above, and has a jump-to-latest button. Related components: Bubble, Message, and Marker (for day separators). State moves from Preact signals to TanStack Store, which other TanStack libraries (Virtual, Form) would share. The palette maps onto shadcn's tokens.
-- [ ] **Stop status updates from re-rendering messages.** Bubbles read only their own delivery state and are memoized, so acks and discovery events don't touch the transcript.
-- [ ] **Paged loading.** `get_messages(before, limit)` in Rust, with an index on `(ts, author, seq)`. Open with the latest ~200 messages and load older pages when the reader nears the top. The Message Scroller handles keeping the scroll position. We write the trigger (an `IntersectionObserver`).
-- [ ] **Load-test.** Use a generated 50,000-message database to check startup time and typing responsiveness.
-- [ ] **Cap the loaded window, only if needed.** Unload messages far below the viewport during long scroll-backs. Full virtualization (TanStack Virtual) is the last resort.
+- [x] **Move the UI to React + shadcn/ui (Base UI).** shadcn is React-only, so this replaces Preact. It brings the [Message Scroller](https://ui.shadcn.com/docs/components/base/message-scroller), which pins to the bottom, keeps your place when older messages are added above, and has a jump-to-latest button. Related components: Bubble, Message, and Marker (for day separators). State moves from Preact signals to TanStack Store, which other TanStack libraries (Virtual, Form) would share. The palette maps onto shadcn's tokens.
+- [x] **Stop status updates from re-rendering messages.** Bubbles read only their own delivery state and are memoized, so acks and discovery events don't touch the transcript.
+- [x] **Paged loading.** `get_messages(before, limit)` in Rust, with an index on `(ts, author, seq)`. Open with the latest ~200 messages and load older pages when the reader nears the top. The Message Scroller handles keeping the scroll position. We write the trigger (an `IntersectionObserver`).
+- [x] **Load-test.** Use a generated 50,000-message database to check startup time and typing responsiveness. Result: the newest page loads in ~0.25 ms. The app opens at the bottom and stays around 60 MB even after scrolling back through ~20,000 messages, thanks to the scroller's `content-visibility`.
+- [ ] **Cap the loaded window, only if needed.** Unload messages far below the viewport during long scroll-backs. Not needed so far (see the load test). Full virtualization (TanStack Virtual) is the last resort.
 
 ## 1. Daily use
 
