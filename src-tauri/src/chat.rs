@@ -42,6 +42,10 @@ const PAIR_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
 
+/// Compatibility rules, since the two peers often run different builds:
+/// - New frame types are fine: older peers read them as `Unknown` and skip them.
+/// - New fields on existing frames must be `#[serde(default)]`; older peers ignore them.
+/// - Never change the meaning or type of an existing field. Add a new one instead.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Frame {
@@ -52,6 +56,9 @@ enum Frame {
     Hello { name: String, have: u64 },
     Msg { seq: u64, ts: i64, text: String },
     Ack { have: u64 },
+    /// A frame type from a newer version. Never sent.
+    #[serde(other, skip_serializing)]
+    Unknown,
 }
 
 /// Everything the UI needs except the message list.
@@ -632,6 +639,8 @@ impl Core {
                 }
                 Frame::Ack { have } => self.set_peer_has(have, false)?,
                 Frame::Hello { name, .. } => self.update_peer_name(&name)?,
+                // From a newer version of the app: skip it rather than drop the session.
+                Frame::Unknown => {}
                 other => bail!("unexpected frame mid-session: {other:?}"),
             }
         }
@@ -773,4 +782,34 @@ async fn read_frame(recv: &mut RecvStream) -> Result<Frame> {
     let mut body = vec![0u8; len];
     recv.read_exact(&mut body).await?;
     Ok(serde_json::from_slice(&body)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Frame {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn unknown_frame_types_parse_as_unknown() {
+        assert!(matches!(parse(r#"{"t":"typing"}"#), Frame::Unknown));
+        assert!(matches!(
+            parse(r#"{"t":"reaction","target":{"author":"x","seq":3},"emoji":"+1"}"#),
+            Frame::Unknown
+        ));
+    }
+
+    #[test]
+    fn extra_fields_on_known_frames_are_ignored() {
+        let frame = parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","reply_to":{"author":"x","seq":2}}"#);
+        assert!(matches!(frame, Frame::Msg { seq: 7, ref text, .. } if text == "hi"));
+    }
+
+    #[test]
+    fn known_frames_keep_their_wire_format() {
+        let json = serde_json::to_string(&Frame::Ack { have: 4 }).unwrap();
+        assert_eq!(json, r#"{"t":"ack","have":4}"#);
+    }
 }

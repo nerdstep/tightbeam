@@ -6,7 +6,7 @@ Items in each section are in suggested order.
 
 ## 0. Groundwork
 
-- [ ] **Ignore unknown frame types.** `read_loop` in `src-tauri/src/chat.rs` currently ends the session on any frame it doesn't recognize. Two peers will often run different builds, so any new frame type would break the connection to an older peer. Skip unknown frames instead (keep `Hello` / `PairRequest` strict). Do this before anything in sections 2 and 3 adds a frame type.
+- [x] **Ignore unknown frame types.** `read_loop` in `src-tauri/src/chat.rs` currently ends the session on any frame it doesn't recognize. Two peers will often run different builds, so any new frame type would break the connection to an older peer. Skip unknown frames instead (keep `Hello` / `PairRequest` strict). Do this before anything in sections 2 and 3 adds a frame type.
 
 ## 0.5. Long histories and UI foundation
 
