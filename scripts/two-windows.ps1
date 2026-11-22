@@ -5,18 +5,18 @@
 #   .\scripts\two-windows.ps1          reuse previous test data (stay paired)
 #   .\scripts\two-windows.ps1 -Fresh   start both from scratch
 #
-# Close any running Tightbeam first (including `cargo tauri dev`), or the build fails
+# Close any running Tightbeam first (including `bun tauri dev`), or the build fails
 # because Windows locks the running .exe.
 
 param([switch]$Fresh)
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent $PSScriptRoot
-Push-Location (Join-Path $root 'src-tauri')
+Push-Location $root
 try {
     # Builds the UI (bun run build) and a debug app that loads it from disk rather than
     # the Vite dev server, so the windows work on their own.
-    cargo tauri build --debug --no-bundle
+    bun tauri build --debug --no-bundle
     if ($LASTEXITCODE) { throw 'Build failed (is Tightbeam still running?)' }
 } finally {
     Pop-Location

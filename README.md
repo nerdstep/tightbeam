@@ -31,15 +31,16 @@ The UI is Preact + TypeScript + Tailwind v4, built with Vite. Theme colors are t
 
 ## Develop
 
-Needs Rust (via rustup), the Tauri CLI (`cargo install tauri-cli --version "^2" --locked`) and bun.
+Needs Rust (via rustup) and bun. The Tauri CLI comes with `bun install`.
 
 ```powershell
 bun install            # once
-cd src-tauri
-cargo tauri dev        # run the app; the UI hot-reloads as you edit
-cargo test             # run the two-peer test (about 5 seconds)
-cargo tauri build      # make an installer in target/release/bundle/
+bun tauri dev          # run the app; the UI hot-reloads as you edit
+bun tauri build        # make an installer in src-tauri/target/release/bundle/
+cd src-tauri; cargo test   # run the two-peer test (about 5 seconds)
 ```
+
+`bun run dev` alone starts only Vite. The UI needs the Tauri bridge, so it won't work in a regular browser.
 
 For the TypeScript, from the project root:
 
