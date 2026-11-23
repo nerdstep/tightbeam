@@ -69,6 +69,11 @@ enum Frame {
     Ack {
         have: u64,
     },
+    /// `up_to` = the highest of your sequence numbers I've seen. Sent at the start of
+    /// each session and whenever it grows. Added in 0.3; older peers skip it.
+    Seen {
+        up_to: u64,
+    },
     /// A frame type from a newer version. Never sent.
     #[serde(other, skip_serializing)]
     Unknown,
@@ -82,6 +87,8 @@ pub struct Status {
     pub connected: bool,
     /// Highest of my sequence numbers the peer has confirmed. Mine at or below are delivered.
     pub peer_has: u64,
+    /// Highest of my sequence numbers the peer has seen. Mine at or below are seen.
+    pub peer_seen: u64,
     pub nearby: Vec<Person>,
     pub pairing: Option<PairPrompt>,
     pub notice: Option<String>,
@@ -130,6 +137,9 @@ struct State {
     name: String,
     peer: Option<(EndpointId, String)>,
     peer_has: u64,
+    peer_seen: u64,
+    /// Highest of the peer's sequence numbers I've seen; what our `Seen` frames say.
+    seen: u64,
     nearby: BTreeMap<String, String>,
     pairing: Option<Pairing>,
     session: Option<Session>,
@@ -184,7 +194,10 @@ impl Core {
             (Some(id), name) => Some((id.parse()?, name.unwrap_or_default())),
             _ => None,
         };
-        let peer_has = db.get_str("peer_has")?.and_then(|s| s.parse().ok()).unwrap_or(0);
+        let counter =
+            |key| -> Result<u64> { Ok(db.get_str(key)?.and_then(|s| s.parse().ok()).unwrap_or(0)) };
+        let (peer_has, peer_seen, seen) =
+            (counter("peer_has")?, counter("peer_seen")?, counter("seen")?);
 
         // LAN only for now: no relay servers, no public DNS, just mDNS. No UPnP either:
         // we never ask the router to open a public port, and we only ever advertise
@@ -211,6 +224,8 @@ impl Core {
                 name,
                 peer,
                 peer_has,
+                peer_seen,
+                seen,
                 nearby: BTreeMap::new(),
                 pairing: None,
                 session: None,
@@ -255,6 +270,7 @@ impl Core {
                 .map(|(id, name)| Person { id: id.to_string(), name: name.clone() }),
             connected: st.session.is_some(),
             peer_has: st.peer_has,
+            peer_seen: st.peer_seen,
             nearby: st
                 .nearby
                 .iter()
@@ -312,6 +328,26 @@ impl Core {
         Ok(msg)
     }
 
+    /// The person is looking at the chat: everything received so far counts as seen.
+    /// Cheap when nothing changed, so call it freely.
+    pub fn mark_seen(&self) -> Result<()> {
+        let Some(peer) = self.peer_id() else { return Ok(()) };
+        let up_to = self.db().max_seq(&peer.to_string())?;
+        let out = {
+            let mut st = self.state();
+            if up_to <= st.seen {
+                return Ok(());
+            }
+            st.seen = up_to;
+            st.session.as_ref().map(|s| s.out.clone())
+        };
+        self.db().set("seen", up_to.to_string())?;
+        if let Some(out) = out {
+            let _ = out.send(Frame::Seen { up_to });
+        }
+        Ok(())
+    }
+
     /// Ask a nearby person to pair. Returns immediately; progress shows up in `status`.
     pub fn pair_with(self: &Arc<Self>, id: &str) -> Result<()> {
         let remote: EndpointId = id.parse().context("bad id")?;
@@ -367,11 +403,15 @@ impl Core {
             db.delete("peer_id")?;
             db.delete("peer_name")?;
             db.delete("peer_has")?;
+            db.delete("peer_seen")?;
+            db.delete("seen")?;
         }
         let session = {
             let mut st = self.state();
             st.peer = None;
             st.peer_has = 0;
+            st.peer_seen = 0;
+            st.seen = 0;
             st.session.take()
         };
         if let Some(s) = session {
@@ -638,6 +678,8 @@ impl Core {
         for m in self.db().since(&self.id(), their_have)? {
             let _ = out.send(Frame::Msg { seq: m.seq, ts: m.ts, text: m.text });
         }
+        // Covers anything seen while we were apart.
+        let _ = out.send(Frame::Seen { up_to: self.state().seen });
         self.changed();
 
         let writer = tokio::spawn(async move {
@@ -685,6 +727,7 @@ impl Core {
                     let _ = out.send(Frame::Ack { have });
                 }
                 Frame::Ack { have } => self.set_peer_has(have, false)?,
+                Frame::Seen { up_to } => self.set_peer_seen(up_to)?,
                 Frame::Hello { name, .. } => self.update_peer_name(&name)?,
                 // From a newer version of the app: skip it rather than drop the session.
                 Frame::Unknown => {}
@@ -748,16 +791,37 @@ impl Core {
 
     /// `exact` on hello (they may have lost history); otherwise only ever increases.
     fn set_peer_has(&self, have: u64, exact: bool) -> Result<()> {
-        let new = {
+        let (new, seen) = {
             let mut st = self.state();
             let new = if exact { have } else { st.peer_has.max(have) };
-            if new == st.peer_has {
+            // They can't have seen what they no longer have.
+            let seen = st.peer_seen.min(new);
+            if new == st.peer_has && seen == st.peer_seen {
                 return Ok(());
             }
             st.peer_has = new;
-            new
+            st.peer_seen = seen;
+            (new, seen)
         };
-        self.db().set("peer_has", new.to_string())?;
+        {
+            let db = self.db();
+            db.set("peer_has", new.to_string())?;
+            db.set("peer_seen", seen.to_string())?;
+        }
+        self.changed();
+        Ok(())
+    }
+
+    /// Only ever increases; `set_peer_has` lowers it if they lost history.
+    fn set_peer_seen(&self, up_to: u64) -> Result<()> {
+        {
+            let mut st = self.state();
+            if up_to <= st.peer_seen {
+                return Ok(());
+            }
+            st.peer_seen = up_to;
+        }
+        self.db().set("peer_seen", up_to.to_string())?;
         self.changed();
         Ok(())
     }
@@ -859,5 +923,7 @@ mod tests {
     fn known_frames_keep_their_wire_format() {
         let json = serde_json::to_string(&Frame::Ack { have: 4 }).unwrap();
         assert_eq!(json, r#"{"t":"ack","have":4}"#);
+        let json = serde_json::to_string(&Frame::Seen { up_to: 4 }).unwrap();
+        assert_eq!(json, r#"{"t":"seen","up_to":4}"#);
     }
 }

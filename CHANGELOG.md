@@ -4,6 +4,8 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+- Seen receipts. A sent message now shows "seen" after "delivered", once it has been on screen in the other person's Tightbeam. If they run an older version, messages stop at "delivered".
+
 ## 0.2.0 — 2026-11-23
 
 - The settings menu shows which version you're running, and has Quit Tightbeam.

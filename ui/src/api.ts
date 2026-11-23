@@ -25,6 +25,8 @@ export interface Status {
   connected: boolean
   /** Highest of my sequence numbers the peer has confirmed. */
   peer_has: number
+  /** Highest of my sequence numbers the peer has seen. Always 0 with peers before 0.3. */
+  peer_seen: number
   nearby: Person[]
   pairing: PairPrompt | null
   notice: string | null

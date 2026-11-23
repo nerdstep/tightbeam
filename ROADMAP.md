@@ -33,11 +33,16 @@ Previously the whole history loaded at startup and every bubble re-rendered on e
 
 New frame types or message kinds. The per-author append-only log stays as it is: changes are new entries that refer to earlier ones, never rewrites.
 
-- [ ] **Seen receipts.** `Seen { up_to }` is sent when the chat is focused, the same shape as `Ack`. Show "seen" in place of "delivered".
+- [x] **Seen receipts.** `Seen { up_to }`, the same shape as `Ack`, is sent when the window gains focus or a message arrives while it's focused, and again at the start of each session. "Seen" replaces "delivered".
 - [ ] **Typing indicator.** A throwaway frame, never stored. It expires after a few seconds without a refresh.
 - [ ] **Reactions.** A message kind that targets `(author, seq)`.
 - [ ] **Replies.** A message carrying an optional `reply_to: (author, seq)`, shown as a quoted snippet.
 - [ ] **Edit and delete.** New messages that say "replace or hide `(author, seq)`". The UI shows the latest version and an "edited" mark.
+- [ ] **Slash commands.** Typing `/` at the start of the message box opens a filtered list of commands (shadcn's Command in a popover). Tab completes, an unknown command shows a hint instead of sending, and `//` sends a literal slash. Commands come from a small registry in the UI. First commands:
+  - `/nudge`: a sound, plus a flash of the window or tray icon on the other side. A new frame type.
+  - `/me waves`: shown as an action line instead of a bubble. Older builds show the raw text.
+  - `/shrug` and friends: they only insert text.
+  - Later: `/away` and `/back` (see the away status below), then `/search` and `/edit` once those exist.
 - [ ] **Search** with SQLite FTS5 over the message text.
 - [ ] **Stable ordering.** Messages are sorted by each author's wall clock, so clock skew can misorder them. Use a hybrid logical clock (or Lamport timestamps) for display order.
 
@@ -58,6 +63,5 @@ New frame types or message kinds. The per-author append-only log stays as it is:
 
 - [ ] **More than one device per person** (for example a laptop plus a desktop, and eventually phones via Tauri mobile). This is the biggest architectural change: each person's log has to sync across their own devices, and pairing becomes per person rather than per device.
 - [ ] Voice notes.
-- [ ] A "nudge" with a sound.
 - [ ] An away status after a period of inactivity.
 - [ ] Per-person colors or themes.

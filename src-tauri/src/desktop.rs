@@ -1,6 +1,7 @@
 //! Desktop integration: the tray icon, hiding instead of quitting when the window
-//! closes, the unread count (title, tray tooltip, Dock badge / taskbar dot), and
-//! notifications. Lives in Rust so it keeps working while the window is hidden.
+//! closes, the unread count (title, tray tooltip, Dock badge / taskbar dot),
+//! notifications, and when messages count as seen. Lives in Rust so it keeps working
+//! while the window is hidden.
 
 use std::{
     sync::{
@@ -102,6 +103,7 @@ pub fn on_message(app: &AppHandle, message: &Message) {
     }
     let looking = window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false);
     if looking {
+        let _ = core.mark_seen();
         return;
     }
     let unread = desktop.unread.fetch_add(1, Ordering::Relaxed) + 1;
@@ -111,8 +113,12 @@ pub fn on_message(app: &AppHandle, message: &Message) {
     }
 }
 
-/// The window got focus: the person has seen everything.
-pub fn clear_unread(app: &AppHandle) {
+/// The window got focus: the person has seen everything. Clears the unread count and
+/// tells the peer (a seen receipt).
+pub fn on_focused(app: &AppHandle) {
+    if let Some(core) = app.try_state::<Arc<Core>>() {
+        let _ = core.mark_seen();
+    }
     let Some(desktop) = app.try_state::<Desktop>() else { return };
     if desktop.unread.swap(0, Ordering::Relaxed) != 0
         && let Some(window) = app.get_webview_window(MAIN_WINDOW)

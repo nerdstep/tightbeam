@@ -1,5 +1,6 @@
 //! Two real Tightbeam cores on this machine, found via mDNS and talking over QUIC.
-//! Covers pairing, live messages, delivery acks, and catching up after one side was off.
+//! Covers pairing, live messages, delivery acks, seen receipts, and catching up after
+//! one side was off.
 
 use std::{
     path::PathBuf,
@@ -85,6 +86,12 @@ async fn pair_chat_and_catch_up() {
     bob.send_message("hi alice").unwrap();
     wait_for("alice gets bob's message", 10, || texts(&alice).contains(&"hi alice".into())).await;
     wait_for("alice sees delivery", 10, || alice.status().peer_has == 1).await;
+    assert_eq!(alice.status().peer_seen, 0, "delivered isn't seen");
+
+    // Bob looks at the chat: Alice's message shows as seen.
+    let b = bob.clone();
+    like_tauri(move || b.mark_seen()).unwrap();
+    wait_for("alice sees bob saw it", 10, || alice.status().peer_seen == 1).await;
 
     // Bob goes offline; Alice keeps writing.
     bob.shutdown().await;
@@ -106,6 +113,10 @@ async fn pair_chat_and_catch_up() {
     .await;
     wait_for("alice sees catch-up delivered", 10, || alice.status().peer_has == 3).await;
     assert_eq!(texts(&bob).len(), 4, "no duplicates after catch-up");
+    assert_eq!(alice.status().peer_seen, 1, "seen must survive the reconnect, and not grow");
+    let b = bob.clone();
+    like_tauri(move || b.mark_seen()).unwrap();
+    wait_for("alice sees the catch-up seen", 10, || alice.status().peer_seen == 3).await;
 
     alice.shutdown().await;
     bob.shutdown().await;

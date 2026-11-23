@@ -213,7 +213,7 @@ pub fn run() {
                 api.prevent_close();
                 let _ = window.hide();
             }
-            WindowEvent::Focused(true) => desktop::clear_unread(window.app_handle()),
+            WindowEvent::Focused(true) => desktop::on_focused(window.app_handle()),
             _ => {}
         })
         .invoke_handler(tauri::generate_handler![

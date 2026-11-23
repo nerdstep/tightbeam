@@ -72,7 +72,7 @@ function Header() {
 const dayOf = (m: ChatMessage) => new Date(m.ts).toDateString()
 
 function Transcript() {
-  const { messages, hasOlder, loadingOlder, myId, peerHas } = useSelector(
+  const { messages, hasOlder, loadingOlder, myId, peerHas, peerSeen } = useSelector(
     store,
     (s) => ({
       messages: s.messages,
@@ -80,6 +80,7 @@ function Transcript() {
       loadingOlder: s.loadingOlder,
       myId: s.status?.me.id ?? '',
       peerHas: s.status?.peer_has ?? 0,
+      peerSeen: s.status?.peer_seen ?? 0,
     }),
     { compare: shallow },
   )
@@ -98,8 +99,17 @@ function Transcript() {
       loadingOlder={loadingOlder}
       myId={myId}
       peerHas={peerHas}
+      peerSeen={peerSeen}
     />
   )
+}
+
+/** Where one of my messages has got to. */
+type Receipt = 'waiting' | 'delivered' | 'seen'
+
+function receiptFor(seq: number, peerHas: number, peerSeen: number): Receipt {
+  if (seq <= peerSeen) return 'seen'
+  return seq <= peerHas ? 'delivered' : 'waiting'
 }
 
 /** Rows within this many of the oldest loaded one trigger loading the previous page. */
@@ -120,12 +130,14 @@ function VirtualTranscript({
   loadingOlder,
   myId,
   peerHas,
+  peerSeen,
 }: {
   messages: ChatMessage[]
   hasOlder: boolean
   loadingOlder: boolean
   myId: string
   peerHas: number
+  peerSeen: number
 }) {
   const viewportRef = useRef<HTMLDivElement>(null)
   // Ignore the first renders: before the initial jump to the end, the top rows are
@@ -176,8 +188,7 @@ function VirtualTranscript({
                 >
                   <Row
                     message={m}
-                    mine={m.author === myId}
-                    delivered={m.author === myId && m.seq <= peerHas}
+                    receipt={m.author === myId ? receiptFor(m.seq, peerHas, peerSeen) : null}
                     newDay={!prev || dayOf(prev) !== dayOf(m)}
                     groupStart={!prev || !sameGroup(prev, m)}
                     groupEnd={!next || !sameGroup(m, next)}
@@ -207,15 +218,14 @@ const sameGroup = (a: ChatMessage, b: ChatMessage) =>
  */
 const Row = memo(function Row({
   message,
-  mine,
-  delivered,
+  receipt,
   newDay,
   groupStart,
   groupEnd,
 }: {
   message: ChatMessage
-  mine: boolean
-  delivered: boolean
+  /** Only for my own messages. */
+  receipt: Receipt | null
   newDay: boolean
   /** First in its group: space above it. */
   groupStart: boolean
@@ -223,6 +233,7 @@ const Row = memo(function Row({
   groupEnd: boolean
 }) {
   const when = new Date(message.ts)
+  const mine = receipt !== null
   const align = mine ? 'end' : 'start'
   return (
     <div className={groupStart ? 'pt-3' : 'pt-0.5'}>
@@ -241,7 +252,7 @@ const Row = memo(function Row({
           {groupEnd && (
             <MessageFooter className="text-[11px] font-normal">
               {when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
-              {mine && (delivered ? ' · delivered' : ' · waiting')}
+              {receipt && ` · ${receipt}`}
             </MessageFooter>
           )}
         </MessageContent>
