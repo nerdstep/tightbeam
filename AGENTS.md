@@ -1,0 +1,35 @@
+# AGENTS.md
+
+Tightbeam is private chat between two people on the same LAN: a Rust backend (Tauri 2, iroh, SQLite) in `src-tauri/` and a React UI in `ui/`. `README.md` explains the protocol, sync and layout; read it before touching either. `ROADMAP.md` has what's next and why.
+
+## Done
+
+- A change is done when the checks in `.github/workflows/ci.yml` pass locally: the UI check from the project root, and fmt, clippy and tests in `src-tauri/`.
+- A change people will notice also gets a line under `## Unreleased` in `CHANGELOG.md`. That section becomes the release text.
+
+## Compatibility between versions
+
+The two peers routinely run different builds, and both keep their history across upgrades.
+
+- **Wire format** (`Frame` in `src-tauri/src/chat.rs`): grow it by adding frame types and optional fields. Existing frames keep their meaning. Older peers skip unknown types (`Frame::Unknown`); `Hello` and `PairRequest` stay strict.
+- **Message log**: append-only per author. Edits, deletes, reactions and replies are new entries that refer to `(author, seq)`.
+- **SQLite**: a schema change migrates existing databases in place.
+
+## Gotchas
+
+- Tauri's sync commands run off the tokio runtime. Spawn async work through `Core`'s runtime handle (`self.rt`).
+- Windows can't send from a LAN address to itself, so same-machine runs use loopback: `scripts/two-windows.ps1`, or `TIGHTBEAM_DATA_DIR` plus `TIGHTBEAM_LOOPBACK=1`.
+- The macOS webview is WebKit (Safari 16.4 and up). CSS newer than that needs a fallback, like `fit()` in `Chat.tsx` and the scrollbar rules in `styles.css`.
+- `src-tauri/Info.plist` declares the mDNS service and the Local Network reason. Without them, macOS blocks discovery silently.
+- `ui/src/components/ui/` is shadcn's generated code. Local edits there carry a `Tightbeam:` comment; reapply them after `shadcn add` overwrites a file.
+- The transcript stays fast because status events (acks, discovery) leave message rows alone: rows are memoized, and components select narrowly from the store.
+- The version lives only in `src-tauri/Cargo.toml`. Releases go through `scripts/release.ps1` (see "Releases" in `README.md`).
+
+## Public repo
+
+Everything committed is public. Machine-specific details (hostnames, IPs, account names, SSH setup) go in gitignored `*.local.md` files. Secrets, such as the updater signing key, go in GitHub repository secrets.
+
+## Other people's machines
+
+- `scripts/setup-mac.ps1` and `scripts/build-mac.ps1` run on a Mac that someone else uses. Ask before running them.
+- Ask before automating the mouse or keyboard. The user may be at the computer.

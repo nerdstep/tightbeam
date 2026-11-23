@@ -1,0 +1,21 @@
+// markdownlint, read by both the VS Code extension and `bun run lint:md`.
+{
+  "config": {
+    "default": true,
+    // Prose is one line per paragraph or list item; editors wrap it.
+    "MD013": false,
+    // Changelog versions all have the same subheadings, if any.
+    "MD024": { "siblings_only": true }
+  },
+  // What the CLI lints when run with no arguments. The extension lints open files.
+  "globs": ["**/*.md"],
+  "ignores": [
+    "**/node_modules/**",
+    "src-tauri/target/**",
+    "dist/**",
+    // Claude Code's pointer to AGENTS.md: a single import line, no heading.
+    "CLAUDE.md",
+    // Appended under a release's notes, so it starts at a second-level heading.
+    ".github/release-footer.md"
+  ]
+}
