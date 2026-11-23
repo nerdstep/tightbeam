@@ -14,10 +14,8 @@ fn quiet() -> Emit {
 }
 
 fn temp_dir(label: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    let nanos =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     std::env::temp_dir().join(format!("tightbeam-test-{nanos}-{label}"))
 }
 
@@ -70,10 +68,8 @@ async fn pair_chat_and_catch_up() {
         bob.status().pairing.is_some()
     })
     .await;
-    let (code_a, code_b) = (
-        alice.status().pairing.unwrap().code,
-        bob.status().pairing.unwrap().code,
-    );
+    let (code_a, code_b) =
+        (alice.status().pairing.unwrap().code, bob.status().pairing.unwrap().code);
     assert_eq!(code_a, code_b, "pairing codes must match");
     assert!(bob.status().pairing.unwrap().incoming);
     let b = bob.clone();

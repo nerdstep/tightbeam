@@ -50,8 +50,10 @@ fn main() -> Result<()> {
     );
 
     // Spread over the past year, ending an hour ago, continuing each author's numbering.
-    let mut next = [a.max_seq(&id_a)?.max(b.max_seq(&id_a)?), a.max_seq(&id_b)?.max(b.max_seq(&id_b)?)];
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+    let mut next =
+        [a.max_seq(&id_a)?.max(b.max_seq(&id_a)?), a.max_seq(&id_b)?.max(b.max_seq(&id_b)?)];
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
     let start = now - 365 * 24 * 3_600_000;
     let step = (now - 3_600_000 - start) / count as i64;
     let messages: Vec<Message> = (0..count)

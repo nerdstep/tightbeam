@@ -143,10 +143,7 @@ impl Db {
 
     /// Every message, in display order.
     pub fn all(&self) -> Result<Vec<Message>> {
-        self.query(
-            "SELECT author, seq, ts, text FROM messages ORDER BY ts, author, seq",
-            [],
-        )
+        self.query("SELECT author, seq, ts, text FROM messages ORDER BY ts, author, seq", [])
     }
 
     fn query(&self, sql: &str, p: impl rusqlite::Params) -> Result<Vec<Message>> {

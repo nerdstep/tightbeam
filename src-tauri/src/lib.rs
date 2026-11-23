@@ -32,7 +32,11 @@ fn get_status(core: CoreState) -> Status {
 
 /// A page of history: the newest messages, or those before `before`. Oldest first.
 #[tauri::command]
-fn get_messages(core: CoreState, before: Option<Cursor>, limit: Option<usize>) -> Result<Page, String> {
+fn get_messages(
+    core: CoreState,
+    before: Option<Cursor>,
+    limit: Option<usize>,
+) -> Result<Page, String> {
     let limit = limit.unwrap_or(200).clamp(1, 1000);
     core.page(before.as_ref(), limit).map_err(err)
 }

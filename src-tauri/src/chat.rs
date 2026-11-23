@@ -49,13 +49,26 @@ const REDIAL_EVERY: Duration = Duration::from_secs(3);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
 enum Frame {
-    PairRequest { name: String },
-    PairAccept { name: String },
+    PairRequest {
+        name: String,
+    },
+    PairAccept {
+        name: String,
+    },
     PairReject,
     /// `have` = the highest sequence number I hold from you.
-    Hello { name: String, have: u64 },
-    Msg { seq: u64, ts: i64, text: String },
-    Ack { have: u64 },
+    Hello {
+        name: String,
+        have: u64,
+    },
+    Msg {
+        seq: u64,
+        ts: i64,
+        text: String,
+    },
+    Ack {
+        have: u64,
+    },
     /// A frame type from a newer version. Never sent.
     #[serde(other, skip_serializing)]
     Unknown,
@@ -146,7 +159,11 @@ impl Core {
     /// `loopback_only` binds to 127.0.0.1, for running two copies on one machine in tests.
     /// (Windows refuses to send from a LAN address to that same address, so same-machine
     /// tests over the LAN address are flaky.)
-    pub async fn start_with(data_dir: PathBuf, emit: Emit, loopback_only: bool) -> Result<Arc<Self>> {
+    pub async fn start_with(
+        data_dir: PathBuf,
+        emit: Emit,
+        loopback_only: bool,
+    ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating {}", data_dir.display()))?;
         let db = Db::open(&data_dir.join("tightbeam.db"))?;
@@ -183,9 +200,7 @@ impl Core {
             builder = builder.clear_ip_transports().bind_addr("127.0.0.1:0")?;
         }
         let endpoint = builder.bind().await?;
-        let mdns = MdnsAddressLookup::builder()
-            .service_name(SERVICE)
-            .build(endpoint.id())?;
+        let mdns = MdnsAddressLookup::builder().service_name(SERVICE).build(endpoint.id())?;
         endpoint.address_lookup()?.add(mdns.clone());
 
         let core = Arc::new(Self {
@@ -234,7 +249,10 @@ impl Core {
         let st = self.state();
         Status {
             me: Person { id: self.id(), name: st.name.clone() },
-            peer: st.peer.as_ref().map(|(id, name)| Person { id: id.to_string(), name: name.clone() }),
+            peer: st
+                .peer
+                .as_ref()
+                .map(|(id, name)| Person { id: id.to_string(), name: name.clone() }),
             connected: st.session.is_some(),
             peer_has: st.peer_has,
             nearby: st
@@ -282,12 +300,8 @@ impl Core {
         ensure!(self.peer_id().is_some(), "not paired with anyone yet");
         let msg = {
             let db = self.db();
-            let msg = Message {
-                author: self.id(),
-                seq: db.max_seq(&self.id())? + 1,
-                ts: now_ms(),
-                text,
-            };
+            let msg =
+                Message { author: self.id(), seq: db.max_seq(&self.id())? + 1, ts: now_ms(), text };
             db.insert(&msg)?;
             msg
         };
@@ -450,11 +464,19 @@ impl Core {
             let conn = match timeout(CONNECT_TIMEOUT, self.endpoint.connect(peer, ALPN)).await {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(e)) => {
-                    eprintln!("[{}] dial failed after {:?}: {e:#}", self.me.fmt_short(), started.elapsed());
+                    eprintln!(
+                        "[{}] dial failed after {:?}: {e:#}",
+                        self.me.fmt_short(),
+                        started.elapsed()
+                    );
                     continue;
                 }
                 Err(_) => {
-                    eprintln!("[{}] dial timed out after {:?}", self.me.fmt_short(), started.elapsed());
+                    eprintln!(
+                        "[{}] dial timed out after {:?}",
+                        self.me.fmt_short(),
+                        started.elapsed()
+                    );
                     continue;
                 }
             };
@@ -606,7 +628,8 @@ impl Core {
             let mut st = self.state();
             st.next_generation += 1;
             let generation = st.next_generation;
-            let old = st.session.replace(Session { generation, out: out.clone(), conn: conn.clone() });
+            let old =
+                st.session.replace(Session { generation, out: out.clone(), conn: conn.clone() });
             if let Some(old) = old {
                 old.conn.close(0u32.into(), b"replaced");
             }
@@ -646,7 +669,12 @@ impl Core {
         loop {
             match read_frame(recv).await? {
                 Frame::Msg { seq, ts, text } => {
-                    let msg = Message { author: peer.to_string(), seq, ts, text: clean(&text, MAX_TEXT_CHARS) };
+                    let msg = Message {
+                        author: peer.to_string(),
+                        seq,
+                        ts,
+                        text: clean(&text, MAX_TEXT_CHARS),
+                    };
                     let (is_new, have) = {
                         let db = self.db();
                         (db.insert(&msg)?, db.max_seq(peer)?)
@@ -822,7 +850,8 @@ mod tests {
 
     #[test]
     fn extra_fields_on_known_frames_are_ignored() {
-        let frame = parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","reply_to":{"author":"x","seq":2}}"#);
+        let frame =
+            parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","reply_to":{"author":"x","seq":2}}"#);
         assert!(matches!(frame, Frame::Msg { seq: 7, ref text, .. } if text == "hi"));
     }
 

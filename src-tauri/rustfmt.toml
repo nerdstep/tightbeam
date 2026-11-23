@@ -1,0 +1,3 @@
+# Fill lines up to the width instead of rustfmt's shorter defaults for calls and structs.
+use_small_heuristics = "Max"
+
