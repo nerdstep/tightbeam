@@ -4,6 +4,8 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+## 0.2.0 — 2026-11-23
+
 - The settings menu shows which version you're running, and has Quit Tightbeam.
 - Automatic updates. Tightbeam downloads new versions from GitHub in the background and offers to restart into them. Turn this off with "Automatic updates" in settings, or check by hand with "Check for updates". This is the first version that can update itself, so install it by hand.
 
