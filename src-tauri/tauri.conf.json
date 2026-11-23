@@ -27,7 +27,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIwRjU4NUQxNjJEOEY2MkIKUldRcjl0aGkwWVgxc0RtZDhET0duUGUra29VZGY0Wm5nalRFOEx2bnhUWE9pTTZOOHVDYWM3b00K",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDcxODlGODBEQzA4RkI0QTEKUldTaHRJL0FEZmlKY1pHdUI0VEFoa045elFjQ2tjcExIbXlhcTlqSEhMN3l2Z282dGxSZDVMQTgK",
       "endpoints": ["https://github.com/nerdstep/tightbeam/releases/latest/download/latest.json"],
       "requireSignedVersion": true,
       "windows": { "installMode": "passive" }
