@@ -4,13 +4,14 @@
 //! Wire protocol (ALPN `tightbeam/1`): one bidirectional QUIC stream per connection,
 //! carrying length-prefixed JSON `Frame`s. A connection starts with either
 //! `PairRequest` (unpaired) or `Hello` (paired). After both sides say `Hello`, each
-//! sends the messages the other is missing, then live messages and acks.
+//! sends the messages the other is missing, then live messages, acks, seen receipts
+//! and nudges.
 
 use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -41,6 +42,8 @@ const MAX_NAME_CHARS: usize = 40;
 const PAIR_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
+/// At most one nudge this often, each way.
+const NUDGE_EVERY: Duration = Duration::from_secs(3);
 
 /// Compatibility rules, since the two peers often run different builds:
 /// - New frame types are fine: older peers read them as `Unknown` and skip them.
@@ -74,6 +77,9 @@ enum Frame {
     Seen {
         up_to: u64,
     },
+    /// Get the other person's attention. Live only, never stored. Added in 0.3; older
+    /// peers skip it.
+    Nudge,
     /// A frame type from a newer version. Never sent.
     #[serde(other, skip_serializing)]
     Unknown,
@@ -115,6 +121,8 @@ pub struct PairPrompt {
 pub enum Event {
     Status(Status),
     Message(Message),
+    /// The peer nudged us.
+    Nudge,
 }
 
 pub type Emit = Arc<dyn Fn(Event) + Send + Sync>;
@@ -145,6 +153,8 @@ struct State {
     session: Option<Session>,
     next_generation: u64,
     notice: Option<String>,
+    nudge_sent: Option<Instant>,
+    nudge_received: Option<Instant>,
 }
 
 pub struct Core {
@@ -231,6 +241,8 @@ impl Core {
                 session: None,
                 next_generation: 0,
                 notice: None,
+                nudge_sent: None,
+                nudge_received: None,
             }),
             emit,
             tasks: Mutex::new(Vec::new()),
@@ -345,6 +357,35 @@ impl Core {
         if let Some(out) = out {
             let _ = out.send(Frame::Seen { up_to });
         }
+        Ok(())
+    }
+
+    /// Erases the conversation on this computer; the peer keeps their copy. My messages
+    /// they haven't received yet stay, so they still get delivered. Sequence numbers
+    /// carry on as before, so sync never asks for the erased messages again.
+    pub fn clear_history(&self) -> Result<()> {
+        let keep_after = self.peer_id().map(|_| self.state().peer_has);
+        self.db().clear(&self.id(), keep_after)?;
+        Ok(())
+    }
+
+    /// Shakes the peer's window and plays a sound there. Only while connected.
+    pub fn nudge(&self) -> Result<()> {
+        let out = {
+            let mut st = self.state();
+            let out = st
+                .session
+                .as_ref()
+                .map(|s| s.out.clone())
+                .context("Not connected, so the nudge can't reach them.")?;
+            ensure!(
+                !st.nudge_sent.is_some_and(|t| t.elapsed() < NUDGE_EVERY),
+                "You just nudged. Give it a few seconds."
+            );
+            st.nudge_sent = Some(Instant::now());
+            out
+        };
+        let _ = out.send(Frame::Nudge);
         Ok(())
     }
 
@@ -728,6 +769,7 @@ impl Core {
                 }
                 Frame::Ack { have } => self.set_peer_has(have, false)?,
                 Frame::Seen { up_to } => self.set_peer_seen(up_to)?,
+                Frame::Nudge => self.nudged(),
                 Frame::Hello { name, .. } => self.update_peer_name(&name)?,
                 // From a newer version of the app: skip it rather than drop the session.
                 Frame::Unknown => {}
@@ -824,6 +866,18 @@ impl Core {
         self.db().set("peer_seen", up_to.to_string())?;
         self.changed();
         Ok(())
+    }
+
+    /// Passes a nudge on, unless one just came in.
+    fn nudged(&self) {
+        {
+            let mut st = self.state();
+            if st.nudge_received.is_some_and(|t| t.elapsed() < NUDGE_EVERY) {
+                return;
+            }
+            st.nudge_received = Some(Instant::now());
+        }
+        (self.emit)(Event::Nudge);
     }
 
     fn set_notice(&self, notice: String) {
@@ -925,5 +979,7 @@ mod tests {
         assert_eq!(json, r#"{"t":"ack","have":4}"#);
         let json = serde_json::to_string(&Frame::Seen { up_to: 4 }).unwrap();
         assert_eq!(json, r#"{"t":"seen","up_to":4}"#);
+        let json = serde_json::to_string(&Frame::Nudge).unwrap();
+        assert_eq!(json, r#"{"t":"nudge"}"#);
     }
 }

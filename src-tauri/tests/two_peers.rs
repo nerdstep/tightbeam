@@ -1,17 +1,29 @@
 //! Two real Tightbeam cores on this machine, found via mDNS and talking over QUIC.
-//! Covers pairing, live messages, delivery acks, seen receipts, and catching up after
-//! one side was off.
+//! Covers pairing, live messages, delivery acks, seen receipts, catching up after one
+//! side was off, nudges, and clearing one side's history.
 
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use tightbeam_lib::chat::{Core, Emit};
+use tightbeam_lib::chat::{Core, Emit, Event};
 
 fn quiet() -> Emit {
     Arc::new(|_| {})
+}
+
+/// Counts the nudges it's told about.
+fn counting_nudges(count: Arc<AtomicUsize>) -> Emit {
+    Arc::new(move |event| {
+        if let Event::Nudge = event {
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+    })
 }
 
 fn temp_dir(label: &str) -> PathBuf {
@@ -102,7 +114,8 @@ async fn pair_chat_and_catch_up() {
     assert_eq!(alice.status().peer_has, 1, "undelivered messages must not show as delivered");
 
     // Bob comes back with the same identity and catches up.
-    bob = Core::start_with(dir_b.clone(), quiet(), true).await.unwrap();
+    let nudges = Arc::new(AtomicUsize::new(0));
+    bob = Core::start_with(dir_b.clone(), counting_nudges(nudges.clone()), true).await.unwrap();
     assert_eq!(bob.id(), bob_id, "identity must survive a restart");
     assert_eq!(bob.status().peer.unwrap().name, "Alice", "pairing must survive a restart");
     wait_for("reconnect", 40, || alice.status().connected && bob.status().connected).await;
@@ -117,6 +130,22 @@ async fn pair_chat_and_catch_up() {
     let b = bob.clone();
     like_tauri(move || b.mark_seen()).unwrap();
     wait_for("alice sees the catch-up seen", 10, || alice.status().peer_seen == 3).await;
+
+    // Alice nudges Bob. A second nudge right after is refused.
+    let a = alice.clone();
+    like_tauri(move || a.nudge()).unwrap();
+    wait_for("bob gets the nudge", 10, || nudges.load(Ordering::SeqCst) == 1).await;
+    assert!(alice.nudge().is_err(), "nudges are rate-limited");
+
+    // Bob clears his copy. Alice keeps hers, and numbering carries on.
+    let b = bob.clone();
+    like_tauri(move || b.clear_history()).unwrap();
+    assert!(texts(&bob).is_empty());
+    assert_eq!(texts(&alice).len(), 4);
+    assert_eq!(bob.send_message("fresh start").unwrap().seq, 2);
+    wait_for("alice gets it", 10, || texts(&alice).contains(&"fresh start".into())).await;
+    assert_eq!(texts(&alice).len(), 5);
+    assert_eq!(texts(&bob), ["fresh start"]);
 
     alice.shutdown().await;
     bob.shutdown().await;

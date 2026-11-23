@@ -38,8 +38,10 @@ New frame types or message kinds. The per-author append-only log stays as it is:
 - [ ] **Reactions.** A message kind that targets `(author, seq)`.
 - [ ] **Replies.** A message carrying an optional `reply_to: (author, seq)`, shown as a quoted snippet.
 - [ ] **Edit and delete.** New messages that say "replace or hide `(author, seq)`". The UI shows the latest version and an "edited" mark.
-- [ ] **Slash commands.** Typing `/` at the start of the message box opens a filtered list of commands (shadcn's Command in a popover). Tab completes, an unknown command shows a hint instead of sending, and `//` sends a literal slash. Commands come from a small registry in the UI. First commands:
-  - `/nudge`: a sound, plus a flash of the window or tray icon on the other side. A new frame type.
+- [x] **Slash commands.** Typing `/` at the start of the message box opens a filtered list of commands. Tab completes, an unknown command shows a hint instead of sending, and `//` sends a literal slash. Commands come from a small registry in `ui/src/commands.ts`. So far:
+  - `/clear`: erases this computer's copy of the conversation. The peer's copy is untouched, nothing goes over the wire, and sequence numbers carry on (a `cleared` table remembers the highest one erased per author), so sync never asks for the erased messages again.
+  - `/nudge`: a `Nudge` frame, live only. A shake and a sound in an open window, a taskbar flash or Dock bounce behind other windows, a notification from the tray. At most one every 3 seconds each way.
+- [ ] **More commands:**
   - `/me waves`: shown as an action line instead of a bubble. Older builds show the raw text.
   - `/shrug` and friends: they only insert text.
   - Later: `/away` and `/back` (see the away status below), then `/search` and `/edit` once those exist.

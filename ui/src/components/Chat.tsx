@@ -3,6 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { memo, useEffect, useRef, useState } from 'react'
 
 import { api, type Message as ChatMessage } from '@/api'
+import { type Command, parse, suggest } from '@/commands'
 import { Linkified } from '@/components/Linkified'
 import { SettingsMenu } from '@/components/SettingsMenu'
 import {
@@ -29,7 +30,7 @@ import {
 } from '@/components/ui/message-scroller'
 import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
-import { addMessage, loadOlder, messageKey, run, store } from '@/store'
+import { addMessage, clearHistory, loadOlder, messageKey, run, store } from '@/store'
 
 /** Paired: the conversation. */
 export function Chat() {
@@ -275,14 +276,44 @@ function fit(el: HTMLTextAreaElement) {
 
 function Composer() {
   const [text, setText] = useState('')
+  const [hint, setHint] = useState<string | null>(null)
+  // Which suggestion is highlighted, and whether Escape closed the list.
+  const [active, setActive] = useState(0)
+  const [dismissed, setDismissed] = useState(false)
+  const [clearing, setClearing] = useState(false)
   const textRef = useRef<HTMLTextAreaElement>(null)
   const { scrollToEnd } = useMessageScroller()
 
-  const send = async () => {
-    const value = text.trim()
-    if (!value) return
-    setText('')
+  const suggestions = dismissed ? [] : suggest(text)
+  const highlighted = suggestions[Math.min(active, suggestions.length - 1)]
+
+  const change = (value: string) => {
+    setText(value)
+    setHint(null)
+    setActive(0)
+    setDismissed(false)
+  }
+
+  const reset = () => {
+    change('')
     if (!autoSizes && textRef.current) textRef.current.style.height = ''
+  }
+
+  const perform = (command: Command) => {
+    reset()
+    void command.action({ confirmClear: () => setClearing(true) })
+  }
+
+  const send = async () => {
+    const parsed = parse(text)
+    if (parsed.kind === 'command') {
+      if (parsed.command) perform(parsed.command)
+      else setHint(`There's no /${parsed.name} command. To send it as a message, start with //.`)
+      return
+    }
+    const value = parsed.text
+    if (!value) return
+    reset()
     const sent = await run(api.sendMessage(value))
     if (sent) {
       addMessage(sent)
@@ -292,37 +323,150 @@ function Composer() {
     }
   }
 
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.nativeEvent.isComposing) return
+    if (highlighted) {
+      const step = { ArrowDown: 1, ArrowUp: -1 }[e.key]
+      if (step) {
+        e.preventDefault()
+        const at = suggestions.indexOf(highlighted)
+        setActive((at + step + suggestions.length) % suggestions.length)
+        return
+      }
+      if (e.key === 'Tab') {
+        e.preventDefault()
+        setText(`/${highlighted.name}`)
+        return
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        setDismissed(true)
+        return
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault()
+        perform(highlighted)
+        return
+      }
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      void send()
+    }
+  }
+
   return (
     <form
-      className="flex items-end gap-2 border-t bg-card px-4 py-3"
+      className="relative flex items-end gap-2 border-t bg-card px-4 py-3"
       onSubmit={(e) => {
         e.preventDefault()
         void send()
       }}
     >
+      {highlighted && (
+        <CommandList
+          commands={suggestions}
+          highlighted={highlighted}
+          onHighlight={(c) => setActive(suggestions.indexOf(c))}
+          onPick={perform}
+        />
+      )}
+      {hint && (
+        <p className="absolute right-4 bottom-full left-4 mb-2 rounded-lg border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-md">
+          {hint}
+        </p>
+      )}
       <Textarea
         ref={textRef}
         rows={1}
         maxLength={4000}
-        placeholder="Message"
+        placeholder="Message, or / for commands"
         aria-label="Message"
         className="max-h-36 min-h-9 resize-none py-1.5 text-sm"
         value={text}
         onChange={(e) => {
-          setText(e.target.value)
+          change(e.target.value)
           fit(e.target)
         }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-            e.preventDefault()
-            void send()
-          }
-        }}
+        onKeyDown={onKeyDown}
       />
       <Button type="submit" size="lg">
         Send
       </Button>
+      <ClearDialog open={clearing} onOpenChange={setClearing} />
     </form>
+  )
+}
+
+/** The commands matching what's typed so far, above the message box. */
+function CommandList({
+  commands,
+  highlighted,
+  onHighlight,
+  onPick,
+}: {
+  commands: Command[]
+  highlighted: Command
+  onHighlight: (command: Command) => void
+  onPick: (command: Command) => void
+}) {
+  return (
+    <ul className="absolute bottom-full left-4 mb-2 w-80 max-w-[calc(100%-2rem)] rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
+      {commands.map((c) => (
+        <li key={c.name}>
+          <button
+            type="button"
+            className={`flex w-full items-baseline gap-3 rounded-md px-2 py-1.5 text-left text-sm ${c === highlighted ? 'bg-accent text-accent-foreground' : ''}`}
+            // Keep the focus in the message box.
+            onMouseDown={(e) => e.preventDefault()}
+            onMouseEnter={() => onHighlight(c)}
+            onClick={() => onPick(c)}
+          >
+            <span className="font-mono">/{c.name}</span>
+            <span className="text-xs text-muted-foreground">{c.description}</span>
+          </button>
+        </li>
+      ))}
+      <li className="px-2 pt-1 pb-0.5 text-[11px] text-muted-foreground">
+        ↑↓ to choose · Enter to run · Tab to complete · Esc to close
+      </li>
+    </ul>
+  )
+}
+
+function ClearDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  const name = useSelector(store, (s) => s.status?.peer?.name || 'The other person')
+  return (
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
+      <AlertDialogContent size="sm">
+        <AlertDialogHeader>
+          <AlertDialogTitle>Clear this conversation?</AlertDialogTitle>
+          <AlertDialogDescription>
+            This erases the history on this computer, and it can’t be undone. {name} keeps their
+            copy. Messages that haven’t reached them yet stay, so they still get delivered.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            variant="destructive"
+            onClick={() => {
+              // AlertDialogAction is a plain button: it doesn't close the dialog itself.
+              onOpenChange(false)
+              void clearHistory()
+            }}
+          >
+            Clear
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
   )
 }
 

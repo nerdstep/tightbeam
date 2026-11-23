@@ -1,4 +1,5 @@
 import { shallow, useSelector } from '@tanstack/react-store'
+import { useEffect, useRef } from 'react'
 
 import { Chat } from './components/Chat'
 import { Notice } from './components/Notice'
@@ -20,8 +21,11 @@ export function App() {
     { compare: shallow },
   )
 
+  const ref = useRef<HTMLDivElement>(null)
+  useShakeOnNudge(ref)
+
   return (
-    <div className="flex h-full flex-col">
+    <div ref={ref} className="flex h-full flex-col">
       <UpdateBar />
       <Notice />
       <main className="min-h-0 flex-1">
@@ -30,4 +34,17 @@ export function App() {
       {pairing && <PairDialog prompt={pairing} />}
     </div>
   )
+}
+
+/** A nudge, sent or received, shakes the whole window for a moment. */
+function useShakeOnNudge(ref: React.RefObject<HTMLDivElement | null>) {
+  const nudges = useSelector(store, (s) => s.nudges)
+  useEffect(() => {
+    if (nudges === 0 || matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    const offsets = [0, -8, 8, -6, 6, -3, 3, 0]
+    ref.current?.animate(
+      offsets.map((x) => ({ transform: `translateX(${x}px)` })),
+      { duration: 450, easing: 'ease-in-out' },
+    )
+  }, [nudges, ref])
 }

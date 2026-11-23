@@ -13,6 +13,8 @@ Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https:/
 - **Sync.** Messages are numbered per author. On connect, each side says "the last one I have from you is #N", and the other sends everything after it. Duplicates are ignored, so resending is always safe.
 - **Delivery.** Your message shows "waiting" until the other app confirms it has it, then "delivered". It shows "seen" once their window has had focus with the message in it. Like delivery, "seen" is a number per person ("I've seen up to #N"), re-sent at the start of every connection.
 
+**Commands:** type `/` in the message box for a list. `/clear` erases the conversation on this computer; the other person keeps their copy, and your messages that haven't reached them yet stay so they still get delivered. The erased messages are overwritten in the database file, not just marked free. `/nudge` shakes the other person's window and plays a sound, or shows a notification if Tightbeam is in their tray. To send a message that starts with a slash, begin it with `//`.
+
 **In the background:** closing the window hides it. Tightbeam keeps running in the tray (menu bar on macOS) so messages still arrive, with notifications and an unread count. Quit from the gear menu or the tray icon, or with Cmd+Q on macOS. Opening Tightbeam again brings back the running window. Settings (the gear in the header) toggle notifications and start-at-login, which starts it in the tray.
 
 **Updates:** Tightbeam checks GitHub Releases for a new version 30 seconds after it starts, then every 6 hours. It downloads the update in the background and checks the update's signature against the public key in `tauri.conf.json`. A bar then offers to restart into it. Settings has "Check for updates", and "Automatic updates" to turn the checks off. Development and test builds never check.
@@ -24,6 +26,7 @@ Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https:/
 ```text
 ui/src/api.ts             typed wrappers for the Rust commands, plus the shared types
 ui/src/store.ts           app state (TanStack Store), fed by events from Rust; history paging
+ui/src/commands.ts        slash commands
 ui/src/components/        the screens: Setup, Pair, Chat, PairDialog, Notice
 ui/src/components/ui/     shadcn/ui components (generated; update with the shadcn CLI)
 src-tauri/src/chat.rs     the engine: discovery, pairing, protocol, sync

@@ -57,6 +57,17 @@ fn send_message(core: CoreState, text: String) -> Result<Message, String> {
     core.send_message(&text).map_err(err)
 }
 
+/// Erases the conversation on this computer only.
+#[tauri::command]
+fn clear_history(core: CoreState) -> Result<(), String> {
+    core.clear_history().map_err(err)
+}
+
+#[tauri::command]
+fn nudge(core: CoreState) -> Result<(), String> {
+    core.nudge().map_err(err)
+}
+
 #[tauri::command]
 fn pair_with(core: CoreState, id: String) -> Result<(), String> {
     core.pair_with(&id).map_err(err)
@@ -186,8 +197,10 @@ pub fn run() {
             app.manage(Desktop::new());
             let handle = app.handle().clone();
             let emit: Emit = Arc::new(move |event| {
-                if let Event::Message(message) = &event {
-                    desktop::on_message(&handle, message);
+                match &event {
+                    Event::Message(message) => desktop::on_message(&handle, message),
+                    Event::Nudge => desktop::on_nudge(&handle),
+                    Event::Status(_) => {}
                 }
                 let _ = handle.emit("tightbeam", event);
             });
@@ -221,6 +234,8 @@ pub fn run() {
             get_messages,
             set_name,
             send_message,
+            clear_history,
+            nudge,
             pair_with,
             answer_pair,
             unpair,

@@ -1,7 +1,7 @@
 //! Desktop integration: the tray icon, hiding instead of quitting when the window
 //! closes, the unread count (title, tray tooltip, Dock badge / taskbar dot),
-//! notifications, and when messages count as seen. Lives in Rust so it keeps working
-//! while the window is hidden.
+//! notifications, nudges, and when messages count as seen. Lives in Rust so it keeps
+//! working while the window is hidden.
 
 use std::{
     sync::{
@@ -12,7 +12,7 @@ use std::{
 };
 
 use tauri::{
-    AppHandle, Manager, WebviewWindow,
+    AppHandle, Manager, UserAttentionType, WebviewWindow,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
 };
@@ -101,16 +101,43 @@ pub fn on_message(app: &AppHandle, message: &Message) {
     if message.author == core.id() {
         return;
     }
-    let looking = window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false);
-    if looking {
+    if looking(&window) {
         let _ = core.mark_seen();
         return;
     }
     let unread = desktop.unread.fetch_add(1, Ordering::Relaxed) + 1;
     show_unread(app, &window, unread);
-    if desktop.notifications() {
-        notify(app, &desktop, core.peer_name(), message);
+    if desktop.notifications() && !recently_notified(&desktop) {
+        let mut body: String = message.text.chars().take(140).collect();
+        if body.len() < message.text.len() {
+            body.push('…');
+        }
+        notify(app, &title(core.peer_name(), "New message"), &body, false);
     }
+}
+
+/// The peer nudged us. While the window is open, the UI shakes it and plays a sound;
+/// this flashes the taskbar or Dock icon if it's behind other windows. From the tray,
+/// a notification with a sound instead.
+pub fn on_nudge(app: &AppHandle) {
+    let (Some(core), Some(desktop), Some(window)) = (
+        app.try_state::<Arc<Core>>(),
+        app.try_state::<Desktop>(),
+        app.get_webview_window(MAIN_WINDOW),
+    ) else {
+        return;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        if desktop.notifications() {
+            notify(app, &title(core.peer_name(), "Tightbeam"), "Nudged you", true);
+        }
+    } else if !looking(&window) {
+        let _ = window.request_user_attention(Some(UserAttentionType::Informational));
+    }
+}
+
+fn looking(window: &WebviewWindow) -> bool {
+    window.is_visible().unwrap_or(false) && window.is_focused().unwrap_or(false)
 }
 
 /// The window got focus: the person has seen everything. Clears the unread count and
@@ -148,20 +175,28 @@ fn show_unread(app: &AppHandle, window: &WebviewWindow, unread: u32) {
     let _ = window.set_badge_count((unread > 0).then_some(i64::from(unread)));
 }
 
-fn notify(app: &AppHandle, desktop: &Desktop, peer_name: Option<String>, message: &Message) {
-    {
-        let mut last = desktop.last_notified.lock().unwrap();
-        if last.is_some_and(|t| t.elapsed() < NOTIFY_AT_MOST_EVERY) {
-            return;
-        }
-        *last = Some(Instant::now());
+/// True if a message notification went out moments ago; otherwise records one now.
+fn recently_notified(desktop: &Desktop) -> bool {
+    let mut last = desktop.last_notified.lock().unwrap();
+    if last.is_some_and(|t| t.elapsed() < NOTIFY_AT_MOST_EVERY) {
+        return true;
     }
-    let title = peer_name.filter(|n| !n.is_empty()).unwrap_or_else(|| "New message".into());
-    let mut body: String = message.text.chars().take(140).collect();
-    if body.len() < message.text.len() {
-        body.push('…');
+    *last = Some(Instant::now());
+    false
+}
+
+/// The peer's name, or `fallback` if they have none.
+fn title(peer_name: Option<String>, fallback: &str) -> String {
+    peer_name.filter(|n| !n.is_empty()).unwrap_or_else(|| fallback.into())
+}
+
+/// `sound`: Windows always plays one; macOS only when asked.
+fn notify(app: &AppHandle, title: &str, body: &str, sound: bool) {
+    let mut builder = app.notification().builder().title(title).body(body);
+    if sound && cfg!(target_os = "macos") {
+        builder = builder.sound("NSUserNotificationDefaultSoundName");
     }
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+    if let Err(e) = builder.show() {
         eprintln!("notification failed: {e}");
     }
 }

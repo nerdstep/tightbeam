@@ -63,7 +63,11 @@ export interface UpdateReady {
   version: string
 }
 
-export type CoreEvent = { kind: 'status'; data: Status } | { kind: 'message'; data: Message }
+export type CoreEvent =
+  | { kind: 'status'; data: Status }
+  | { kind: 'message'; data: Message }
+  /** The peer nudged us. */
+  | { kind: 'nudge' }
 
 export const api = {
   getStatus: () => invoke<Status>('get_status'),
@@ -71,6 +75,10 @@ export const api = {
     invoke<Page>('get_messages', { before: before ?? null, limit: limit ?? null }),
   setName: (name: string) => invoke<void>('set_name', { name }),
   sendMessage: (text: string) => invoke<Message>('send_message', { text }),
+  /** Erases the conversation on this computer. Undelivered messages of mine stay. */
+  clearHistory: () => invoke<void>('clear_history'),
+  /** Fails when not connected, or right after another nudge. */
+  nudge: () => invoke<void>('nudge'),
   pairWith: (id: string) => invoke<void>('pair_with', { id }),
   answerPair: (accept: boolean) => invoke<void>('answer_pair', { accept }),
   unpair: () => invoke<void>('unpair'),

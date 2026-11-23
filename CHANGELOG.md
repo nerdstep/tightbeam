@@ -5,6 +5,9 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 ## Unreleased
 
 - Seen receipts. A sent message now shows "seen" after "delivered", once it has been on screen in the other person's Tightbeam. If they run an older version, messages stop at "delivered".
+- Slash commands. Type `/` in the message box for a list. To send a message that starts with a slash, begin it with `//`.
+  - `/clear` erases the conversation on this computer. The other person keeps their copy, and messages that haven't reached them yet are still delivered.
+  - `/nudge` shakes the other person's window and plays a sound. If their window is closed to the tray, they get a notification instead. Older versions ignore nudges.
 
 ## 0.2.0 — 2026-11-23
 

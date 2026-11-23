@@ -52,7 +52,13 @@ impl Db {
                  PRIMARY KEY (author, seq)
              );
              -- Display order, for paging through history.
-             CREATE INDEX IF NOT EXISTS messages_by_time ON messages (ts, author, seq);",
+             CREATE INDEX IF NOT EXISTS messages_by_time ON messages (ts, author, seq);
+             -- The highest sequence number erased per author by `clear`. Numbering and
+             -- sync carry on from here, as if the messages were still stored.
+             CREATE TABLE IF NOT EXISTS cleared (
+                 author TEXT    PRIMARY KEY,
+                 up_to  INTEGER NOT NULL
+             );",
         )?;
         Ok(Self(conn))
     }
@@ -105,14 +111,43 @@ impl Db {
         Ok(())
     }
 
-    /// Highest sequence number stored for `author`, or 0 if none.
+    /// Highest sequence number held for `author`, counting erased ones, or 0 if none.
     pub fn max_seq(&self, author: &str) -> Result<u64> {
         let n: i64 = self.0.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE author = ?1",
+            "SELECT MAX(
+                 COALESCE((SELECT MAX(seq) FROM messages WHERE author = ?1), 0),
+                 COALESCE((SELECT up_to FROM cleared WHERE author = ?1), 0))",
             [author],
             |r| r.get(0),
         )?;
         Ok(n as u64)
+    }
+
+    /// Erases the history, except `keep_author`'s messages after `keep_after` (mine that
+    /// haven't been delivered yet). The space is zeroed rather than just freed. Returns
+    /// how many messages were erased.
+    pub fn clear(&self, keep_author: &str, keep_after: Option<u64>) -> Result<usize> {
+        let keep_after = keep_after.map(|n| n as i64);
+        let erase = "?2 IS NULL OR NOT (author = ?1 AND seq > ?2)";
+        self.0.execute_batch("PRAGMA secure_delete = ON; BEGIN")?;
+        let result = (|| -> Result<usize> {
+            self.0.execute(
+                &format!(
+                    "INSERT INTO cleared (author, up_to)
+                     SELECT author, MAX(seq) FROM messages WHERE {erase} GROUP BY author
+                     ON CONFLICT(author) DO UPDATE SET up_to = MAX(up_to, excluded.up_to)"
+                ),
+                params![keep_author, keep_after],
+            )?;
+            Ok(self.0.execute(
+                &format!("DELETE FROM messages WHERE {erase}"),
+                params![keep_author, keep_after],
+            )?)
+        })();
+        self.0.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
+        // Old copies of the pages also sit in the write-ahead log until a checkpoint.
+        self.0.execute_batch("PRAGMA secure_delete = OFF; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        result
     }
 
     /// Stores a message. Returns false if it was already stored.
@@ -157,5 +192,39 @@ impl Db {
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn msg(author: &str, seq: u64) -> Message {
+        Message { author: author.into(), seq, ts: seq as i64, text: format!("{author}{seq}") }
+    }
+
+    #[test]
+    fn clear_keeps_numbering_and_undelivered_messages() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.insert_many(&[msg("me", 1), msg("me", 2), msg("me", 3), msg("peer", 1), msg("peer", 2)])
+            .unwrap();
+
+        // The peer has my first two; the third is still waiting.
+        assert_eq!(db.clear("me", Some(2)).unwrap(), 4);
+        let left: Vec<_> = db.all().unwrap().into_iter().map(|m| m.text).collect();
+        assert_eq!(left, ["me3"]);
+        assert_eq!(db.max_seq("me").unwrap(), 3);
+        assert_eq!(db.max_seq("peer").unwrap(), 2, "sync must not ask for erased messages again");
+
+        // Clearing again never lowers what was recorded.
+        assert_eq!(db.clear("me", None).unwrap(), 1);
+        assert!(db.all().unwrap().is_empty());
+        assert_eq!(db.max_seq("me").unwrap(), 3);
+        assert_eq!(db.max_seq("peer").unwrap(), 2);
+
+        // New messages carry on numbering, and paging still works.
+        db.insert(&msg("peer", 3)).unwrap();
+        assert_eq!(db.max_seq("peer").unwrap(), 3);
+        assert_eq!(db.page(None, 10).unwrap().messages, [msg("peer", 3)]);
     }
 }

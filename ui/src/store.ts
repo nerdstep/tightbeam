@@ -5,6 +5,7 @@
 import { createStore } from '@tanstack/react-store'
 
 import { api, type Message, type Status, type UpdateReady } from './api'
+import { chime } from './lib/chime'
 
 const PAGE_SIZE = 200
 
@@ -19,6 +20,8 @@ interface State {
   error: string | null
   /** A downloaded update waiting for a restart. */
   update: UpdateReady | null
+  /** Counts nudges, sent and received; each one shakes the window. */
+  nudges: number
 }
 
 export const store = createStore<State>({
@@ -28,6 +31,7 @@ export const store = createStore<State>({
   loadingOlder: false,
   error: null,
   update: null,
+  nudges: 0,
 })
 
 export const messageKey = (m: Message) => `${m.author}:${m.seq}`
@@ -86,6 +90,23 @@ export function dismissError() {
   store.setState((s) => ({ ...s, error: null }))
 }
 
+/** Shakes the window; with `sound`, chimes too (a nudge from the peer). */
+export function shake(sound: boolean) {
+  store.setState((s) => ({ ...s, nudges: s.nudges + 1 }))
+  // A hidden window gets a notification from Rust instead.
+  if (sound && document.visibilityState === 'visible') chime()
+}
+
+/** Erases the conversation on this computer, then shows what's left. */
+export async function clearHistory() {
+  if (!(await run(api.clearHistory().then(() => true)))) return
+  const page = await run(api.getMessages(undefined, PAGE_SIZE))
+  if (!page) return
+  loaded.clear()
+  for (const m of page.messages) loaded.add(messageKey(m))
+  store.setState((s) => ({ ...s, messages: page.messages, hasOlder: page.has_more }))
+}
+
 export function setUpdate(update: UpdateReady | null) {
   store.setState((s) => ({ ...s, update }))
 }
@@ -94,7 +115,8 @@ export async function start() {
   // Listen first so nothing that happens while loading is missed.
   await api.onEvent((event) => {
     if (event.kind === 'status') store.setState((s) => ({ ...s, status: event.data }))
-    else addMessage(event.data)
+    else if (event.kind === 'message') addMessage(event.data)
+    else shake(true)
   })
   await api.onUpdateReady(setUpdate)
   // An update may have downloaded before the window loaded.
