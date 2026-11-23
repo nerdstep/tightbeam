@@ -11,7 +11,7 @@ Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https:/
 - **Pairing.** You click a nearby person, and both screens show the same six-digit code, derived from both keys. The other person accepts. From then on, each app only talks to that one key.
 - **Connection.** Once paired, the app with the lower ID dials the other every few seconds until connected. The link is QUIC with TLS, authenticated by those keys.
 - **Sync.** Messages are numbered per author. On connect, each side says "the last one I have from you is #N", and the other sends everything after it. Duplicates are ignored, so resending is always safe.
-- **Delivery.** Your message shows "waiting" until the other app confirms it has it, then "delivered".
+- **Delivery.** Your message shows "waiting" until the other app confirms it has it, then "delivered". It shows "seen" once their window has had focus with the message in it. Like delivery, "seen" is a number per person ("I've seen up to #N"), re-sent at the start of every connection.
 
 **In the background:** closing the window hides it. Tightbeam keeps running in the tray (menu bar on macOS) so messages still arrive, with notifications and an unread count. Quit from the gear menu or the tray icon, or with Cmd+Q on macOS. Opening Tightbeam again brings back the running window. Settings (the gear in the header) toggle notifications and start-at-login, which starts it in the tray.
 
@@ -79,7 +79,7 @@ The tag starts the Release workflow. It runs CI on the tagged commit, then build
 
 Dependabot opens a pull request each month for dependency updates. The GitHub Actions in the workflows are pinned to exact commits, and Dependabot updates those too.
 
-CI signs the update files with the updater's private key. It reads the key from the repository secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`; `src-tauri/tauri.release.conf.json` turns signing on. Local and SSH builds skip the update files, so they don't need the key. Keep a backup of the key: without it, installed copies can't update, and both people would have to reinstall by hand.
+CI signs the update files with the updater's private key. It reads the key from the repository secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`; `src-tauri/tauri.release.conf.json` turns signing on. Local and SSH builds skip the update files, so they don't need the key. Keep a backup of the key. Without it, installed copies can't update, and every install has to be replaced by hand.
 
 Installed copies update from a release once it's published. Drafts and pre-releases are never offered.
 

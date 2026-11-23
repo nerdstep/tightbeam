@@ -28,8 +28,3 @@ The two peers routinely run different builds, and both keep their history across
 ## Public repo
 
 Everything committed is public. Machine-specific details (hostnames, IPs, account names, SSH setup) go in gitignored `*.local.md` files. Secrets, such as the updater signing key, go in GitHub repository secrets.
-
-## Other people's machines
-
-- `scripts/setup-mac.ps1` and `scripts/build-mac.ps1` run on a Mac that someone else uses. Ask before running them.
-- Ask before automating the mouse or keyboard. The user may be at the computer.

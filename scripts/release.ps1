@@ -27,6 +27,11 @@ function Invoke-Git {
   if ($LASTEXITCODE -ne 0) { throw "git $args failed" }
 }
 
+# Before anything changes: a missing tool halfway through would leave edited files behind.
+foreach ($tool in 'git', 'gh', 'cargo') {
+  if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { throw "$tool isn't on PATH." }
+}
+
 if ($Version -notmatch '^\d+\.\d+\.\d+$') { throw "Version should look like 1.2.3, not '$Version'." }
 $tag = "v$Version"
 
