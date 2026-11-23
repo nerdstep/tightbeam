@@ -44,7 +44,7 @@ New frame types or message kinds. The per-author append-only log stays as it is:
 ## 3. Bigger pieces
 
 - [ ] **Images and files**, including pasted screenshots. Use `iroh-blobs` for transfer. Messages carry a content hash, and the bytes sync separately.
-- [ ] **Automatic builds.** GitHub Actions (free for public repos, macOS included):
+- [x] **Automatic builds.** GitHub Actions (free for public repos, macOS included):
   - `ci.yml` runs the UI checks, plus rustfmt, clippy and the tests on Windows and macOS, for each push to main and each pull request.
   - `release.yml` builds the Windows installer and the macOS `.dmg` into a draft release when a `v*` tag is pushed (`scripts/release.ps1`).
   - Building over SSH remains for one-off Mac builds of unreleased branches.
