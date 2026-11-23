@@ -1,7 +1,9 @@
 name: Release
 
-# Pushing a version tag (scripts/release.ps1 does it) builds the Windows installer and
-# the macOS app into a draft GitHub release. Check the draft, then publish it.
+# Pushing a version tag (scripts/release.ps1 does it) checks the tagged commit, then
+# builds the Windows installer and the macOS app into a draft GitHub release. The
+# release text is the version's section of CHANGELOG.md plus release-footer.md.
+# Check the draft, then publish it.
 on:
   push:
     tags: ['v*']
@@ -10,13 +12,20 @@ permissions:
   contents: write
 
 jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   draft:
     name: Draft release
+    needs: ci
     runs-on: ubuntu-latest
     outputs:
       id: ${{ steps.draft.outputs.id }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check the tag matches the version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)
@@ -24,8 +33,22 @@ jobs:
             echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in src-tauri/Cargo.toml"
             exit 1
           fi
+      - name: Write the release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # The lines between "## <version> ..." and the next "## " heading.
+          awk -v v="$version" '
+            /^## / { if (found) exit; if ($0 == "## " v || index($0, "## " v " ") == 1) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no entries under \"## $version\""
+            exit 1
+          fi
+          { echo; cat .github/release-footer.md; } >> notes.md
+          cat notes.md
       # Created once here rather than by each build, so the two builds can't race to
-      # create two drafts. A re-run reuses the existing draft.
+      # create two drafts. A re-run reuses the existing draft and refreshes its text.
       - name: Create the draft
         id: draft
         env:
@@ -33,12 +56,14 @@ jobs:
         run: |
           id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
             --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id" | head -n 1)
-          if [ -z "$id" ]; then
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" -F body=@notes.md > /dev/null
+          else
             id=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
               -f tag_name="$GITHUB_REF_NAME" \
               -f name="Tightbeam ${GITHUB_REF_NAME#v}" \
+              -F body=@notes.md \
               -F draft=true \
-              -F generate_release_notes=true \
               --jq .id)
           fi
           echo "id=$id" >> "$GITHUB_OUTPUT"
@@ -53,10 +78,11 @@ jobs:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: oven-sh/setup-bun@v2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: rustup toolchain install stable --profile minimal && rustup default stable
+        shell: bash
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: src-tauri
       - run: bun install --frozen-lockfile
@@ -64,7 +90,7 @@ jobs:
       # .app and .dmg on macOS) and uploads them to the draft. The .app goes up as a
       # .tar.gz. Once the updater is set up, this also signs the updates and writes
       # latest.json, given TAURI_SIGNING_PRIVATE_KEY from the repository secrets.
-      - uses: tauri-apps/tauri-action@v1
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:

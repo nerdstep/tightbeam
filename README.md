@@ -51,7 +51,7 @@ cd src-tauri; cargo test   # run the two-peer test (about 5 seconds)
 For the TypeScript, from the project root:
 
 ```powershell
-bun run check          # type-check, lint (oxlint) and format check (oxfmt)
+bun run check          # type-check, lint (oxlint), format check (oxfmt), Markdown lint
 bun run fmt            # format
 ```
 
@@ -67,7 +67,13 @@ For the Rust, in `src-tauri`: `cargo fmt` and `cargo clippy --all-targets`. CI r
 .\scripts\release.ps1 0.2.0
 ```
 
-This sets the version in `src-tauri/Cargo.toml`, the only place it's stored (`tauri.conf.json` falls back to it). It then commits, tags `v0.2.0` and pushes. The tag starts the Release workflow, which builds the Windows installer and the macOS app (Apple Silicon, `.dmg`) into a draft release on GitHub. Check the draft, then publish it.
+First, add what changed under `## Unreleased` in `CHANGELOG.md`, push, and let CI pass. The script checks for all three.
+
+It then moves the Unreleased entries under the new version and sets the version in `src-tauri/Cargo.toml`, the only place it's stored (`tauri.conf.json` falls back to it). Finally it commits, tags `v0.2.0` and pushes.
+
+The tag starts the Release workflow. It runs CI on the tagged commit, then builds the Windows installer and the macOS app (Apple Silicon, `.dmg`) into a draft release on GitHub. The draft's text is that version's changelog section plus the install steps in `.github/release-footer.md`. Check the draft, then publish it.
+
+Dependabot opens a pull request each month for dependency updates. The GitHub Actions in the workflows are pinned to exact commits, and Dependabot updates those too.
 
 The builds aren't signed with a paid certificate, so the first install shows a warning:
 

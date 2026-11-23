@@ -7,7 +7,9 @@ import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
@@ -16,9 +18,11 @@ import { run } from '@/store'
 /** The gear menu in the header. `onUnpair` adds an Unpair item (chat screen only). */
 export function SettingsMenu({ onUnpair }: { onUnpair?: () => void }) {
   const [prefs, setPrefs] = useState<Prefs | null>(null)
+  const [version, setVersion] = useState('')
 
   useEffect(() => {
     void run(api.getPrefs()).then((p) => p && setPrefs(p))
+    void run(api.version()).then((v) => v && setVersion(v))
   }, [])
 
   const update = (change: Partial<Prefs>, save: Promise<void>) => {
@@ -56,6 +60,16 @@ export function SettingsMenu({ onUnpair }: { onUnpair?: () => void }) {
             <DropdownMenuItem variant="destructive" onClick={onUnpair}>
               Unpair…
             </DropdownMenuItem>
+          </>
+        )}
+        {version && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuGroup>
+              <DropdownMenuLabel className="text-xs font-normal">
+                Tightbeam {version}
+              </DropdownMenuLabel>
+            </DropdownMenuGroup>
           </>
         )}
       </DropdownMenuContent>

@@ -46,7 +46,11 @@ New frame types or message kinds. The per-author append-only log stays as it is:
 - [ ] **Images and files**, including pasted screenshots. Use `iroh-blobs` for transfer. Messages carry a content hash, and the bytes sync separately.
 - [x] **Automatic builds.** GitHub Actions (free for public repos, macOS included):
   - `ci.yml` runs the UI checks, plus rustfmt, clippy and the tests on Windows and macOS, for each push to main and each pull request.
-  - `release.yml` builds the Windows installer and the macOS `.dmg` into a draft release when a `v*` tag is pushed (`scripts/release.ps1`).
+  - `release.yml` runs CI on the tagged commit, then builds the Windows installer and the macOS `.dmg` into a draft release when a `v*` tag is pushed (`scripts/release.ps1`). The release text comes from `CHANGELOG.md`.
+  - Dependabot sends monthly update PRs, including for the actions, which are pinned to commit hashes.
+- [ ] **Pre-release channel.** Tags like `v0.2.0-beta.1` publish as pre-releases, which the updater ignores, so a build can be tried by hand before it reaches everyone. `release.ps1` needs to accept that version format.
+- [ ] **Check the built files before upload.** On macOS: a valid signature, the Local Network keys in `Info.plist`, and the version string. On Windows: the installer's version.
+- [ ] **Mac builds of any branch from Actions** (manual run, `.dmg` attached to the run), replacing the SSH build.
   - Building over SSH remains for one-off Mac builds of unreleased branches.
 - [ ] **Off-network chat, opt-in.** Enable iroh's relay servers so peers can reach each other off the LAN. Messages stay end-to-end encrypted, but the relay operator can see that the two endpoints talk. Off by default, with a clear setting.
 

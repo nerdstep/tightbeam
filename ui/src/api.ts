@@ -1,6 +1,7 @@
 // Typed wrappers around the Rust commands in src-tauri/src/lib.rs.
 // The interfaces mirror the Serialize structs in src-tauri/src/chat.rs and db.rs.
 
+import { getVersion } from '@tauri-apps/api/app'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
@@ -70,6 +71,8 @@ export const api = {
   setStartAtLogin: (on: boolean) => invoke<void>('set_start_at_login', { on }),
   /** Opens an http(s) or mailto link outside the app. */
   openLink: (url: string) => invoke<void>('open_link', { url }),
+  /** The app version, from src-tauri/Cargo.toml. */
+  version: () => getVersion(),
   onEvent: (handler: (event: CoreEvent) => void) =>
     listen<CoreEvent>('tightbeam', (e) => handler(e.payload)),
 }
