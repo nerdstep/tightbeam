@@ -29,7 +29,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+          # GitHub's macOS VMs don't deliver mDNS multicast, so the two-peer test can't
+          # find its other peer there. It runs on Windows.
+          - os: macos-latest
+            test-args: -- --skip pair_chat_and_catch_up
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -54,4 +59,4 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
       - name: Test
         working-directory: src-tauri
-        run: cargo test --locked
+        run: cargo test --locked ${{ matrix.test-args }}
