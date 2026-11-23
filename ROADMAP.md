@@ -20,11 +20,11 @@ Previously the whole history loaded at startup and every bubble re-rendered on e
 
 ## 1. Daily use
 
-- [ ] **Keep running in the background.** Closing the window hides it to the tray (Windows) or menu bar (macOS), with Open and Quit items. Add an optional "start at login" (`tauri-plugin-autostart`).
-- [ ] **Notifications.** Show a system notification for a new message when the window isn't focused (`tauri-plugin-notification`), with a setting to turn it off.
-- [ ] **Unread count.** Show a badge on the Dock / taskbar icon, cleared when the chat is focused.
-- [ ] **Remember window size and position** (`tauri-plugin-window-state`).
-- [ ] **Clickable links**, opening in the default browser (`tauri-plugin-opener`).
+- [x] **Keep running in the background.** Closing the window hides it to the tray (Windows) or menu bar (macOS), with Open and Quit items. Add an optional "start at login" (`tauri-plugin-autostart`).
+- [x] **Notifications.** Show a system notification for a new message when the window isn't focused (`tauri-plugin-notification`), with a setting to turn it off.
+- [x] **Unread count.** Shown in the window title, tray tooltip and tray icon (a dot), plus the Dock badge on macOS or a taskbar dot on Windows. Cleared when the window is focused.
+- [x] **Remember window size and position** (`tauri-plugin-window-state`).
+- [x] **Clickable links**, opening in the default browser (`tauri-plugin-opener`).
 - [ ] **Auto updates** with `tauri-plugin-updater`. The app checks a `latest.json` on GitHub Releases at launch (and every few hours), downloads the signed update, and offers "Update ready — restart". Releases can be published from the existing local and SSH builds first (`gh release upload`), before CI exists. It needs:
   - An updater signing keypair (`tauri signer generate`). The public key goes in `tauri.conf.json`; the private key never goes in the repo.
   - A version bump for each release (`tauri.conf.json` and `Cargo.toml`).

@@ -12,7 +12,9 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Tightbeam",
+        "visible": false,
         "width": 440,
         "height": 680,
         "minWidth": 340,

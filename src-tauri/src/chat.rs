@@ -372,6 +372,20 @@ impl Core {
         self.changed();
     }
 
+    /// An app preference stored alongside the chat data (e.g. notifications on/off).
+    pub fn pref(&self, key: &str) -> Result<Option<String>> {
+        self.db().get_str(&format!("pref_{key}"))
+    }
+
+    pub fn set_pref(&self, key: &str, value: &str) -> Result<()> {
+        self.db().set(&format!("pref_{key}"), value)
+    }
+
+    /// The peer's display name, if paired.
+    pub fn peer_name(&self) -> Option<String> {
+        self.state().peer.as_ref().map(|(_, name)| name.clone())
+    }
+
     // ---- Background tasks ----------------------------------------------------------
 
     async fn accept_loop(self: Arc<Self>) {

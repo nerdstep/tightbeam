@@ -47,6 +47,12 @@ export interface Page {
   has_more: boolean
 }
 
+export interface Prefs {
+  notifications: boolean
+  /** `null` when start-at-login isn't available (test mode). */
+  start_at_login: boolean | null
+}
+
 export type CoreEvent = { kind: 'status'; data: Status } | { kind: 'message'; data: Message }
 
 export const api = {
@@ -59,6 +65,11 @@ export const api = {
   answerPair: (accept: boolean) => invoke<void>('answer_pair', { accept }),
   unpair: () => invoke<void>('unpair'),
   dismissNotice: () => invoke<void>('dismiss_notice'),
+  getPrefs: () => invoke<Prefs>('get_prefs'),
+  setNotifications: (on: boolean) => invoke<void>('set_notifications', { on }),
+  setStartAtLogin: (on: boolean) => invoke<void>('set_start_at_login', { on }),
+  /** Opens an http(s) or mailto link outside the app. */
+  openLink: (url: string) => invoke<void>('open_link', { url }),
   onEvent: (handler: (event: CoreEvent) => void) =>
     listen<CoreEvent>('tightbeam', (e) => handler(e.payload)),
 }

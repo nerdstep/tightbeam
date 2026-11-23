@@ -2,6 +2,7 @@ import { shallow, useSelector } from '@tanstack/react-store'
 import { useState } from 'react'
 
 import { api } from '@/api'
+import { SettingsMenu } from '@/components/SettingsMenu'
 import { Button } from '@/components/ui/button'
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from '@/components/ui/empty'
 import { Input } from '@/components/ui/input'
@@ -25,7 +26,10 @@ export function Pair() {
     <section className="flex h-full flex-col">
       <header className="flex items-center justify-between gap-3 border-b bg-card px-4 py-3">
         <h1 className="font-semibold">Pair</h1>
-        <Rename name={myName} />
+        <div className="flex items-center gap-1">
+          <Rename name={myName} />
+          <SettingsMenu />
+        </div>
       </header>
       {nearby.length === 0 ? (
         <Empty>

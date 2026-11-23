@@ -1,16 +1,28 @@
 pub mod chat;
 pub mod db;
+mod desktop;
 
 use std::{path::PathBuf, sync::Arc};
 
-use chat::{Core, Emit, Status};
+use chat::{Core, Emit, Event, Status};
 use db::{Cursor, Message, Page};
-use tauri::{Emitter, Manager, State};
+use desktop::{Desktop, MAIN_WINDOW, MINIMIZED_ARG};
+use serde::Serialize;
+use tauri::{Emitter, Manager, RunEvent, State, WindowEvent};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
+use tauri_plugin_opener::OpenerExt;
+use tauri_plugin_window_state::StateFlags;
 
 type CoreState<'a> = State<'a, Arc<Core>>;
 
-fn err(e: anyhow::Error) -> String {
+fn err(e: impl std::fmt::Display) -> String {
     format!("{e:#}")
+}
+
+/// Running with TIGHTBEAM_DATA_DIR (two copies on one machine for testing): skip
+/// single-instance, window memory and start-at-login, which are per-app, not per-copy.
+fn test_mode() -> bool {
+    std::env::var_os("TIGHTBEAM_DATA_DIR").is_some()
 }
 
 #[tauri::command]
@@ -55,8 +67,67 @@ fn dismiss_notice(core: CoreState) {
     core.dismiss_notice()
 }
 
+#[derive(Serialize)]
+struct Prefs {
+    notifications: bool,
+    /// `None` when start-at-login isn't available (test mode).
+    start_at_login: Option<bool>,
+}
+
+#[tauri::command]
+fn get_prefs(app: tauri::AppHandle, desktop: State<Desktop>) -> Prefs {
+    Prefs {
+        notifications: desktop.notifications(),
+        start_at_login: (!test_mode()).then(|| app.autolaunch().is_enabled().unwrap_or(false)),
+    }
+}
+
+#[tauri::command]
+fn set_notifications(core: CoreState, desktop: State<Desktop>, on: bool) -> Result<(), String> {
+    desktop.set_notifications(on);
+    core.set_pref("notifications", if on { "1" } else { "0" }).map_err(err)
+}
+
+#[tauri::command]
+fn set_start_at_login(app: tauri::AppHandle, on: bool) -> Result<(), String> {
+    if test_mode() {
+        return Err("start at login is off in test mode".into());
+    }
+    let autolaunch = app.autolaunch();
+    if on { autolaunch.enable() } else { autolaunch.disable() }.map_err(err)
+}
+
+/// Opens a link from a message in the default browser or mail app.
+#[tauri::command]
+fn open_link(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let allowed = ["https://", "http://", "mailto:"];
+    if !allowed.iter().any(|p| url.to_ascii_lowercase().starts_with(p)) {
+        return Err("only web and email links can be opened".into());
+    }
+    app.opener().open_url(url, None::<&str>).map_err(err)
+}
+
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    if !test_mode() {
+        builder = builder
+            // Must be first: a second launch just brings back the running window.
+            .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| desktop::show_main(app)))
+            .plugin(
+                tauri_plugin_window_state::Builder::default()
+                    // Not visibility: quitting from the tray would make the next launch hidden.
+                    .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                    .build(),
+            )
+            .plugin(tauri_plugin_autostart::init(
+                MacosLauncher::LaunchAgent,
+                Some(vec![MINIMIZED_ARG]),
+            ));
+    }
+
+    builder
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // To run two copies on one machine: give each its own TIGHTBEAM_DATA_DIR and
             // set TIGHTBEAM_LOOPBACK=1 (see Core::start_with for why).
@@ -65,13 +136,37 @@ pub fn run() {
                 None => app.path().app_data_dir()?,
             };
             let loopback = std::env::var_os("TIGHTBEAM_LOOPBACK").is_some();
+
+            app.manage(Desktop::new());
             let handle = app.handle().clone();
             let emit: Emit = Arc::new(move |event| {
+                if let Event::Message(message) = &event {
+                    desktop::on_message(&handle, message);
+                }
                 let _ = handle.emit("tightbeam", event);
             });
             let core = tauri::async_runtime::block_on(Core::start_with(dir, emit, loopback))?;
+            let notifications = core.pref("notifications")?.as_deref() != Some("0");
+            app.state::<Desktop>().set_notifications(notifications);
             app.manage(core);
+
+            desktop::setup_tray(app.handle())?;
+            // The window starts hidden (tauri.conf.json); show it unless we were started
+            // at login, in which case we stay in the tray.
+            if !std::env::args().any(|a| a == MINIMIZED_ARG) {
+                desktop::show_main(app.handle());
+            }
             Ok(())
+        })
+        .on_window_event(|window, event| match event {
+            // Closing the window hides it; the app keeps running in the tray so messages
+            // still arrive. Quit from the tray (or Cmd+Q on macOS).
+            WindowEvent::CloseRequested { api, .. } if window.label() == MAIN_WINDOW => {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+            WindowEvent::Focused(true) => desktop::clear_unread(window.app_handle()),
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             get_status,
@@ -82,14 +177,22 @@ pub fn run() {
             answer_pair,
             unpair,
             dismiss_notice,
+            get_prefs,
+            set_notifications,
+            set_start_at_login,
+            open_link,
         ])
         .build(tauri::generate_context!())
         .expect("error while starting Tightbeam")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event
-                && let Some(core) = app.try_state::<Arc<Core>>()
-            {
-                tauri::async_runtime::block_on(core.shutdown());
+        .run(|app, event| match event {
+            // macOS: clicking the Dock icon while the window is hidden.
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => desktop::show_main(app),
+            RunEvent::Exit => {
+                if let Some(core) = app.try_state::<Arc<Core>>() {
+                    tauri::async_runtime::block_on(core.shutdown());
+                }
             }
+            _ => {}
         });
 }

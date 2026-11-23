@@ -3,6 +3,8 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { memo, useEffect, useRef, useState } from 'react'
 
 import { api, type Message as ChatMessage } from '@/api'
+import { Linkified } from '@/components/Linkified'
+import { SettingsMenu } from '@/components/SettingsMenu'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -12,7 +14,6 @@ import {
   AlertDialogFooter,
   AlertDialogHeader,
   AlertDialogTitle,
-  AlertDialogTrigger,
 } from '@/components/ui/alert-dialog'
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
 import { Button } from '@/components/ui/button'
@@ -49,6 +50,7 @@ function Header() {
     (s) => ({ name: s.status?.peer?.name ?? '', connected: !!s.status?.connected }),
     { compare: shallow },
   )
+  const [unpairing, setUnpairing] = useState(false)
 
   return (
     <header className="flex items-center justify-between gap-3 border-b bg-card px-4 py-3">
@@ -61,7 +63,8 @@ function Header() {
           {connected ? 'Connected' : 'Not connected · messages send when you’re both online'}
         </span>
       </div>
-      <Unpair name={name} />
+      <SettingsMenu onUnpair={() => setUnpairing(true)} />
+      <UnpairDialog name={name} open={unpairing} onOpenChange={setUnpairing} />
     </header>
   )
 }
@@ -168,7 +171,7 @@ function VirtualTranscript({
                   key={item.key}
                   ref={virtualizer.measureElement}
                   data-index={item.index}
-                  className="absolute start-0 top-0 w-full"
+                  className="absolute inset-s-0 top-0 w-full"
                   style={{ transform: `translateY(${item.start}px)` }}
                 >
                   <Row
@@ -232,7 +235,7 @@ const Row = memo(function Row({
         <MessageContent className="gap-1">
           <Bubble variant={mine ? 'default' : 'secondary'} align={align}>
             <BubbleContent className="whitespace-pre-wrap" title={when.toLocaleString()}>
-              {message.text}
+              <Linkified text={message.text} />
             </BubbleContent>
           </Bubble>
           {groupEnd && (
@@ -312,10 +315,17 @@ function Composer() {
   )
 }
 
-function Unpair({ name }: { name: string }) {
+function UnpairDialog({
+  name,
+  open,
+  onOpenChange,
+}: {
+  name: string
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
   return (
-    <AlertDialog>
-      <AlertDialogTrigger render={<Button variant="ghost" size="sm" />}>Unpair</AlertDialogTrigger>
+    <AlertDialog open={open} onOpenChange={onOpenChange}>
       <AlertDialogContent size="sm">
         <AlertDialogHeader>
           <AlertDialogTitle>Unpair from {name}?</AlertDialogTitle>

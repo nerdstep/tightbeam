@@ -13,6 +13,8 @@ Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https:/
 - **Sync.** Messages are numbered per author. On connect, each side says "the last one I have from you is #N", and the other sends everything after it. Duplicates are ignored, so resending is always safe.
 - **Delivery.** Your message shows "waiting" until the other app confirms it has it, then "delivered".
 
+**In the background:** closing the window hides it. Tightbeam keeps running in the tray (menu bar on macOS) so messages still arrive, with notifications and an unread count. Quit from the tray icon, or with Cmd+Q on macOS. Opening Tightbeam again brings back the running window. Settings (the gear in the header) toggle notifications and start-at-login, which starts it in the tray.
+
 **Privacy:** the app never asks your router to open a port (UPnP is off), never contacts relay or DNS servers, and only advertises private LAN addresses.
 
 ## Layout
