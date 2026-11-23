@@ -4,7 +4,7 @@
 
 import { createStore } from '@tanstack/react-store'
 
-import { api, type Message, type Status } from './api'
+import { api, type Message, type Status, type UpdateReady } from './api'
 
 const PAGE_SIZE = 200
 
@@ -17,6 +17,8 @@ interface State {
   loadingOlder: boolean
   /** A UI-side error (a failed command), shown in place of the engine's notice. */
   error: string | null
+  /** A downloaded update waiting for a restart. */
+  update: UpdateReady | null
 }
 
 export const store = createStore<State>({
@@ -25,6 +27,7 @@ export const store = createStore<State>({
   hasOlder: false,
   loadingOlder: false,
   error: null,
+  update: null,
 })
 
 export const messageKey = (m: Message) => `${m.author}:${m.seq}`
@@ -83,12 +86,19 @@ export function dismissError() {
   store.setState((s) => ({ ...s, error: null }))
 }
 
+export function setUpdate(update: UpdateReady | null) {
+  store.setState((s) => ({ ...s, update }))
+}
+
 export async function start() {
   // Listen first so nothing that happens while loading is missed.
   await api.onEvent((event) => {
     if (event.kind === 'status') store.setState((s) => ({ ...s, status: event.data }))
     else addMessage(event.data)
   })
+  await api.onUpdateReady(setUpdate)
+  // An update may have downloaded before the window loaded.
+  setUpdate(await api.getUpdate())
   const status = await api.getStatus()
   const page = await api.getMessages(undefined, PAGE_SIZE)
   const fresh = page.messages.filter((m) => !loaded.has(messageKey(m)))

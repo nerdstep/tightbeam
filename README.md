@@ -13,9 +13,11 @@ Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https:/
 - **Sync.** Messages are numbered per author. On connect, each side says "the last one I have from you is #N", and the other sends everything after it. Duplicates are ignored, so resending is always safe.
 - **Delivery.** Your message shows "waiting" until the other app confirms it has it, then "delivered".
 
-**In the background:** closing the window hides it. Tightbeam keeps running in the tray (menu bar on macOS) so messages still arrive, with notifications and an unread count. Quit from the tray icon, or with Cmd+Q on macOS. Opening Tightbeam again brings back the running window. Settings (the gear in the header) toggle notifications and start-at-login, which starts it in the tray.
+**In the background:** closing the window hides it. Tightbeam keeps running in the tray (menu bar on macOS) so messages still arrive, with notifications and an unread count. Quit from the gear menu or the tray icon, or with Cmd+Q on macOS. Opening Tightbeam again brings back the running window. Settings (the gear in the header) toggle notifications and start-at-login, which starts it in the tray.
 
-**Privacy:** the app never asks your router to open a port (UPnP is off), never contacts relay or DNS servers, and only advertises private LAN addresses.
+**Updates:** Tightbeam checks GitHub Releases for a new version 30 seconds after it starts, then every 6 hours. It downloads the update in the background and checks the update's signature against the public key in `tauri.conf.json`. A bar then offers to restart into it. Settings has "Check for updates", and "Automatic updates" to turn the checks off. Development and test builds never check.
+
+**Privacy:** the app never asks your router to open a port (UPnP is off), never contacts relay or DNS servers, and only advertises private LAN addresses. Its one connection beyond the LAN is the update check, which tells GitHub your IP address and that you use Tightbeam. Messages never leave the LAN.
 
 ## Layout
 
@@ -27,6 +29,8 @@ ui/src/components/ui/     shadcn/ui components (generated; update with the shadc
 src-tauri/src/chat.rs     the engine: discovery, pairing, protocol, sync
 src-tauri/src/db.rs       SQLite storage and history paging
 src-tauri/src/lib.rs      Tauri commands and events
+src-tauri/src/desktop.rs  tray, unread count, notifications
+src-tauri/src/updates.rs  automatic updates
 src-tauri/tests/          two real engines chatting; paging through 50,000 messages
 src-tauri/examples/seed.rs  fills two test profiles with a long synthetic history
 ```
@@ -74,6 +78,10 @@ It then moves the Unreleased entries under the new version and sets the version 
 The tag starts the Release workflow. It runs CI on the tagged commit, then builds the Windows installer and the macOS app (Apple Silicon, `.dmg`) into a draft release on GitHub. The draft's text is that version's changelog section plus the install steps in `.github/release-footer.md`. Check the draft, then publish it.
 
 Dependabot opens a pull request each month for dependency updates. The GitHub Actions in the workflows are pinned to exact commits, and Dependabot updates those too.
+
+CI signs the update files with the updater's private key. It reads the key from the repository secrets `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`; `src-tauri/tauri.release.conf.json` turns signing on. Local and SSH builds skip the update files, so they don't need the key. Keep a backup of the key: without it, installed copies can't update, and both people would have to reinstall by hand.
+
+Installed copies update from a release once it's published. Drafts and pre-releases are never offered.
 
 The builds aren't signed with a paid certificate, so the first install shows a warning:
 

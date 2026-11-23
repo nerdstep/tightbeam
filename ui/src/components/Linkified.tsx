@@ -1,5 +1,4 @@
-import { api } from '@/api'
-import { run } from '@/store'
+import { ExternalLink } from '@/components/ExternalLink'
 
 /**
  * Web and email links: http(s):// or mailto:, up to whitespace, not ending in
@@ -7,7 +6,7 @@ import { run } from '@/store'
  */
 const LINK = /\b(?:https?:\/\/|mailto:)[^\s<>"]*[^\s<>".,;:!?'")\]}]/gi
 
-/** Message text with links made clickable. They open in the default browser or mail app. */
+/** Message text with links made clickable. */
 export function Linkified({ text }: { text: string }) {
   const parts: React.ReactNode[] = []
   let last = 0
@@ -16,18 +15,9 @@ export function Linkified({ text }: { text: string }) {
     const start = match.index
     if (start > last) parts.push(text.slice(last, start))
     parts.push(
-      <a
-        key={start}
-        href={url}
-        className="underline underline-offset-2 wrap-anywhere hover:opacity-80"
-        onClick={(e) => {
-          // Never navigate the app's own window.
-          e.preventDefault()
-          void run(api.openLink(url))
-        }}
-      >
+      <ExternalLink key={start} href={url}>
         {url}
-      </a>,
+      </ExternalLink>,
     )
     last = start + url.length
   }

@@ -52,6 +52,13 @@ export interface Prefs {
   notifications: boolean
   /** `null` when start-at-login isn't available (test mode). */
   start_at_login: boolean | null
+  /** Automatic update checks. `null` when updates aren't available (dev and test builds). */
+  updates: boolean | null
+}
+
+/** An update that has downloaded and is waiting for a restart. */
+export interface UpdateReady {
+  version: string
 }
 
 export type CoreEvent = { kind: 'status'; data: Status } | { kind: 'message'; data: Message }
@@ -69,10 +76,20 @@ export const api = {
   getPrefs: () => invoke<Prefs>('get_prefs'),
   setNotifications: (on: boolean) => invoke<void>('set_notifications', { on }),
   setStartAtLogin: (on: boolean) => invoke<void>('set_start_at_login', { on }),
+  /** Quits the app. Closing the window only hides it to the tray. */
+  quit: () => invoke<void>('quit'),
   /** Opens an http(s) or mailto link outside the app. */
   openLink: (url: string) => invoke<void>('open_link', { url }),
   /** The app version, from src-tauri/Cargo.toml. */
   version: () => getVersion(),
+  setAutoUpdates: (on: boolean) => invoke<void>('set_auto_updates', { on }),
+  /** Checks now and downloads what it finds. `null` means up to date. */
+  checkForUpdates: () => invoke<UpdateReady | null>('check_for_updates'),
+  getUpdate: () => invoke<UpdateReady | null>('get_update'),
+  /** Installs the downloaded update and restarts the app. */
+  installUpdate: () => invoke<void>('install_update'),
+  onUpdateReady: (handler: (update: UpdateReady) => void) =>
+    listen<UpdateReady>('update-ready', (e) => handler(e.payload)),
   onEvent: (handler: (event: CoreEvent) => void) =>
     listen<CoreEvent>('tightbeam', (e) => handler(e.payload)),
 }

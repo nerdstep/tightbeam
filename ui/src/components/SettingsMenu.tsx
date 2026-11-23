@@ -13,7 +13,33 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { run } from '@/store'
+import { run, setUpdate } from '@/store'
+
+const CHECK_LABEL = {
+  idle: 'Check for updates',
+  checking: 'Checking…',
+  current: 'Up to date',
+  ready: 'Update ready',
+}
+
+/** Checks now. The menu stays open to show the result; a found update shows the update bar. */
+function CheckForUpdates() {
+  const [state, setState] = useState<keyof typeof CHECK_LABEL>('idle')
+
+  const check = async () => {
+    setState('checking')
+    const found = await run(api.checkForUpdates())
+    if (found === undefined) return setState('idle') // failed; the error shows in the banner
+    if (found) setUpdate(found)
+    setState(found ? 'ready' : 'current')
+  }
+
+  return (
+    <DropdownMenuItem closeOnClick={false} disabled={state !== 'idle'} onClick={() => void check()}>
+      {CHECK_LABEL[state]}
+    </DropdownMenuItem>
+  )
+}
 
 /** The gear menu in the header. `onUnpair` adds an Unpair item (chat screen only). */
 export function SettingsMenu({ onUnpair }: { onUnpair?: () => void }) {
@@ -54,6 +80,18 @@ export function SettingsMenu({ onUnpair }: { onUnpair?: () => void }) {
             Start at login
           </DropdownMenuCheckboxItem>
         )}
+        {prefs?.updates != null && (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuCheckboxItem
+              checked={prefs.updates}
+              onCheckedChange={(on) => update({ updates: on }, api.setAutoUpdates(on))}
+            >
+              Automatic updates
+            </DropdownMenuCheckboxItem>
+            <CheckForUpdates />
+          </>
+        )}
         {onUnpair && (
           <>
             <DropdownMenuSeparator />
@@ -62,15 +100,14 @@ export function SettingsMenu({ onUnpair }: { onUnpair?: () => void }) {
             </DropdownMenuItem>
           </>
         )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={() => void run(api.quit())}>Quit Tightbeam</DropdownMenuItem>
         {version && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuGroup>
-              <DropdownMenuLabel className="text-xs font-normal">
-                Tightbeam {version}
-              </DropdownMenuLabel>
-            </DropdownMenuGroup>
-          </>
+          <DropdownMenuGroup>
+            <DropdownMenuLabel className="text-xs font-normal">
+              Tightbeam {version}
+            </DropdownMenuLabel>
+          </DropdownMenuGroup>
         )}
       </DropdownMenuContent>
     </DropdownMenu>

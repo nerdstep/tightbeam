@@ -5,6 +5,7 @@ import { Notice } from './components/Notice'
 import { Pair } from './components/Pair'
 import { PairDialog } from './components/PairDialog'
 import { Setup } from './components/Setup'
+import { UpdateBar } from './components/UpdateBar'
 import { store } from './store'
 
 export function App() {
@@ -20,10 +21,13 @@ export function App() {
   )
 
   return (
-    <>
+    <div className="flex h-full flex-col">
+      <UpdateBar />
       <Notice />
-      {ready && (!named ? <Setup /> : paired ? <Chat /> : <Pair />)}
+      <main className="min-h-0 flex-1">
+        {ready && (!named ? <Setup /> : paired ? <Chat /> : <Pair />)}
+      </main>
       {pairing && <PairDialog prompt={pairing} />}
-    </>
+    </div>
   )
 }

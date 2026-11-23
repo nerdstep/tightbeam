@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod db;
 mod desktop;
+mod updates;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -12,8 +13,13 @@ use tauri::{Emitter, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_window_state::StateFlags;
+use updates::{Ready, Updates};
 
 type CoreState<'a> = State<'a, Arc<Core>>;
+
+/// What window-state remembers. Not visibility: quitting from the tray would make the
+/// next launch hidden.
+const WINDOW_STATE: StateFlags = StateFlags::all().difference(StateFlags::VISIBLE);
 
 fn err(e: impl std::fmt::Display) -> String {
     format!("{e:#}")
@@ -21,7 +27,7 @@ fn err(e: impl std::fmt::Display) -> String {
 
 /// Running with TIGHTBEAM_DATA_DIR (two copies on one machine for testing): skip
 /// single-instance, window memory and start-at-login, which are per-app, not per-copy.
-fn test_mode() -> bool {
+pub(crate) fn test_mode() -> bool {
     std::env::var_os("TIGHTBEAM_DATA_DIR").is_some()
 }
 
@@ -76,14 +82,44 @@ struct Prefs {
     notifications: bool,
     /// `None` when start-at-login isn't available (test mode).
     start_at_login: Option<bool>,
+    /// Automatic update checks. `None` when updates aren't available (dev and test builds).
+    updates: Option<bool>,
 }
 
 #[tauri::command]
-fn get_prefs(app: tauri::AppHandle, desktop: State<Desktop>) -> Prefs {
+fn get_prefs(app: tauri::AppHandle, desktop: State<Desktop>, updates: State<Updates>) -> Prefs {
     Prefs {
         notifications: desktop.notifications(),
         start_at_login: (!test_mode()).then(|| app.autolaunch().is_enabled().unwrap_or(false)),
+        updates: updates::available().then(|| updates.auto()),
     }
+}
+
+#[tauri::command]
+fn set_auto_updates(core: CoreState, updates: State<Updates>, on: bool) -> Result<(), String> {
+    updates.set_auto(on);
+    core.set_pref("updates", if on { "1" } else { "0" }).map_err(err)
+}
+
+/// Checks now. `None` means up to date.
+#[tauri::command]
+async fn check_for_updates(app: tauri::AppHandle) -> Result<Option<Ready>, String> {
+    updates::check(&app).await.map_err(err)
+}
+
+/// The update that's downloaded and waiting for a restart, if any.
+#[tauri::command]
+fn get_update(updates: State<Updates>) -> Option<Ready> {
+    updates.ready()
+}
+
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    // Unpacking the update is blocking work.
+    tauri::async_runtime::spawn_blocking(move || updates::install(&app))
+        .await
+        .map_err(err)?
+        .map_err(err)
 }
 
 #[tauri::command]
@@ -99,6 +135,12 @@ fn set_start_at_login(app: tauri::AppHandle, on: bool) -> Result<(), String> {
     }
     let autolaunch = app.autolaunch();
     if on { autolaunch.enable() } else { autolaunch.disable() }.map_err(err)
+}
+
+/// Quits for real (closing the window only hides it). The engine shuts down on exit.
+#[tauri::command]
+fn quit(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 /// Opens a link from a message in the default browser or mail app.
@@ -119,8 +161,7 @@ pub fn run() {
             .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| desktop::show_main(app)))
             .plugin(
                 tauri_plugin_window_state::Builder::default()
-                    // Not visibility: quitting from the tray would make the next launch hidden.
-                    .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                    .with_state_flags(WINDOW_STATE)
                     .build(),
             )
             .plugin(tauri_plugin_autostart::init(
@@ -132,6 +173,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // To run two copies on one machine: give each its own TIGHTBEAM_DATA_DIR and
             // set TIGHTBEAM_LOOPBACK=1 (see Core::start_with for why).
@@ -152,7 +194,9 @@ pub fn run() {
             let core = tauri::async_runtime::block_on(Core::start_with(dir, emit, loopback))?;
             let notifications = core.pref("notifications")?.as_deref() != Some("0");
             app.state::<Desktop>().set_notifications(notifications);
+            app.manage(Updates::new(core.pref("updates")?.as_deref() != Some("0")));
             app.manage(core);
+            updates::start(app.handle());
 
             desktop::setup_tray(app.handle())?;
             // The window starts hidden (tauri.conf.json); show it unless we were started
@@ -184,6 +228,11 @@ pub fn run() {
             get_prefs,
             set_notifications,
             set_start_at_login,
+            set_auto_updates,
+            check_for_updates,
+            get_update,
+            install_update,
+            quit,
             open_link,
         ])
         .build(tauri::generate_context!())
