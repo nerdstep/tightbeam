@@ -25,10 +25,9 @@ Previously the whole history loaded at startup and every bubble re-rendered on e
 - [x] **Unread count.** Shown in the window title, tray tooltip and tray icon (a dot), plus the Dock badge on macOS or a taskbar dot on Windows. Cleared when the window is focused.
 - [x] **Remember window size and position** (`tauri-plugin-window-state`).
 - [x] **Clickable links**, opening in the default browser (`tauri-plugin-opener`).
-- [ ] **Auto updates** with `tauri-plugin-updater`. The app checks a `latest.json` on GitHub Releases at launch (and every few hours), downloads the signed update, and offers "Update ready — restart". Releases can be published from the existing local and SSH builds first (`gh release upload`), before CI exists. It needs:
-  - An updater signing keypair (`tauri signer generate`). The public key goes in `tauri.conf.json`; the private key never goes in the repo.
-  - A version bump for each release (`tauri.conf.json` and `Cargo.toml`).
-  - On macOS, the app installed somewhere the person running it can write to (for example `~/Applications`). An app the build account copies to `/Users/Shared` can't replace itself.
+- [ ] **Auto updates** with `tauri-plugin-updater`. The app checks a `latest.json` on GitHub Releases at launch (and every few hours), downloads the signed update, and offers "Update ready — restart". It needs:
+  - An updater signing keypair (`tauri signer generate`). The public key goes in `tauri.conf.json`. The private key never goes in the repo; it's stored as the repository secret `TAURI_SIGNING_PRIVATE_KEY`, which the Release workflow passes to `tauri-action`. The action then signs the bundles and uploads `latest.json`.
+  - On macOS, the app installed somewhere the person running it can write to. Dragging it from the release `.dmg` to Applications does that. A copy the build account puts in `/Users/Shared` can't replace itself.
 
 ## 2. Chat features
 
@@ -45,7 +44,10 @@ New frame types or message kinds. The per-author append-only log stays as it is:
 ## 3. Bigger pieces
 
 - [ ] **Images and files**, including pasted screenshots. Use `iroh-blobs` for transfer. Messages carry a content hash, and the bytes sync separately.
-- [ ] **Automatic builds.** GitHub Actions builds the Windows and macOS apps on a version tag (macOS runners are free for public repos) and publishes the release and `latest.json` that auto updates read. This replaces building over SSH. The updater's private signing key is stored as a repository secret.
+- [ ] **Automatic builds.** GitHub Actions (free for public repos, macOS included):
+  - `ci.yml` runs the UI checks, plus rustfmt, clippy and the tests on Windows and macOS, for each push to main and each pull request.
+  - `release.yml` builds the Windows installer and the macOS `.dmg` into a draft release when a `v*` tag is pushed (`scripts/release.ps1`).
+  - Building over SSH remains for one-off Mac builds of unreleased branches.
 - [ ] **Off-network chat, opt-in.** Enable iroh's relay servers so peers can reach each other off the LAN. Messages stay end-to-end encrypted, but the relay operator can see that the two endpoints talk. Off by default, with a clear setting.
 
 ## Later

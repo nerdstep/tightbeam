@@ -55,12 +55,27 @@ bun run check          # type-check, lint (oxlint) and format check (oxfmt)
 bun run fmt            # format
 ```
 
+For the Rust, in `src-tauri`: `cargo fmt` and `cargo clippy --all-targets`. CI runs all of these checks and the tests on Windows and macOS, for every push to main and every pull request.
+
 **Two copies on one PC.** From the project root, run `.\scripts\two-windows.ps1` (add `-Fresh` to start over). It gives each copy its own data folder and uses loopback, because Windows refuses to send from a machine's LAN address to that same address. Close any running Tightbeam first.
 
 **Start over.** Delete the app's data folder: `%APPDATA%\chat.tightbeam.desktop` on Windows, `~/Library/Application Support/chat.tightbeam.desktop` on macOS.
 
-## Building for macOS
+## Releases
 
-Tauri can't build Mac apps from Windows. Mac builds run on a Mac over SSH: `scripts/setup-mac.ps1` prepares it once, and `scripts/build-mac.ps1` builds the `.app` (Apple Silicon) from GitHub. Both expect an SSH alias named `mac-mini`.
+```powershell
+.\scripts\release.ps1 0.2.0
+```
+
+This sets the version in `src-tauri/Cargo.toml`, the only place it's stored (`tauri.conf.json` falls back to it). It then commits, tags `v0.2.0` and pushes. The tag starts the Release workflow, which builds the Windows installer and the macOS app (Apple Silicon, `.dmg`) into a draft release on GitHub. Check the draft, then publish it.
+
+The builds aren't signed with a paid certificate, so the first install shows a warning:
+
+- **Windows:** SmartScreen. Choose "More info", then "Run anyway".
+- **macOS:** open the app once, then go to System Settings → Privacy & Security and choose "Open Anyway".
+
+## Building for macOS by hand
+
+Tauri can't build Mac apps from Windows. To get a Mac build of an unreleased branch, build on a Mac over SSH: `scripts/setup-mac.ps1` prepares the Mac once, and `scripts/build-mac.ps1` builds the `.app` from GitHub. Both expect an SSH alias named `mac-mini`.
 
 `src-tauri/Info.plist` declares the mDNS service and a Local Network usage reason. Without them, macOS silently blocks discovery.

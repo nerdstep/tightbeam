@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Tightbeam",
-  "version": "0.1.0",
   "identifier": "chat.tightbeam.desktop",
   "build": {
     "devUrl": "http://localhost:1420",
@@ -28,7 +27,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "app"],
+    "targets": ["nsis", "app", "dmg"],
     "category": "SocialNetworking",
     "shortDescription": "Private chat between two people on the same network",
     "icon": [

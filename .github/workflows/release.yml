@@ -1,0 +1,73 @@
+name: Release
+
+# Pushing a version tag (scripts/release.ps1 does it) builds the Windows installer and
+# the macOS app into a draft GitHub release. Check the draft, then publish it.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  draft:
+    name: Draft release
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.draft.outputs.id }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag matches the version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' src-tauri/Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match version $version in src-tauri/Cargo.toml"
+            exit 1
+          fi
+      # Created once here rather than by each build, so the two builds can't race to
+      # create two drafts. A re-run reuses the existing draft.
+      - name: Create the draft
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id" | head -n 1)
+          if [ -z "$id" ]; then
+            id=$(gh api "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$GITHUB_REF_NAME" \
+              -f name="Tightbeam ${GITHUB_REF_NAME#v}" \
+              -F draft=true \
+              -F generate_release_notes=true \
+              --jq .id)
+          fi
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.os }})
+    needs: draft
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Apple Silicon, which is all Tightbeam targets.
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: bun install --frozen-lockfile
+      # Builds the bundle targets in tauri.conf.json (the NSIS installer on Windows; the
+      # .app and .dmg on macOS) and uploads them to the draft. The .app goes up as a
+      # .tar.gz. Once the updater is set up, this also signs the updates and writes
+      # latest.json, given TAURI_SIGNING_PRIVATE_KEY from the repository secrets.
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          releaseId: ${{ needs.draft.outputs.id }}
+          tagName: ${{ github.ref_name }}
+          releaseDraft: true
