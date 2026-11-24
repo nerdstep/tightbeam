@@ -4,6 +4,8 @@ A private line between two people on the same network. There's no server and no 
 
 Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https://iroh.computer) for networking, SQLite for history.
 
+![Tightbeam on Windows and on macOS, two people in the same conversation](docs/screenshot-small.png)
+
 ## How it works
 
 - **Identity.** On first launch the app creates a keypair, stored in its SQLite file. The public key is your permanent ID.
