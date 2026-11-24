@@ -4,6 +4,8 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+## 0.6.0 — 2026-11-24
+
 - More commands:
   - `/vanish 1m your message` sends a message that erases itself from both computers once the time is up, counting from when the other person sees it. It shows a countdown, and its notification doesn't include the text. It needs this version or later on both computers.
   - `/dnd` turns on do not disturb for an hour, or for as long as you say (`/dnd 30m`, `/dnd 2h`); `/dnd off` ends it. No notifications or nudge sounds, the other person sees "Do not disturb", and their nudges are paused.
