@@ -2,7 +2,7 @@
 // The interfaces mirror the Serialize structs in src-tauri/src/chat.rs and db.rs.
 
 import { getVersion } from '@tauri-apps/api/app'
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 
 export interface Person {
@@ -69,6 +69,36 @@ export interface Quote extends Ref {
   /** Deleted, or vanished. */
   deleted: boolean
   vanished: boolean
+  /** Its file, unless deleted. */
+  file: FileInfo | null
+}
+
+/** A file attached to a message, as its sender describes it. */
+export interface FileInfo {
+  /** BLAKE3 of the contents. Also how the file is fetched and shown (`fileUrl`). */
+  hash: string
+  name: string
+  size: number
+  mime: string
+  /** Set for an image the sender's app could display. */
+  width?: number
+  height?: number
+  /** A tiny copy of the image as a `data:` URL, shown until the file arrives. */
+  preview?: string
+}
+
+/** A message's file on this computer: still to come, here, or gone from the sender. */
+export interface Attachment extends FileInfo {
+  state: 'pending' | 'done' | 'gone'
+}
+
+/** What the UI says about a file it sends, besides the bytes. */
+export interface NewFile {
+  name: string
+  mime: string
+  width: number | null
+  height: number | null
+  preview: string | null
 }
 
 export interface Reaction {
@@ -84,11 +114,12 @@ export interface Message {
   ts: number
   /** Display order: like `ts`, but never before a message its author had already seen. */
   hlc: number
-  /** The latest edit's text, if edited. Empty once deleted. */
+  /** The latest edit's text, if edited. Empty once deleted. With a file, the caption. */
   text: string
   edited: boolean
-  /** Deleted by its author, or vanished: a placeholder, without reply or reactions. */
+  /** Deleted by its author, or vanished: a placeholder, without reply, reactions or file. */
   deleted: boolean
+  file: Attachment | null
   /** A vanishing message: seconds it lasts once seen. */
   vanish: number | null
   /** When it vanishes (ms), once its countdown has started. */
@@ -139,6 +170,15 @@ export type CoreEvent =
   | { kind: 'updated'; data: Message }
   /** The peer is typing. Repeats every few seconds while they type. */
   | { kind: 'typing' }
+  /** A file is on its way, to or from here. The last one has `have === size`. */
+  | { kind: 'transfer'; data: { hash: string; have: number; size: number } }
+
+/** Escapes everything outside ASCII, so JSON fits in an HTTP header. */
+const asciiJson = (value: unknown) =>
+  JSON.stringify(value).replaceAll(
+    /[\u007f-￿]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`,
+  )
 
 export const api = {
   getStatus: () => invoke<Status>('get_status'),
@@ -153,6 +193,19 @@ export const api = {
   /** `vanish`: seconds it lasts once they've seen it. */
   sendMessage: (text: string, replyTo?: Ref, vanish?: number) =>
     invoke<Message>('send_message', { text, replyTo: replyTo ?? null, vanish: vanish ?? null }),
+  /** Sends a file, with `text` as its caption. Needs the peer on 0.7 or later. */
+  sendFile: async (bytes: ArrayBuffer, file: NewFile, text: string, replyTo?: Ref) =>
+    invoke<Message>('send_file', bytes, {
+      headers: { 'x-tightbeam-file': asciiJson({ ...file, text, reply_to: replyTo ?? null }) },
+    }),
+  /** Where the webview loads a file that's here. */
+  fileUrl: (hash: string) => convertFileSrc(hash, 'tbfile'),
+  /** Opens a picture in its default app. */
+  openFile: (hash: string) => invoke<void>('open_file', { hash }),
+  /** Shows a file in Explorer or Finder. */
+  showFile: (hash: string) => invoke<void>('show_file', { hash }),
+  /** Asks where to save a copy, then saves it. `false` if cancelled. */
+  saveFileCopy: (hash: string) => invoke<boolean>('save_file_copy', { hash }),
   /** `/dnd`: until then (ms), or `null` to turn it off. */
   setDnd: (until: number | null) => invoke<void>('set_dnd', { until }),
   /** `/status`. */

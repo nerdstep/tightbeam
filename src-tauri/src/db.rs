@@ -16,6 +16,11 @@
 //! A vanishing message carries a lifetime (`vanish`, seconds). Each side starts the
 //! countdown (`expires`, its own clock) once the recipient has seen it, then erases its
 //! copy like a delete. `expires` is local and never synced.
+//!
+//! A message can carry a file (`FileInfo`: hash, name, size, type). The bytes live in
+//! the data folder, not here; the `files` table records which have arrived ('done') and
+//! which the sender no longer has ('gone'). No row means still on its way. A delete
+//! blanks the message's file details along with its text.
 
 use std::{
     path::Path,
@@ -51,12 +56,60 @@ pub struct Entry {
     pub kind: Kind,
 }
 
+/// A file attached to a message, as its sender describes it. Synced with the message;
+/// the bytes follow separately.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileInfo {
+    /// BLAKE3 of the contents: 64 lowercase hex digits.
+    pub hash: String,
+    pub name: String,
+    pub size: u64,
+    pub mime: String,
+    /// Set for an image the sender's app could display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// A tiny copy of the image as a `data:` URL, shown until the file arrives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// Where a message's file has got to on this computer.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileState {
+    /// Still to come from the sender.
+    Pending,
+    /// Here, complete and checked.
+    Done,
+    /// The sender no longer has it.
+    Gone,
+}
+
+/// A message's file, as the transcript shows it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Attachment {
+    #[serde(flatten)]
+    pub info: FileInfo,
+    pub state: FileState,
+}
+
+/// A file that's here: its name in the data folder, its type, and its size in bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
     Message {
         reply_to: Option<Ref>,
         /// Seconds it lasts once seen, for a vanishing message.
         vanish: Option<u64>,
+        file: Option<FileInfo>,
     },
     /// Replaces the author's earlier reaction to `to`, if any.
     Reaction { to: Ref },
@@ -69,7 +122,7 @@ pub enum Kind {
 impl Entry {
     pub fn message(author: impl Into<String>, seq: u64, ts: i64, text: impl Into<String>) -> Self {
         let (author, text) = (author.into(), text.into());
-        let kind = Kind::Message { reply_to: None, vanish: None };
+        let kind = Kind::Message { reply_to: None, vanish: None, file: None };
         Self { author, seq, ts, hlc: ts, text, kind }
     }
 }
@@ -81,12 +134,13 @@ pub struct Message {
     pub seq: u64,
     pub ts: i64,
     pub hlc: i64,
-    /// The latest edit's text, if edited. Empty once deleted.
+    /// The latest edit's text, if edited. Empty once deleted. With a file, the caption.
     pub text: String,
     pub edited: bool,
-    /// Deleted by its author, or vanished. Shown as a placeholder, without reply or
-    /// reactions.
+    /// Deleted by its author, or vanished. Shown as a placeholder, without reply,
+    /// reactions or file.
     pub deleted: bool,
+    pub file: Option<Attachment>,
     /// A vanishing message: seconds it lasts once seen.
     pub vanish: Option<u64>,
     /// When it vanishes (ms, this computer's clock), once the countdown has started.
@@ -109,6 +163,8 @@ pub struct Quote {
     /// Deleted, or vanished.
     pub deleted: bool,
     pub vanished: bool,
+    /// Its file, unless deleted.
+    pub file: Option<FileInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -146,6 +202,10 @@ const MESSAGE: &str = "message";
 const REACTION: &str = "reaction";
 const EDIT: &str = "edit";
 const DELETE: &str = "delete";
+
+/// Values of `files.state`.
+const FILE_DONE: &str = "done";
+const FILE_GONE: &str = "gone";
 
 /// Settings key: the highest `hlc` erased by `clear`, so the clock never runs backwards.
 const CLEARED_CLOCK: &str = "cleared_clock";
@@ -213,7 +273,7 @@ impl Db {
             )?;
         }
         let db = Self(conn);
-        if version < 4 {
+        if version < 5 {
             // One transaction, so the search index is filled using the finished schema.
             db.0.execute_batch("BEGIN")?;
             let result = (|| -> Result<()> {
@@ -228,12 +288,28 @@ impl Db {
                          INSERT INTO search (search, rank) VALUES ('secure-delete', 1);",
                     )?;
                 }
-                // 0.6: vanishing messages. `vanish` syncs; `expires` is this computer's own.
+                if version < 4 {
+                    // 0.6: vanishing messages. `vanish` syncs; `expires` is this computer's.
+                    db.0.execute_batch(
+                        "ALTER TABLE messages ADD COLUMN vanish INTEGER;
+                         ALTER TABLE messages ADD COLUMN expires INTEGER;
+                         CREATE INDEX messages_by_expiry ON messages (expires)
+                             WHERE expires IS NOT NULL;",
+                    )?;
+                }
+                // 0.7: files. `file` is the `FileInfo` as JSON; `file_hash` repeats its hash
+                // for lookups.
                 db.0.execute_batch(
-                    "ALTER TABLE messages ADD COLUMN vanish INTEGER;
-                     ALTER TABLE messages ADD COLUMN expires INTEGER;
-                     CREATE INDEX messages_by_expiry ON messages (expires)
-                         WHERE expires IS NOT NULL;",
+                    "ALTER TABLE messages ADD COLUMN file TEXT;
+                     ALTER TABLE messages ADD COLUMN file_hash TEXT;
+                     CREATE INDEX messages_by_file ON messages (file_hash)
+                         WHERE file_hash IS NOT NULL;
+                     CREATE TABLE files (
+                         hash  TEXT PRIMARY KEY,
+                         -- Its name in the data folder.
+                         name  TEXT NOT NULL,
+                         state TEXT NOT NULL
+                     );",
                 )?;
                 if version < 3 {
                     // Fill the search index from the history.
@@ -241,7 +317,7 @@ impl Db {
                         db.index(&Ref { author: e.author, seq: e.seq })?;
                     }
                 }
-                db.0.execute_batch("PRAGMA user_version = 4")?;
+                db.0.execute_batch("PRAGMA user_version = 5")?;
                 Ok(())
             })();
             db.0.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
@@ -295,6 +371,108 @@ impl Db {
             .query_row(params![at.author, at.seq as i64], |r| r.get(0))
             .optional()?
             .flatten())
+    }
+
+    /// Where a file has got to here.
+    pub fn file_state(&self, hash: &str) -> Result<FileState> {
+        let state: Option<String> = self
+            .0
+            .prepare_cached("SELECT state FROM files WHERE hash = ?1")?
+            .query_row([hash], |r| r.get(0))
+            .optional()?;
+        Ok(match state.as_deref() {
+            Some(FILE_DONE) => FileState::Done,
+            Some(FILE_GONE) => FileState::Gone,
+            _ => FileState::Pending,
+        })
+    }
+
+    /// Records a file as here (`name` is where it's stored) or gone from the sender.
+    pub fn set_file(&self, hash: &str, name: &str, state: FileState) -> Result<()> {
+        let state = match state {
+            FileState::Done => FILE_DONE,
+            FileState::Gone => FILE_GONE,
+            FileState::Pending => {
+                self.forget_file(hash)?;
+                return Ok(());
+            }
+        };
+        self.0
+            .prepare_cached(
+                "INSERT INTO files (hash, name, state) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(hash) DO UPDATE SET name = excluded.name, state = excluded.state",
+            )?
+            .execute(params![hash, name, state])?;
+        Ok(())
+    }
+
+    pub fn forget_file(&self, hash: &str) -> Result<()> {
+        self.0.prepare_cached("DELETE FROM files WHERE hash = ?1")?.execute([hash])?;
+        Ok(())
+    }
+
+    /// A file that's here and still attached to a message, so it can be shown or sent.
+    pub fn stored_file(&self, hash: &str) -> Result<Option<StoredFile>> {
+        Ok(self
+            .0
+            .prepare_cached(
+                "SELECT files.name, json_extract(messages.file, '$.mime'),
+                        json_extract(messages.file, '$.size')
+                 FROM files JOIN messages ON messages.file_hash = files.hash
+                 WHERE files.hash = ?1 AND files.state = 'done' LIMIT 1",
+            )?
+            .query_row([hash], |r| {
+                let size: i64 = r.get(2)?;
+                Ok(StoredFile { name: r.get(0)?, mime: r.get(1)?, size: size as u64 })
+            })
+            .optional()?)
+    }
+
+    /// Whether a message still has this file.
+    pub fn file_in_use(&self, hash: &str) -> Result<bool> {
+        Ok(self
+            .0
+            .prepare_cached("SELECT EXISTS (SELECT 1 FROM messages WHERE file_hash = ?1)")?
+            .query_row([hash], |r| r.get(0))?)
+    }
+
+    /// Files still to come, newest message first, each once.
+    pub fn wanted_files(&self) -> Result<Vec<FileInfo>> {
+        let mut stmt = self.0.prepare_cached(
+            "SELECT file FROM messages
+             WHERE file_hash IS NOT NULL AND file_hash NOT IN (SELECT hash FROM files)
+             ORDER BY hlc DESC",
+        )?;
+        let mut wanted: Vec<FileInfo> = Vec::new();
+        for json in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            if let Ok(file) = serde_json::from_str::<FileInfo>(&json?)
+                && !wanted.iter().any(|w| w.hash == file.hash)
+            {
+                wanted.push(file);
+            }
+        }
+        Ok(wanted)
+    }
+
+    /// Recorded files that no message has any more (deleted, vanished or cleared).
+    pub fn unused_files(&self) -> Result<Vec<String>> {
+        let mut stmt = self.0.prepare_cached(
+            "SELECT hash FROM files WHERE hash NOT IN
+                 (SELECT file_hash FROM messages WHERE file_hash IS NOT NULL)",
+        )?;
+        let hashes = stmt.query_map([], |r| r.get(0))?;
+        Ok(hashes.collect::<Result<_, _>>()?)
+    }
+
+    /// The messages that have this file.
+    pub fn with_file(&self, hash: &str) -> Result<Vec<Ref>> {
+        let mut stmt = self.0.prepare_cached(
+            "SELECT author, seq FROM messages WHERE file_hash = ?1 AND kind = 'message'",
+        )?;
+        let refs = stmt.query_map([hash], |r| {
+            Ok(Ref { author: r.get(0)?, seq: r.get::<_, i64>(1)? as u64 })
+        })?;
+        Ok(refs.collect::<Result<_, _>>()?)
     }
 
     /// Messages matching `query`, newest first. Each word matches words starting with
@@ -492,16 +670,18 @@ impl Db {
 
     /// Stores an entry. Returns false if it was already stored.
     pub fn insert(&self, e: &Entry) -> Result<bool> {
-        let (kind, to, vanish) = match &e.kind {
-            Kind::Message { reply_to, vanish } => (MESSAGE, reply_to.as_ref(), *vanish),
-            Kind::Reaction { to } => (REACTION, Some(to), None),
-            Kind::Edit { of } => (EDIT, Some(of), None),
-            Kind::Delete { of } => (DELETE, Some(of), None),
+        let (kind, to, vanish, file) = match &e.kind {
+            Kind::Message { reply_to, vanish, file } => {
+                (MESSAGE, reply_to.as_ref(), *vanish, file.as_ref())
+            }
+            Kind::Reaction { to } => (REACTION, Some(to), None, None),
+            Kind::Edit { of } => (EDIT, Some(of), None, None),
+            Kind::Delete { of } => (DELETE, Some(of), None, None),
         };
         let changed = self.0.execute(
             "INSERT OR IGNORE INTO messages
-                 (author, seq, ts, hlc, text, kind, ref_author, ref_seq, vanish)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (author, seq, ts, hlc, text, kind, ref_author, ref_seq, vanish, file, file_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 e.author,
                 e.seq as i64,
@@ -511,7 +691,9 @@ impl Db {
                 kind,
                 to.map(|r| &r.author),
                 to.map(|r| r.seq as i64),
-                vanish.map(|v| v as i64)
+                vanish.map(|v| v as i64),
+                file.map(serde_json::to_string).transpose()?,
+                file.map(|f| &f.hash),
             ],
         )?;
         if changed == 0 {
@@ -532,16 +714,34 @@ impl Db {
         Ok(true)
     }
 
-    /// Adds a message's current text to the search index, unless it was deleted.
+    /// Adds a message's current text, and its file's name, to the search index, unless
+    /// it was deleted.
     fn index(&self, at: &Ref) -> Result<()> {
         let Some(original) = self.original(at)? else { return Ok(()) };
         let current = self.current(at, original)?;
         if !current.deleted && !self.vanished(at)? {
+            let text = match self.file_of(at)? {
+                Some(file) if current.text.is_empty() => file.name,
+                Some(file) => format!("{}\n{}", current.text, file.name),
+                None => current.text,
+            };
             self.0
                 .prepare_cached("INSERT INTO search (text, author, seq) VALUES (?1, ?2, ?3)")?
-                .execute(params![current.text, at.author, at.seq as i64])?;
+                .execute(params![text, at.author, at.seq as i64])?;
         }
         Ok(())
+    }
+
+    /// A message's file, if it has one and is stored here.
+    fn file_of(&self, at: &Ref) -> Result<Option<FileInfo>> {
+        let json: Option<Option<String>> = self
+            .0
+            .prepare_cached(
+                "SELECT file FROM messages WHERE author = ?1 AND seq = ?2 AND kind = 'message'",
+            )?
+            .query_row(params![at.author, at.seq as i64], |r| r.get(0))
+            .optional()?;
+        Ok(json.flatten().and_then(|j| serde_json::from_str(&j).ok()))
     }
 
     /// A message's text as first sent, if it's stored here.
@@ -570,7 +770,7 @@ impl Db {
 
     /// Adds the latest edit, the quoted message and the reactions.
     fn show(&self, e: Entry) -> Result<Message> {
-        let Kind::Message { reply_to, vanish } = e.kind else { bail!("not a message") };
+        let Kind::Message { reply_to, vanish, file } = e.kind else { bail!("not a message") };
         let at = Ref { author: e.author, seq: e.seq };
         let current = self.current(&at, e.text)?;
         let expires = self.expires(&at)?;
@@ -586,6 +786,7 @@ impl Db {
                 text,
                 edited: false,
                 deleted: true,
+                file: None,
                 vanish,
                 expires,
                 vanished,
@@ -599,8 +800,13 @@ impl Db {
                 let vanished = self.vanished(&to)?;
                 let deleted = vanished || quoted.as_ref().is_some_and(|q| q.deleted);
                 let text = quoted.filter(|_| !deleted).map(|q| q.text);
-                Some(Quote { author: to.author, seq: to.seq, text, deleted, vanished })
+                let file = if deleted { None } else { self.file_of(&to)? };
+                Some(Quote { author: to.author, seq: to.seq, text, deleted, vanished, file })
             }
+            None => None,
+        };
+        let file = match file {
+            Some(info) => Some(Attachment { state: self.file_state(&info.hash)?, info }),
             None => None,
         };
         let reactions = self.reactions(&at)?;
@@ -613,6 +819,7 @@ impl Db {
             text,
             edited,
             deleted: false,
+            file,
             vanish,
             expires,
             vanished: false,
@@ -645,15 +852,17 @@ impl Db {
         })
     }
 
-    /// Blanks the text of a deleted message and of its edits, zeroing the space. Only the
-    /// message's author can delete it, so `of.author` is also whose edits these are.
+    /// Blanks the text and file details of a deleted message, and the text of its edits,
+    /// zeroing the space. Only the message's author can delete it, so `of.author` is also
+    /// whose edits these are. The file itself is removed once no message has it (see
+    /// `unused_files`).
     pub fn scrub(&self, of: &Ref) -> Result<()> {
         self.0.execute(
             "DELETE FROM search WHERE author = ?1 AND seq = ?2",
             params![of.author, of.seq as i64],
         )?;
         self.0.execute(
-            "UPDATE messages SET text = ''
+            "UPDATE messages SET text = '', file = NULL, file_hash = NULL
              WHERE author = ?1 AND (
                  (kind = 'message' AND seq = ?2)
                  OR (kind = 'edit' AND ref_author = ?1 AND ref_seq = ?2))",
@@ -666,7 +875,7 @@ impl Db {
     /// Entries matching `filter`, the SQL after `FROM messages`.
     fn entries(&self, filter: &str, p: impl rusqlite::Params) -> Result<Vec<Entry>> {
         let mut stmt = self.0.prepare_cached(&format!(
-            "SELECT author, seq, ts, hlc, text, kind, ref_author, ref_seq, vanish
+            "SELECT author, seq, ts, hlc, text, kind, ref_author, ref_seq, vanish, file
              FROM messages {filter}"
         ))?;
         let rows = stmt.query_map(p, |r| {
@@ -681,6 +890,9 @@ impl Db {
                 (_, reply_to) => Kind::Message {
                     reply_to,
                     vanish: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                    file: r
+                        .get::<_, Option<String>>(9)?
+                        .and_then(|json| serde_json::from_str(&json).ok()),
                 },
             };
             Ok(Entry {
@@ -710,7 +922,7 @@ mod tests {
 
     fn reply(author: &str, seq: u64, to: (&str, u64)) -> Entry {
         let reply_to = Some(Ref { author: to.0.into(), seq: to.1 });
-        Entry { kind: Kind::Message { reply_to, vanish: None }, ..msg(author, seq) }
+        Entry { kind: Kind::Message { reply_to, vanish: None, file: None }, ..msg(author, seq) }
     }
 
     fn react(author: &str, seq: u64, emoji: &str, to: (&str, u64)) -> Entry {
@@ -940,7 +1152,7 @@ mod tests {
     fn vanishing_messages() {
         let db = Db::open(Path::new(":memory:")).unwrap();
         let vanishing = |author: &str, seq: u64, secs: u64| Entry {
-            kind: Kind::Message { reply_to: None, vanish: Some(secs) },
+            kind: Kind::Message { reply_to: None, vanish: Some(secs), file: None },
             ..Entry::message(author, seq, seq as i64, "secret plans")
         };
         db.insert_many(&[
@@ -954,7 +1166,7 @@ mod tests {
         };
         assert_eq!(
             db.since("peer", 0).unwrap()[0].kind,
-            Kind::Message { reply_to: None, vanish: Some(60) }
+            Kind::Message { reply_to: None, vanish: Some(60), file: None }
         );
 
         // Nothing happens until it's seen.
@@ -984,5 +1196,71 @@ mod tests {
         db.insert(&edit("peer", 3, "secret again", ("peer", 1))).unwrap();
         assert!(find(1).vanished);
         assert!(db.search("again", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn files() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let photo = |hash: &str| FileInfo {
+            hash: hash.repeat(64),
+            name: "beach.jpg".into(),
+            size: 1000,
+            mime: "image/jpeg".into(),
+            width: Some(4),
+            height: Some(3),
+            preview: None,
+        };
+        let with_file = |author: &str, seq: u64, text: &str, file: FileInfo| Entry {
+            kind: Kind::Message { reply_to: None, vanish: None, file: Some(file) },
+            ..Entry::message(author, seq, seq as i64, text)
+        };
+        db.insert_many(&[
+            with_file("peer", 1, "", photo("a")),
+            with_file("peer", 2, "the view", photo("b")),
+            with_file("me", 1, "same again", photo("a")),
+            reply("me", 2, ("peer", 2)),
+        ])
+        .unwrap();
+        let find = |author: &str, seq: u64| {
+            db.all().unwrap().into_iter().find(|m| m.author == author && m.seq == seq).unwrap()
+        };
+        let a = "a".repeat(64);
+
+        // It syncs with the message, and shows as on its way.
+        assert_eq!(db.since("peer", 0).unwrap()[0].kind, with_file("x", 1, "", photo("a")).kind);
+        let shown = find("peer", 1).file.unwrap();
+        assert_eq!((shown.info, shown.state), (photo("a"), FileState::Pending));
+        assert_eq!(find("me", 2).reply_to.unwrap().file, Some(photo("b")), "replies show it");
+
+        // Each file is wanted once, newest message first.
+        let wanted: Vec<_> = db.wanted_files().unwrap().into_iter().map(|f| f.hash).collect();
+        assert_eq!(wanted, ["b".repeat(64), a.clone()]);
+        db.set_file(&a, "beach.jpg", FileState::Done).unwrap();
+        assert_eq!(find("peer", 1).file.unwrap().state, FileState::Done);
+        assert_eq!(db.wanted_files().unwrap().len(), 1);
+        let stored = db.stored_file(&a).unwrap().unwrap();
+        assert_eq!((stored.name.as_str(), stored.mime.as_str()), ("beach.jpg", "image/jpeg"));
+        assert_eq!(db.with_file(&a).unwrap().len(), 2);
+
+        // Found by name, or by caption and name together.
+        assert_eq!(db.search("beach", 10).unwrap().len(), 3);
+        assert_eq!(db.search("view beach", 10).unwrap().len(), 1);
+
+        // Deleting one message leaves the file for the other.
+        db.insert(&delete("peer", 3, ("peer", 1))).unwrap();
+        db.scrub(&Ref { author: "peer".into(), seq: 1 }).unwrap();
+        assert!(find("peer", 1).file.is_none());
+        assert_eq!(db.since("peer", 0).unwrap()[0].kind, msg("x", 1).kind, "blanked in storage");
+        assert!(db.file_in_use(&a).unwrap() && db.unused_files().unwrap().is_empty());
+        db.insert(&delete("me", 3, ("me", 1))).unwrap();
+        db.scrub(&Ref { author: "me".into(), seq: 1 }).unwrap();
+        assert!(!db.file_in_use(&a).unwrap());
+        assert!(db.stored_file(&a).unwrap().is_none(), "never served once unused");
+        assert_eq!(db.unused_files().unwrap(), [a.as_str()]);
+        db.forget_file(&a).unwrap();
+
+        // Clearing leaves nothing wanted.
+        db.clear("me", None).unwrap();
+        assert!(db.wanted_files().unwrap().is_empty());
     }
 }

@@ -6,6 +6,7 @@ import { createStore } from '@tanstack/react-store'
 
 import {
   api,
+  type Attachment,
   type Cursor,
   type Hit,
   type Message,
@@ -14,6 +15,7 @@ import {
   type UpdateReady,
 } from './api'
 import { chime } from './lib/chime'
+import { formatBytes, isPicture, MAX_FILE_BYTES, type Staged, stage, unstage } from './lib/files'
 
 const PAGE_SIZE = 200
 /** Search once typing pauses this long. */
@@ -54,6 +56,12 @@ interface State {
   search: Search | null
   /** A message for the transcript to scroll to and highlight. `n` tells repeats apart. */
   jump: { key: string; n: number } | null
+  /** Pictures waiting in the message box to be sent. */
+  staged: Staged[]
+  /** Files on their way, to or from here, by hash: how far along, 0 to 1. */
+  transfers: Record<string, number>
+  /** The picture shown full size. */
+  viewing: Attachment | null
 }
 
 export const store = createStore<State>({
@@ -70,6 +78,9 @@ export const store = createStore<State>({
   peerTyping: false,
   search: null,
   jump: null,
+  staged: [],
+  transfers: {},
+  viewing: null,
 })
 
 /** How long "typing…" lasts without another signal. The sender repeats it more often. */
@@ -104,7 +115,11 @@ export function addMessage(m: Message) {
  */
 function updateMessage(updated: Message) {
   const key = messageKey(updated)
-  const quote = { text: updated.deleted ? null : updated.text, deleted: updated.deleted }
+  const quote = {
+    text: updated.deleted ? null : updated.text,
+    deleted: updated.deleted,
+    file: updated.file,
+  }
   store.setState((s) => ({
     ...s,
     messages: s.messages.map((m) => {
@@ -118,7 +133,52 @@ function updateMessage(updated: Message) {
     replyingTo:
       updated.deleted && s.replyingTo && messageKey(s.replyingTo) === key ? null : s.replyingTo,
     editing: updated.deleted && s.editing && messageKey(s.editing) === key ? null : s.editing,
+    // Nor keep showing a picture that was deleted.
+    viewing:
+      updated.deleted && s.viewing && fileOf(s.messages, key)?.hash === s.viewing.hash
+        ? null
+        : s.viewing,
   }))
+}
+
+const fileOf = (messages: Message[], key: string) =>
+  messages.find((m) => messageKey(m) === key)?.file
+
+/**
+ * Adds pictures to the message box, to go with the next message. Anything else, or
+ * anything over 1 GB, is turned away with a note.
+ */
+export async function stageFiles(files: File[]) {
+  const pictures = files.filter(isPicture)
+  const fitting = pictures.filter((f) => f.size > 0 && f.size <= MAX_FILE_BYTES)
+  if (fitting.length < files.length) {
+    const tooBig = pictures.find((f) => f.size > MAX_FILE_BYTES)
+    const note = tooBig
+      ? `${tooBig.name} is ${formatBytes(tooBig.size)}. Files can be up to 1 GB.`
+      : 'Only pictures can be sent for now.'
+    store.setState((s) => ({ ...s, error: note }))
+  }
+  const ready = await Promise.all(fitting.map(stage))
+  if (ready.length) store.setState((s) => ({ ...s, staged: [...s.staged, ...ready] }))
+}
+
+/** Takes a picture out of the message box. */
+export function unstageFile(id: number) {
+  const gone = store.state.staged.find((s) => s.id === id)
+  if (gone) unstage(gone)
+  store.setState((s) => ({ ...s, staged: s.staged.filter((x) => x.id !== id) }))
+}
+
+/** Shows a picture full size, or closes it with `null`. */
+export function setViewing(viewing: Attachment | null) {
+  store.setState((s) => ({ ...s, viewing }))
+}
+
+function setTransfer(hash: string, have: number, size: number) {
+  store.setState((s) => {
+    const { [hash]: _, ...others } = s.transfers
+    return { ...s, transfers: have >= size ? others : { ...others, [hash]: have / size } }
+  })
 }
 
 let typingLapse: ReturnType<typeof setTimeout> | undefined
@@ -276,6 +336,9 @@ export async function start() {
         break
       case 'typing':
         setPeerTyping(true)
+        break
+      case 'transfer':
+        setTransfer(event.data.hash, event.data.have, event.data.size)
         break
       case 'nudge':
         // Do not disturb: nudges are refused at the source, but an older build may send one.

@@ -112,6 +112,11 @@ pub fn on_message(app: &AppHandle, message: &Message) {
         let text = match message.text.strip_prefix("/me ") {
             _ if message.vanish.is_some() => "Vanishing message".to_string(),
             Some(action) => format!("{} {action}", title(core.peer_name(), "They")),
+            None if message.text.is_empty() => match &message.file {
+                Some(file) if file.info.width.is_some() => "Sent a picture".to_string(),
+                Some(file) => format!("Sent {}", file.info.name),
+                None => String::new(),
+            },
             None => message.text.clone(),
         };
         let mut body: String = text.chars().take(140).collect();

@@ -28,6 +28,7 @@ anyhow = "1"
 blake3 = "1.8"
 n0-future = "0.3"
 tauri-plugin-updater = "2.14.1"
+tauri-plugin-dialog = "2.8.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

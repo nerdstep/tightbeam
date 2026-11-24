@@ -2,6 +2,7 @@ import { shallow, useSelector } from '@tanstack/react-store'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import {
   EllipsisIcon,
+  ImagePlusIcon,
   PencilIcon,
   ReplyIcon,
   SearchIcon,
@@ -14,6 +15,7 @@ import { memo, useCallback, useEffect, useRef, useState } from 'react'
 
 import { api, type Message as ChatMessage, type Quote, type Reaction } from '@/api'
 import { type Command, parse, suggest } from '@/commands'
+import { describeFile, FileView, StagedFiles, Viewer } from '@/components/Files'
 import { Linkified } from '@/components/Linkified'
 import { SearchBar, SearchResults } from '@/components/Search'
 import { SettingsMenu } from '@/components/SettingsMenu'
@@ -59,7 +61,9 @@ import {
   setDeleting,
   setEditing,
   setReplyingTo,
+  stageFiles,
   store,
+  unstageFile,
 } from '@/store'
 
 /** The reactions on offer. */
@@ -67,6 +71,9 @@ const EMOJI = ['👍', '❤️', '😂', '😮', '😢', '🎉']
 
 /** While typing, tell the peer this often. Their "typing…" lapses a little after. */
 const TYPING_EVERY_MS = 2500
+
+/** Whether something dragged over the window is files. */
+const carriesFiles = (e: React.DragEvent) => e.dataTransfer.types.includes('Files')
 
 /** Paired: the conversation. */
 export function Chat() {
@@ -82,9 +89,31 @@ export function Chat() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
+  // Pictures dragged onto the window go in the message box.
+  const [dragging, setDragging] = useState(false)
+
   return (
     <MessageScrollerProvider defaultScrollPosition="end">
-      <section className="flex h-full flex-col">
+      <section
+        className="relative flex h-full flex-col"
+        onDragOver={(e) => {
+          if (!carriesFiles(e)) return
+          e.preventDefault()
+          e.dataTransfer.dropEffect = 'copy'
+          setDragging(true)
+        }}
+        onDragLeave={(e) => {
+          // Leaving the window, not just moving between the elements inside it.
+          const to = e.relatedTarget
+          if (!(to instanceof Node && e.currentTarget.contains(to))) setDragging(false)
+        }}
+        onDrop={(e) => {
+          if (!carriesFiles(e)) return
+          e.preventDefault()
+          setDragging(false)
+          void stageFiles([...e.dataTransfer.files])
+        }}
+      >
         <Header />
         <SearchBar />
         <div className="relative flex min-h-0 flex-1 flex-col">
@@ -93,6 +122,12 @@ export function Chat() {
         </div>
         <Composer />
         <DeleteDialog />
+        <Viewer />
+        {dragging && (
+          <div className="pointer-events-none absolute inset-2 z-40 grid place-items-center rounded-xl border-2 border-dashed border-primary bg-background/85 text-sm font-medium">
+            Drop pictures to send
+          </div>
+        )}
       </section>
     </MessageScrollerProvider>
   )
@@ -412,7 +447,24 @@ const Row = memo(function Row({
   }
 
   // `/me waves`: an action line, "Alex waves", instead of a bubble.
-  const action = message.text.startsWith('/me ') ? message.text.slice(4) : null
+  const action = message.text.startsWith('/me ') && !message.file ? message.text.slice(4) : null
+  const { file } = message
+  const words = (
+    <>
+      {action === null ? (
+        <Linkified text={message.text} />
+      ) : (
+        <span className="italic">
+          <span className="font-semibold not-italic">{mine ? myName : peerName}</span>{' '}
+          <Linkified text={action} />
+        </span>
+      )}
+      {message.edited && <span className="ms-1.5 text-[11px] opacity-70">edited</span>}
+      {message.vanish !== null && (
+        <VanishTimer seconds={message.vanish} expires={message.expires} />
+      )}
+    </>
+  )
 
   return (
     <div className={groupStart ? 'pt-3' : 'pt-0.5'}>
@@ -426,7 +478,8 @@ const Row = memo(function Row({
             className={message.reactions.length > 0 ? 'mb-6' : ''}
           >
             <BubbleContent
-              className={`whitespace-pre-wrap transition-shadow ${highlighted ? 'ring-3 ring-ring' : ''}`}
+              // A file sits close to the bubble's edge, with the caption under it.
+              className={`whitespace-pre-wrap transition-shadow ${file ? 'p-1' : ''} ${highlighted ? 'ring-3 ring-ring' : ''}`}
               title={when.toLocaleString()}
             >
               {message.reply_to && (
@@ -436,17 +489,16 @@ const Row = memo(function Row({
                   onJump={onJump}
                 />
               )}
-              {action === null ? (
-                <Linkified text={message.text} />
+              {file ? (
+                <>
+                  {/* Keyed by state: a picture that failed to load gets another go once it comes back. */}
+                  <FileView key={file.state} file={file} peer={peerName} />
+                  {(message.text || message.edited) && (
+                    <div className="px-2 pt-1 pb-0.5">{words}</div>
+                  )}
+                </>
               ) : (
-                <span className="italic">
-                  <span className="font-semibold not-italic">{mine ? myName : peerName}</span>{' '}
-                  <Linkified text={action} />
-                </span>
-              )}
-              {message.edited && <span className="ms-1.5 text-[11px] opacity-70">edited</span>}
-              {message.vanish !== null && (
-                <VanishTimer seconds={message.vanish} expires={message.expires} />
+                words
               )}
             </BubbleContent>
             {message.reactions.length > 0 && (
@@ -543,9 +595,11 @@ function QuoteButton({
           ? 'Message vanished'
           : quote.deleted
             ? 'Deleted message'
-            : quote.text?.startsWith('/me ')
-              ? `* ${quote.text.slice(4)}`
-              : (quote.text ?? 'A message that isn’t on this computer')}
+            : quote.file && !quote.text
+              ? describeFile(quote.file)
+              : quote.text?.startsWith('/me ')
+                ? `* ${quote.text.slice(4)}`
+                : (quote.text ?? 'A message that isn’t on this computer')}
       </span>
     </button>
   )
@@ -680,10 +734,12 @@ function Composer() {
   const [active, setActive] = useState(0)
   const [dismissed, setDismissed] = useState(false)
   const [clearing, setClearing] = useState(false)
+  const [sending, setSending] = useState(false)
   const textRef = useRef<HTMLTextAreaElement>(null)
+  const pickerRef = useRef<HTMLInputElement>(null)
   const typingSentRef = useRef(0)
   const { scrollToEnd } = useMessageScroller()
-  const { replyingTo, editing, peerName, myId, away, dndUntil } = useSelector(
+  const { replyingTo, editing, peerName, myId, away, dndUntil, staged } = useSelector(
     store,
     (s) => ({
       replyingTo: s.replyingTo,
@@ -692,6 +748,7 @@ function Composer() {
       myId: s.status?.me.id ?? '',
       away: s.status?.away ? (s.status.away.note ?? '') : null,
       dndUntil: s.status?.dnd_until ?? null,
+      staged: s.staged.length,
     }),
     { compare: shallow },
   )
@@ -767,7 +824,7 @@ function Composer() {
 
   const saveEdit = async (of: ChatMessage) => {
     const value = text.trim()
-    if (!value) {
+    if (!value && !of.file) {
       setHint('An edit can’t be empty. To remove the message, choose Delete instead.')
       return
     }
@@ -785,7 +842,40 @@ function Composer() {
       else setHint(`There's no /${parsed.name} command. To send it as a message, start with //.`)
       return
     }
-    if (parsed.text) await sendText(parsed.text, undefined, parsed.text)
+    if (store.state.staged.length > 0) await sendFiles(parsed.text)
+    else if (parsed.text) await sendText(parsed.text, undefined, parsed.text)
+  }
+
+  /**
+   * Sends the pictures in the message box, one message each. The first carries the
+   * caption and the reply. One that fails stays in the box, with those after it.
+   */
+  const sendFiles = async (caption: string) => {
+    if (sending) return
+    const reply = replyingTo
+    reset()
+    setReplyingTo(null)
+    setSending(true)
+    for (const [i, s] of store.state.staged.entries()) {
+      const first = i === 0
+      const to = first && reply ? { author: reply.author, seq: reply.seq } : undefined
+      const sent = await run(
+        s.file
+          .arrayBuffer()
+          .then((bytes) => api.sendFile(bytes, s.details, first ? caption : '', to)),
+      )
+      if (!sent) {
+        if (first) {
+          setText(caption)
+          setReplyingTo(reply)
+        }
+        break
+      }
+      unstageFile(s.id)
+      addMessage(sent)
+      scrollToEnd({ behavior: 'smooth' })
+    }
+    setSending(false)
   }
 
   /** Sends `value`, replying if a reply was started. `draft` comes back if it fails. */
@@ -911,7 +1001,9 @@ function Composer() {
             <div className="font-medium">
               Replying to {replyingTo.author === myId ? 'yourself' : peerName}
             </div>
-            <div className="truncate text-muted-foreground">{replyingTo.text}</div>
+            <div className="truncate text-muted-foreground">
+              {replyingTo.text || (replyingTo.file && describeFile(replyingTo.file))}
+            </div>
           </div>
           <Button
             type="button"
@@ -941,12 +1033,38 @@ function Composer() {
           </Button>
         </div>
       )}
+      <StagedFiles sending={sending} />
       <div className="flex items-end gap-2">
+        {!editing && (
+          <>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-lg"
+              aria-label="Add pictures"
+              title="Add pictures (or paste, or drop them here)"
+              onClick={() => pickerRef.current?.click()}
+            >
+              <ImagePlusIcon />
+            </Button>
+            <input
+              ref={pickerRef}
+              type="file"
+              accept="image/*,.heic,.heif"
+              multiple
+              hidden
+              onChange={(e) => {
+                void stageFiles([...(e.target.files ?? [])])
+                e.target.value = '' // so the same picture can be chosen again
+              }}
+            />
+          </>
+        )}
         <Textarea
           ref={textRef}
           rows={1}
           maxLength={4000}
-          placeholder="Message, or / for commands"
+          placeholder={staged ? 'Add a caption' : 'Message, or / for commands'}
           aria-label="Message"
           className="max-h-36 min-h-9 resize-none py-1.5 text-sm"
           value={text}
@@ -955,9 +1073,17 @@ function Composer() {
             fit(e.target)
           }}
           onKeyDown={onKeyDown}
+          onPaste={(e) => {
+            // A pasted picture, such as a screenshot, goes with the next message.
+            const files = [...e.clipboardData.files]
+            if (files.length > 0 && !editing) {
+              e.preventDefault()
+              void stageFiles(files)
+            }
+          }}
         />
-        <Button type="submit" size="lg">
-          {editing ? 'Save' : 'Send'}
+        <Button type="submit" size="lg" disabled={sending}>
+          {sending ? <Spinner /> : editing ? 'Save' : 'Send'}
         </Button>
       </div>
       <ClearDialog open={clearing} onOpenChange={setClearing} />

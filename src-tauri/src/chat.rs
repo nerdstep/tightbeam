@@ -6,10 +6,16 @@
 //! `PairRequest` (unpaired) or `Hello` (paired). After both sides say `Hello`, each
 //! sends the log entries the other is missing (messages and reactions), then live
 //! entries, acks, seen receipts, typing and nudges.
+//!
+//! Files travel on streams of their own, so a big one never holds up messages. A `Msg`
+//! carries the file's hash; once it arrives, the receiver opens a stream to the sender,
+//! asks for the file from the first byte it lacks (`FileRequest`), and gets a
+//! `FileReply` followed by the bytes. It checks the whole file against the hash before
+//! keeping it. A transfer that breaks off resumes there next session.
 
 use std::{
-    collections::BTreeMap,
-    path::PathBuf,
+    collections::{BTreeMap, HashSet},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,11 +33,12 @@ use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::{
-    sync::{mpsc, oneshot},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::{Notify, mpsc, oneshot},
     time::timeout,
 };
 
-use crate::db::{Cursor, Db, Entry, Hit, Kind, Message, Page, Ref};
+use crate::db::{Cursor, Db, Entry, FileInfo, FileState, Hit, Kind, Message, Page, Ref};
 
 pub const ALPN: &[u8] = b"tightbeam/1";
 /// mDNS service name, so we only see other Tightbeam apps (`_tightbeam._udp.local`).
@@ -54,6 +61,19 @@ const VANISH_SECS: std::ops::RangeInclusive<u64> = 5..=7 * 24 * 60 * 60;
 pub const SEARCH_LIMIT: usize = 100;
 /// An away note is a few words, like "lunch" or "back at 3".
 const MAX_NOTE_CHARS: usize = 100;
+/// The largest file that can be sent: 1 GB.
+pub const MAX_FILE_BYTES: u64 = 1 << 30;
+const MAX_FILE_NAME_CHARS: usize = 200;
+/// Room for a tiny JPEG preview as a `data:` URL.
+const MAX_PREVIEW_CHARS: usize = 8 * 1024;
+/// What this build can do beyond 0.6, said in `Hello`.
+const FEATURES: &[&str] = &[FILES];
+/// Feature: sends and receives files.
+const FILES: &str = "files";
+/// How long to wait for the start of a file before trying another.
+const FILE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Transfer progress goes to the UI at most this often.
+const PROGRESS_EVERY: Duration = Duration::from_millis(150);
 
 /// Compatibility rules, since the two peers often run different builds:
 /// - New frame types are fine: older peers read them as `Unknown` and skip them.
@@ -77,6 +97,9 @@ enum Frame {
         /// vanishing messages and `Dnd`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
+        /// What the sender's build can do, such as `files`. Added in 0.7.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     /// An entry in the sender's log. Plain, it's a message.
     Msg {
@@ -107,6 +130,10 @@ enum Frame {
         /// version in `Hello`: older ones would keep it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         vanish: Option<u64>,
+        /// A file, with `text` as its caption. Added in 0.7, and only sent to peers whose
+        /// `Hello` lists the `files` feature.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<Box<FileInfo>>,
     },
     Ack {
         have: u64,
@@ -140,6 +167,33 @@ enum Frame {
     /// A frame type from a newer version. Never sent.
     #[serde(other, skip_serializing)]
     Unknown,
+}
+
+/// Opens a file stream: send me this file, starting at byte `from`.
+#[derive(Debug, Serialize, Deserialize)]
+struct FileRequest {
+    hash: String,
+    from: u64,
+}
+
+/// The answer on a file stream. With `found`, the bytes from `from` to the end follow.
+#[derive(Debug, Serialize, Deserialize)]
+struct FileReply {
+    found: bool,
+}
+
+/// What the UI says about a file it sends. The bytes come separately.
+#[derive(Debug, Deserialize)]
+pub struct NewFile {
+    pub name: String,
+    pub mime: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub preview: Option<String>,
+    /// The caption.
+    #[serde(default)]
+    pub text: String,
+    pub reply_to: Option<Ref>,
 }
 
 /// Everything the UI needs except the message list.
@@ -212,6 +266,13 @@ pub enum Event {
     Updated(Message),
     /// The peer is typing.
     Typing,
+    /// A file is on its way, to or from here: `have` of `size` bytes so far. The last one
+    /// for a transfer has `have == size`.
+    Transfer {
+        hash: String,
+        have: u64,
+        size: u64,
+    },
 }
 
 pub type Emit = Arc<dyn Fn(Event) + Send + Sync>;
@@ -251,6 +312,7 @@ struct State {
     peer_away: Option<Away>,
     /// From their last `Hello`, kept between sessions.
     peer_version: Option<String>,
+    peer_features: Vec<String>,
     dnd_until: Option<i64>,
     peer_dnd_until: Option<i64>,
 }
@@ -259,6 +321,10 @@ pub struct Core {
     endpoint: Endpoint,
     me: EndpointId,
     db: Mutex<Db>,
+    /// Where files are kept: `<hash>/<name>`, plus `<hash>.part` while one arrives.
+    files_dir: PathBuf,
+    /// Wakes the session's downloader when a message with a file arrives.
+    files_wanted: Notify,
     state: Mutex<State>,
     emit: Emit,
     /// Discovery, accept and dial loops; stopped on shutdown so nothing keeps
@@ -307,6 +373,7 @@ impl Core {
         let (peer_has, peer_seen, seen) =
             (counter("peer_has")?, counter("peer_seen")?, counter("seen")?);
         let peer_version = db.get_str("peer_version")?;
+        let peer_features = features_from(db.get_str("peer_features")?.as_deref());
         let dnd_until = db.get_str("dnd_until")?.and_then(|s| s.parse().ok());
 
         // LAN only for now: no relay servers, no public DNS, just mDNS. No UPnP either:
@@ -330,6 +397,8 @@ impl Core {
             me: endpoint.id(),
             endpoint,
             db: Mutex::new(db),
+            files_dir: data_dir.join("files"),
+            files_wanted: Notify::new(),
             state: Mutex::new(State {
                 name,
                 peer,
@@ -347,6 +416,7 @@ impl Core {
                 away_by_hand: false,
                 peer_away: None,
                 peer_version,
+                peer_features,
                 dnd_until,
                 peer_dnd_until: None,
             }),
@@ -355,6 +425,7 @@ impl Core {
             rt: tokio::runtime::Handle::current(),
         });
         core.advertise_name();
+        core.prune_files(); // anything left over from a delete while closing
 
         *core.tasks.lock().unwrap() = vec![
             tokio::spawn(core.clone().accept_loop()).abort_handle(),
@@ -463,8 +534,7 @@ impl Core {
         self.advertise_name();
         if let Some(out) = session {
             let have = self.peer_id().map(|p| self.db().max_seq(&p.to_string())).transpose()?;
-            let version = Some(VERSION.into());
-            let _ = out.send(Frame::Hello { name, have: have.unwrap_or(0), version });
+            let _ = out.send(hello(name, have.unwrap_or(0)));
         }
         self.changed();
         Ok(())
@@ -493,7 +563,82 @@ impl Core {
                  updated, try again once you've been connected."
             );
         }
-        let entry = self.append(text, Kind::Message { reply_to, vanish })?;
+        self.post(text, Kind::Message { reply_to, vanish, file: None })
+    }
+
+    /// Sends a file, with `new.text` as its caption. Blocking: it hashes and stores the
+    /// file, so call it off the UI thread.
+    pub fn send_file(&self, bytes: &[u8], new: NewFile) -> Result<Message> {
+        let peer = self.peer_id().context("not paired with anyone yet")?;
+        ensure!(!bytes.is_empty(), "That file is empty.");
+        ensure!(bytes.len() as u64 <= MAX_FILE_BYTES, "Files can be up to 1 GB.");
+        {
+            let st = self.state();
+            ensure!(
+                st.peer_features.iter().any(|f| f == FILES),
+                "Sending pictures needs {} on Tightbeam 0.7 or later. If they've updated, \
+                 try again once you've been connected.",
+                title_name(st.peer.as_ref().map(|(_, n)| n.clone()))
+            );
+        }
+        if let Some(to) = &new.reply_to {
+            ensure!(self.is_ours(to, &peer.to_string()), "can't reply to that");
+        }
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let info = checked_file(FileInfo {
+            hash: hash.clone(),
+            name: new.name,
+            size: bytes.len() as u64,
+            mime: new.mime,
+            width: new.width,
+            height: new.height,
+            preview: new.preview,
+        })
+        .context("That file can't be sent.")?;
+        if self.db().file_state(&hash)? != FileState::Done {
+            let name = safe_name(&info.name);
+            let dir = self.files_dir.join(&hash);
+            std::fs::create_dir_all(&dir)?;
+            let part = self.files_dir.join(format!("{hash}.part"));
+            std::fs::write(&part, bytes)?;
+            std::fs::rename(&part, dir.join(&name))?;
+            self.db().set_file(&hash, &name, FileState::Done)?;
+        }
+        let text = clean(&new.text, MAX_TEXT_CHARS);
+        self.post(text, Kind::Message { reply_to: new.reply_to, vanish: None, file: Some(info) })
+    }
+
+    /// A file that's here and attached to a message: where it is, and its type.
+    ///
+    /// Someone may move, delete or edit files in the data folder. One that's gone, or
+    /// whose size changed, counts as not here: it goes back to waiting, and the
+    /// downloader gets it again from the peer.
+    pub fn file(&self, hash: &str) -> Result<Option<(PathBuf, String)>> {
+        if !is_hash(hash) {
+            return Ok(None);
+        }
+        let Some(stored) = self.db().stored_file(hash)? else { return Ok(None) };
+        let path = self.files_dir.join(hash).join(&stored.name);
+        let intact = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == stored.size);
+        if !intact {
+            self.lost_file(hash)?;
+            return Ok(None);
+        }
+        Ok(Some((path, stored.mime)))
+    }
+
+    /// A file went missing or changed outside the app: wait for it again, from the peer.
+    /// If they don't have it either, it ends up gone.
+    fn lost_file(&self, hash: &str) -> Result<()> {
+        self.db().forget_file(hash)?;
+        self.file_changed(hash)?;
+        self.files_wanted.notify_one();
+        Ok(())
+    }
+
+    /// Adds a message of mine to the log, shows it, and sends it.
+    fn post(&self, text: String, kind: Kind) -> Result<Message> {
+        let entry = self.append(text, kind)?;
         let at = Ref { author: entry.author.clone(), seq: entry.seq };
         let msg = self.db().message(&at)?.context("message vanished")?;
         (self.emit)(Event::Message(msg.clone()));
@@ -513,11 +658,11 @@ impl Core {
         Ok(())
     }
 
-    /// Replaces the text of one of my messages.
+    /// Replaces the text of one of my messages: a file's caption can be empty.
     pub fn edit(&self, of: Ref, text: &str) -> Result<()> {
         let text = clean(text, MAX_TEXT_CHARS);
-        ensure!(!text.is_empty(), "message can't be empty");
         let current = self.my_message(&of)?;
+        ensure!(!text.is_empty() || current.file.is_some(), "message can't be empty");
         if text == current.text {
             return Ok(());
         }
@@ -535,6 +680,7 @@ impl Core {
         self.db().scrub(&of)?;
         self.updated(&of)?;
         self.send_live(entry);
+        self.prune_files();
         Ok(())
     }
 
@@ -615,6 +761,7 @@ impl Core {
     pub fn clear_history(&self) -> Result<()> {
         let keep_after = self.peer_id().map(|_| self.state().peer_has);
         self.db().clear(&self.id(), keep_after)?;
+        self.prune_files();
         Ok(())
     }
 
@@ -701,6 +848,7 @@ impl Core {
             db.delete("peer_seen")?;
             db.delete("seen")?;
             db.delete("peer_version")?;
+            db.delete("peer_features")?;
         }
         let session = {
             let mut st = self.state();
@@ -709,6 +857,7 @@ impl Core {
             st.peer_seen = 0;
             st.seen = 0;
             st.peer_version = None;
+            st.peer_features.clear();
             st.session.take()
         };
         if let Some(s) = session {
@@ -836,12 +985,13 @@ impl Core {
         let (send, mut recv) = conn.accept_bi().await?;
         match read_frame(&mut recv).await? {
             Frame::PairRequest { name } => self.answer_pair_request(conn, send, recv, name).await,
-            Frame::Hello { name, have, version } => {
+            Frame::Hello { name, have, version, features } => {
                 if self.peer_id() != Some(remote) {
                     conn.close(1u32.into(), b"not paired");
                     return Ok(());
                 }
-                self.run_session(conn, send, recv, Some((name, have, version))).await
+                let theirs = TheirHello { name, have, version, features };
+                self.run_session(conn, send, recv, Some(theirs)).await
             }
             other => bail!("unexpected first frame: {other:?}"),
         }
@@ -940,24 +1090,26 @@ impl Core {
         conn: Connection,
         mut send: SendStream,
         mut recv: RecvStream,
-        their_hello: Option<(String, u64, Option<String>)>,
+        their_hello: Option<TheirHello>,
     ) -> Result<()> {
         let peer = self.peer_id().context("not paired")?;
         ensure!(conn.remote_id() == peer, "connection is not from our peer");
         let peer_str = peer.to_string();
 
         let have = self.db().max_seq(&peer_str)?;
-        let hello = Frame::Hello { name: self.name(), have, version: Some(VERSION.into()) };
-        write_frame(&mut send, &hello).await?;
-        let (their_name, their_have, their_version) = match their_hello {
+        write_frame(&mut send, &hello(self.name(), have)).await?;
+        let theirs = match their_hello {
             Some(hello) => hello,
             None => match read_frame(&mut recv).await? {
-                Frame::Hello { name, have, version } => (name, have, version),
+                Frame::Hello { name, have, version, features } => {
+                    TheirHello { name, have, version, features }
+                }
                 other => bail!("expected hello, got {other:?}"),
             },
         };
-        self.update_peer_name(&their_name)?;
-        self.set_peer_version(their_version)?;
+        self.update_peer_name(&theirs.name)?;
+        self.set_peer_build(theirs.version, theirs.features)?;
+        let their_have = theirs.have;
         self.set_peer_has(their_have, true)?;
 
         // Register the session before reading the backlog, so a message sent in between
@@ -998,8 +1150,13 @@ impl Core {
                 }
             }
         });
+        // Files go on streams of their own: the ones they ask me for, and the ones I want.
+        let serving = tokio::spawn(self.clone().serve_files(conn.clone()));
+        let fetching = tokio::spawn(self.clone().fetch_files(conn.clone()));
         let result = self.read_loop(&mut recv, &peer_str, &out).await;
         writer.abort();
+        serving.abort();
+        fetching.abort();
         conn.close(0u32.into(), b"bye");
         {
             let mut st = self.state();
@@ -1031,10 +1188,12 @@ impl Core {
                     edit_of,
                     delete_of,
                     vanish,
+                    file,
                 } => {
                     // A reply to anyone but the two of us becomes a plain message. A
                     // reaction to a stranger's message, or an edit or delete of anyone's
-                    // but the sender's own, is stored but never shown.
+                    // but the sender's own, is stored but never shown. A file that's too
+                    // big or badly described is left off.
                     let kind = match (delete_of, edit_of, react_to) {
                         (Some(of), ..) => Kind::Delete { of },
                         (None, Some(of), _) => Kind::Edit { of },
@@ -1043,7 +1202,8 @@ impl Core {
                             let reply_to = reply_to.filter(|to| self.is_ours(to, peer));
                             let vanish =
                                 vanish.map(|v| v.clamp(*VANISH_SECS.start(), *VANISH_SECS.end()));
-                            Kind::Message { reply_to, vanish }
+                            let file = file.and_then(|f| checked_file(*f));
+                            Kind::Message { reply_to, vanish, file }
                         }
                     };
                     let limit = if matches!(kind, Kind::Reaction { .. }) {
@@ -1197,16 +1357,213 @@ impl Core {
         Ok(entry)
     }
 
-    fn set_peer_version(&self, version: Option<String>) -> Result<()> {
-        if self.state().peer_version == version {
+    /// Records the peer's version and features from their `Hello`.
+    fn set_peer_build(&self, version: Option<String>, features: Vec<String>) -> Result<()> {
+        let features: Vec<String> = features
+            .into_iter()
+            .filter(|f| FEATURES.contains(&f.as_str()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        {
+            let st = self.state();
+            if st.peer_version == version && st.peer_features == features {
+                return Ok(());
+            }
+        }
+        {
+            let db = self.db();
+            match &version {
+                Some(v) => db.set("peer_version", v)?,
+                None => db.delete("peer_version")?, // they went back to an older build
+            }
+            db.set("peer_features", features.join(","))?;
+        }
+        let mut st = self.state();
+        st.peer_version = version;
+        st.peer_features = features;
+        Ok(())
+    }
+
+    // ---- Files ---------------------------------------------------------------------
+
+    /// Answers the peer's file requests for this session.
+    async fn serve_files(self: Arc<Self>, conn: Connection) {
+        while let Ok((send, recv)) = conn.accept_bi().await {
+            let core = self.clone();
+            tokio::spawn(async move {
+                if let Err(e) = core.serve_file(send, recv).await {
+                    eprintln!("sending a file: {e:#}");
+                }
+            });
+        }
+    }
+
+    /// Sends one file, from where they asked. Only files that are here, still attached
+    /// to a message, and unchanged: one edited in place is treated as lost, never sent as
+    /// the original.
+    async fn serve_file(&self, mut send: SendStream, mut recv: RecvStream) -> Result<()> {
+        let request: FileRequest = read_json(&mut recv).await?;
+        let found = match self.file(&request.hash)? {
+            Some((path, _)) => {
+                let check = path.clone();
+                let hash = tokio::task::spawn_blocking(move || hash_file(&check)).await??;
+                if hash == request.hash {
+                    Some(path)
+                } else {
+                    self.lost_file(&request.hash)?;
+                    None
+                }
+            }
+            None => None,
+        };
+        let Some(path) = found else {
+            write_json(&mut send, &FileReply { found: false }).await?;
+            send.finish()?;
+            return Ok(());
+        };
+        let mut file = tokio::fs::File::open(&path).await?;
+        let size = file.metadata().await?.len();
+        let from = request.from.min(size);
+        file.seek(std::io::SeekFrom::Start(from)).await?;
+        write_json(&mut send, &FileReply { found: true }).await?;
+        let mut progress = Progress::new(&request.hash, from, size, &self.emit);
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            let n = file.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            send.write_all(&buf[..n]).await?;
+            progress.add(n as u64);
+        }
+        send.finish()?;
+        // Wait for them to have it all, so the progress ends when theirs does.
+        let _ = send.stopped().await;
+        drop(progress);
+        Ok(())
+    }
+
+    /// Downloads the files this computer still needs, one at a time, newest first, for
+    /// as long as the session lasts.
+    async fn fetch_files(self: Arc<Self>, conn: Connection) {
+        // Ones that failed this session: tried again next time.
+        let mut failed = HashSet::new();
+        loop {
+            let wanted = self.db().wanted_files();
+            let next = match wanted {
+                Ok(wanted) => wanted.into_iter().find(|f| !failed.contains(&f.hash)),
+                Err(e) => {
+                    eprintln!("finding files to fetch: {e:#}");
+                    None
+                }
+            };
+            let Some(file) = next else {
+                self.files_wanted.notified().await;
+                continue;
+            };
+            if let Err(e) = self.fetch_file(&conn, &file).await {
+                eprintln!("fetching a file: {e:#}");
+                failed.insert(file.hash);
+            }
+        }
+    }
+
+    async fn fetch_file(&self, conn: &Connection, file: &FileInfo) -> Result<()> {
+        tokio::fs::create_dir_all(&self.files_dir).await?;
+        let part_path = self.files_dir.join(format!("{}.part", file.hash));
+        let mut part = tokio::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&part_path)
+            .await?;
+        let mut have = part.metadata().await?.len();
+        if have > file.size {
+            have = 0;
+        }
+        part.set_len(have).await?;
+        part.seek(std::io::SeekFrom::Start(have)).await?;
+
+        let (mut send, mut recv) = conn.open_bi().await?;
+        write_json(&mut send, &FileRequest { hash: file.hash.clone(), from: have }).await?;
+        send.finish()?;
+        let reply: FileReply = timeout(FILE_REPLY_TIMEOUT, read_json(&mut recv))
+            .await
+            .context("no answer to a file request")??;
+        if !reply.found {
+            drop(part);
+            let _ = tokio::fs::remove_file(&part_path).await;
+            self.db().set_file(&file.hash, "", FileState::Gone)?;
+            return self.file_changed(&file.hash);
+        }
+        let mut progress = Progress::new(&file.hash, have, file.size, &self.emit);
+        let mut buf = vec![0u8; 256 * 1024];
+        while let Some(n) = recv.read(&mut buf).await? {
+            have += n as u64;
+            ensure!(have <= file.size, "the file is bigger than they said");
+            part.write_all(&buf[..n]).await?;
+            progress.add(n as u64);
+        }
+        part.flush().await?;
+        drop(part);
+        ensure!(have == file.size, "the file ended early");
+
+        let path = part_path.clone();
+        let hash = tokio::task::spawn_blocking(move || hash_file(&path)).await??;
+        if hash != file.hash {
+            let _ = tokio::fs::remove_file(&part_path).await;
+            bail!("{} didn't match its hash", file.name);
+        }
+        // Deleted while it was on its way: don't keep it.
+        if !self.db().file_in_use(&file.hash)? {
+            let _ = tokio::fs::remove_file(&part_path).await;
             return Ok(());
         }
-        match &version {
-            Some(v) => self.db().set("peer_version", v)?,
-            None => self.db().delete("peer_version")?, // they went back to an older build
+        let name = safe_name(&file.name);
+        let dir = self.files_dir.join(&file.hash);
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::rename(&part_path, dir.join(&name)).await?;
+        self.db().set_file(&file.hash, &name, FileState::Done)?;
+        drop(progress);
+        self.file_changed(&file.hash)
+    }
+
+    /// Tells the UI about each message with this file.
+    fn file_changed(&self, hash: &str) -> Result<()> {
+        let refs = self.db().with_file(hash)?;
+        for at in refs {
+            self.updated(&at)?;
         }
-        self.state().peer_version = version;
         Ok(())
+    }
+
+    /// Removes files no message has any more, and partial downloads of them.
+    fn prune_files(&self) {
+        let result = (|| -> Result<()> {
+            let unused = self.db().unused_files()?;
+            for hash in unused {
+                let dir = self.files_dir.join(&hash);
+                if dir.exists() {
+                    std::fs::remove_dir_all(&dir)?;
+                }
+                self.db().forget_file(&hash)?;
+            }
+            let Ok(entries) = std::fs::read_dir(&self.files_dir) else { return Ok(()) };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if let Some(hash) = name.strip_suffix(".part")
+                    && !self.db().file_in_use(hash)?
+                {
+                    // Fails while it's still being written; the download checks again.
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("removing unused files: {e:#}");
+        }
     }
 
     /// Erases vanishing messages as their time runs out.
@@ -1217,8 +1574,11 @@ impl Core {
             let gone = self.db().expire(now_ms());
             match gone {
                 Ok(gone) => {
-                    for at in gone {
-                        let _ = self.updated(&at);
+                    for at in &gone {
+                        let _ = self.updated(at);
+                    }
+                    if !gone.is_empty() {
+                        self.prune_files();
                     }
                 }
                 Err(e) => eprintln!("erasing vanished messages: {e:#}"),
@@ -1268,10 +1628,13 @@ impl Core {
     /// Tells the UI about a new entry from the peer.
     fn announce(&self, entry: Entry) -> Result<()> {
         match entry.kind {
-            Kind::Message { .. } => {
+            Kind::Message { file, .. } => {
                 let at = Ref { author: entry.author, seq: entry.seq };
                 if let Some(msg) = self.db().message(&at)? {
                     (self.emit)(Event::Message(msg));
+                }
+                if file.is_some() {
+                    self.files_wanted.notify_one();
                 }
             }
             Kind::Reaction { to } => self.updated(&to)?,
@@ -1282,6 +1645,7 @@ impl Core {
                 // Blank it if it's deleted. Also catches an edit sent after the delete.
                 if self.db().message(&of)?.is_some_and(|m| m.deleted) {
                     self.db().scrub(&of)?;
+                    self.prune_files();
                 }
                 self.updated(&of)?;
             }
@@ -1368,15 +1732,153 @@ fn is_lan(addr: &TransportAddr, allow_loopback: bool) -> bool {
 
 fn to_frame(entry: Entry) -> Frame {
     let (mut reply_to, mut react_to, mut edit_of, mut delete_of) = (None, None, None, None);
-    let mut vanish = None;
+    let (mut vanish, mut file) = (None, None);
     match entry.kind {
-        Kind::Message { reply_to: to, vanish: v } => (reply_to, vanish) = (to, v),
+        Kind::Message { reply_to: to, vanish: v, file: f } => {
+            (reply_to, vanish, file) = (to, v, f.map(Box::new))
+        }
         Kind::Reaction { to } => react_to = Some(to),
         Kind::Edit { of } => edit_of = Some(of),
         Kind::Delete { of } => delete_of = Some(of),
     }
     let (seq, ts, hlc, text) = (entry.seq, entry.ts, Some(entry.hlc), entry.text);
-    Frame::Msg { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of, vanish }
+    Frame::Msg { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of, vanish, file }
+}
+
+/// My `Hello`: who I am, the last of their entries I have, and what this build does.
+fn hello(name: String, have: u64) -> Frame {
+    let features = FEATURES.iter().map(|f| f.to_string()).collect();
+    Frame::Hello { name, have, version: Some(VERSION.into()), features }
+}
+
+/// The peer's `Hello`, at the start of a session.
+struct TheirHello {
+    name: String,
+    have: u64,
+    version: Option<String>,
+    features: Vec<String>,
+}
+
+/// Features as stored in settings: comma separated.
+fn features_from(stored: Option<&str>) -> Vec<String> {
+    let stored = stored.unwrap_or_default();
+    stored.split(',').filter(|f| !f.is_empty()).map(String::from).collect()
+}
+
+/// A file's description, tidied, or `None` if it can't be accepted: no valid hash, empty,
+/// or over the size limit. Image details that don't make sense are dropped.
+fn checked_file(file: FileInfo) -> Option<FileInfo> {
+    if !is_hash(&file.hash) || file.size == 0 || file.size > MAX_FILE_BYTES {
+        return None;
+    }
+    let mut name = clean(&file.name, MAX_FILE_NAME_CHARS);
+    if name.is_empty() {
+        name = "file".into();
+    }
+    let mime = file.mime.trim().to_ascii_lowercase();
+    let mime_ok = mime.len() <= 100
+        && mime.contains('/')
+        && mime.chars().all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c));
+    let mime = if mime_ok { mime } else { "application/octet-stream".into() };
+    let dims = match (file.width, file.height) {
+        (Some(w), Some(h)) if (1..=100_000).contains(&w) && (1..=100_000).contains(&h) => {
+            Some((w, h))
+        }
+        _ => None,
+    };
+    let preview = file.preview.filter(|p| {
+        p.len() <= MAX_PREVIEW_CHARS
+            && ["data:image/jpeg;base64,", "data:image/png;base64,", "data:image/webp;base64,"]
+                .iter()
+                .any(|prefix| p.starts_with(prefix))
+            && p.split_once(',').is_some_and(|(_, data)| {
+                data.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
+            })
+    });
+    Some(FileInfo {
+        hash: file.hash,
+        name,
+        size: file.size,
+        mime,
+        width: dims.map(|d| d.0),
+        height: dims.map(|d| d.1),
+        preview: preview.filter(|_| dims.is_some()),
+    })
+}
+
+/// A BLAKE3 hash as files are named by: 64 lowercase hex digits.
+fn is_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(std::fs::File::open(path)?)?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// A file name that's safe to store on Windows and macOS, keeping its extension.
+fn safe_name(name: &str) -> String {
+    const MAX: usize = 100;
+    let name: String = name
+        .chars()
+        .map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c })
+        .collect();
+    let name = name.trim().trim_start_matches('.').trim_end_matches(['.', ' ']);
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.chars().count() <= 10 => (stem, ext),
+        _ => (name, ""),
+    };
+    let room = MAX - ext.chars().count() - 1;
+    let mut stem: String = stem.chars().take(room).collect::<String>().trim_end().to_string();
+    if stem.is_empty() {
+        stem = "file".into();
+    }
+    // Names Windows reserves for devices, with or without an extension.
+    let device = stem.to_ascii_uppercase();
+    let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&device.as_str())
+        || (device.len() == 4
+            && (device.starts_with("COM") || device.starts_with("LPT"))
+            && device.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        stem.insert(0, '_');
+    }
+    if ext.is_empty() { stem } else { format!("{stem}.{ext}") }
+}
+
+/// Reports a transfer's progress to the UI, a few times a second. Dropping it says the
+/// transfer is over, done or not, so a broken one doesn't look stuck.
+struct Progress {
+    hash: String,
+    have: u64,
+    size: u64,
+    last: Instant,
+    emit: Emit,
+}
+
+impl Progress {
+    fn new(hash: &str, have: u64, size: u64, emit: &Emit) -> Self {
+        let (hash, emit) = (hash.to_string(), emit.clone());
+        Self { hash, have, size, last: Instant::now(), emit }
+    }
+
+    fn add(&mut self, n: u64) {
+        self.have += n;
+        if self.last.elapsed() >= PROGRESS_EVERY && self.have < self.size {
+            self.last = Instant::now();
+            self.send(self.have);
+        }
+    }
+
+    fn send(&self, have: u64) {
+        (self.emit)(Event::Transfer { hash: self.hash.clone(), have, size: self.size });
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        self.send(self.size);
+    }
 }
 
 /// The peer's name for messages, or a stand-in before they've named themselves.
@@ -1393,13 +1895,22 @@ fn now_ms() -> i64 {
 }
 
 async fn write_frame(send: &mut SendStream, frame: &Frame) -> Result<()> {
-    let body = serde_json::to_vec(frame)?;
+    write_json(send, frame).await
+}
+
+async fn read_frame(recv: &mut RecvStream) -> Result<Frame> {
+    read_json(recv).await
+}
+
+/// Length-prefixed JSON, as frames are sent.
+async fn write_json(send: &mut SendStream, value: &impl Serialize) -> Result<()> {
+    let body = serde_json::to_vec(value)?;
     send.write_all(&(body.len() as u32).to_be_bytes()).await?;
     send.write_all(&body).await?;
     Ok(())
 }
 
-async fn read_frame(recv: &mut RecvStream) -> Result<Frame> {
+async fn read_json<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Result<T> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
@@ -1452,18 +1963,49 @@ mod tests {
         assert_eq!(json, r#"{"t":"back"}"#);
         let json = serde_json::to_string(&Frame::Dnd { until: Some(5) }).unwrap();
         assert_eq!(json, r#"{"t":"dnd","until":5}"#);
-        let hello = Frame::Hello { name: "a".into(), have: 1, version: Some("0.6.0".into()) };
+        let hello = Frame::Hello {
+            name: "a".into(),
+            have: 1,
+            version: Some("0.7.0".into()),
+            features: vec!["files".into()],
+        };
         let json = serde_json::to_string(&hello).unwrap();
-        assert_eq!(json, r#"{"t":"hello","name":"a","have":1,"version":"0.6.0"}"#);
-        // A Hello from before 0.6 has no version.
+        assert_eq!(
+            json,
+            r#"{"t":"hello","name":"a","have":1,"version":"0.7.0","features":["files"]}"#
+        );
+        // A Hello from before 0.6 has no version, and from before 0.7 no features.
         let old = parse(r#"{"t":"hello","name":"a","have":1}"#);
-        assert!(matches!(old, Frame::Hello { version: None, .. }));
+        assert!(
+            matches!(old, Frame::Hello { version: None, ref features, .. } if features.is_empty())
+        );
         let vanishing = Entry {
-            kind: Kind::Message { reply_to: None, vanish: Some(60) },
+            kind: Kind::Message { reply_to: None, vanish: Some(60), file: None },
             ..Entry::message("me", 9, 1, "psst")
         };
         let json = serde_json::to_string(&to_frame(vanishing)).unwrap();
         assert_eq!(json, r#"{"t":"msg","seq":9,"ts":1,"hlc":1,"text":"psst","vanish":60}"#);
+        let file = FileInfo {
+            hash: "ab".repeat(32),
+            name: "a.png".into(),
+            size: 5,
+            mime: "image/png".into(),
+            width: None,
+            height: None,
+            preview: None,
+        };
+        let photo = Entry {
+            kind: Kind::Message { reply_to: None, vanish: None, file: Some(file) },
+            ..Entry::message("me", 10, 1, "")
+        };
+        let json = serde_json::to_string(&to_frame(photo)).unwrap();
+        let hash = "ab".repeat(32);
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"t":"msg","seq":10,"ts":1,"hlc":1,"text":"","file":{{"hash":"{hash}","name":"a.png","size":5,"mime":"image/png"}}}}"#
+            )
+        );
         // A plain message has the fields from before 0.4, plus `hlc` from 0.5.
         let plain = to_frame(Entry::message("me", 7, 1, "hi"));
         let json = serde_json::to_string(&plain).unwrap();
@@ -1479,5 +2021,57 @@ mod tests {
             json,
             r#"{"t":"msg","seq":8,"ts":1,"hlc":1,"text":"👍","react_to":{"author":"x","seq":2}}"#
         );
+    }
+
+    #[test]
+    fn file_names_are_safe_to_store() {
+        assert_eq!(safe_name("beach.jpg"), "beach.jpg");
+        assert_eq!(safe_name("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(safe_name(r"C:\Windows\a:b?.png"), "C__Windows_a_b_.png");
+        assert_eq!(safe_name(".hidden"), "hidden");
+        assert_eq!(safe_name("trailing. . "), "trailing");
+        assert_eq!(safe_name("con.txt"), "_con.txt");
+        assert_eq!(safe_name("COM1"), "_COM1");
+        assert_eq!(safe_name("company.txt"), "company.txt");
+        assert_eq!(safe_name("..."), "file");
+        assert_eq!(safe_name(""), "file");
+        let long = format!("{}.jpeg", "x".repeat(300));
+        let safe = safe_name(&long);
+        assert_eq!(safe.chars().count(), 100);
+        assert!(safe.ends_with(".jpeg"));
+    }
+
+    #[test]
+    fn file_details_are_checked() {
+        let good = FileInfo {
+            hash: "0f".repeat(32),
+            name: "  pic.png ".into(),
+            size: 10,
+            mime: "Image/PNG".into(),
+            width: Some(4),
+            height: Some(3),
+            preview: Some("data:image/jpeg;base64,AAAA".into()),
+        };
+        let checked = checked_file(good.clone()).unwrap();
+        assert_eq!((checked.name.as_str(), checked.mime.as_str()), ("pic.png", "image/png"));
+        assert_eq!(checked.preview, good.preview);
+
+        let bad_hash = FileInfo { hash: "../x".into(), ..good.clone() };
+        assert!(checked_file(bad_hash).is_none());
+        assert!(checked_file(FileInfo { hash: "0F".repeat(32), ..good.clone() }).is_none());
+        assert!(checked_file(FileInfo { size: MAX_FILE_BYTES + 1, ..good.clone() }).is_none());
+        assert!(checked_file(FileInfo { size: 0, ..good.clone() }).is_none());
+
+        let odd = checked_file(FileInfo {
+            mime: "text/html; charset=utf-8".into(),
+            width: Some(0),
+            preview: Some("data:image/svg+xml;base64,AAAA".into()),
+            ..good.clone()
+        })
+        .unwrap();
+        assert_eq!(odd.mime, "application/octet-stream");
+        assert_eq!((odd.width, odd.height, odd.preview), (None, None, None));
+        let script = Some("data:image/jpeg;base64,<script>".into());
+        assert!(checked_file(FileInfo { preview: script, ..good }).unwrap().preview.is_none());
     }
 }

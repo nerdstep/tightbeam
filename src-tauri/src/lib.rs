@@ -6,12 +6,17 @@ mod updates;
 
 use std::{path::PathBuf, sync::Arc};
 
-use chat::{ConnectionInfo, Core, Emit, Event, Status};
+use chat::{ConnectionInfo, Core, Emit, Event, NewFile, Status};
 use db::{Cursor, Hit, Message, Page, Ref};
 use desktop::{Desktop, MAIN_WINDOW, MINIMIZED_ARG};
 use serde::Serialize;
-use tauri::{Emitter, Manager, RunEvent, State, WindowEvent};
+use tauri::{
+    Emitter, Manager, RunEvent, State, WindowEvent,
+    http::{Response, StatusCode, header},
+    ipc::InvokeBody,
+};
 use tauri_plugin_autostart::{MacosLauncher, ManagerExt as _};
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_window_state::StateFlags;
 use updates::{Ready, Updates};
@@ -78,6 +83,126 @@ fn send_message(
     vanish: Option<u64>,
 ) -> Result<Message, String> {
     core.send_message(&text, reply_to, vanish).map_err(err)
+}
+
+/// Sends a file. The body is its bytes; the `x-tightbeam-file` header is a `NewFile` as
+/// JSON (ASCII only: the UI escapes the rest).
+#[tauri::command]
+async fn send_file(
+    core: State<'_, Arc<Core>>,
+    request: tauri::ipc::Request<'_>,
+) -> Result<Message, String> {
+    let InvokeBody::Raw(bytes) = request.body() else {
+        return Err("expected the file's bytes".into());
+    };
+    let details = request
+        .headers()
+        .get("x-tightbeam-file")
+        .and_then(|v| v.to_str().ok())
+        .ok_or("missing the file's details")?;
+    let new: NewFile = serde_json::from_str(details).map_err(err)?;
+    let (core, bytes) = (core.inner().clone(), bytes.clone());
+    // Hashing and writing a big file takes a moment.
+    tauri::async_runtime::spawn_blocking(move || core.send_file(&bytes, new))
+        .await
+        .map_err(err)?
+        .map_err(err)
+}
+
+/// Kinds of file that open in their default app. Anything else, like a program, can only
+/// be shown in its folder.
+const OPENABLE: &[&str] =
+    &["jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "heic", "heif", "tif", "tiff"];
+
+/// Opens a received or sent picture in its default app.
+#[tauri::command]
+fn open_file(app: tauri::AppHandle, core: CoreState, hash: String) -> Result<(), String> {
+    let (path, _) = core.file(&hash).map_err(err)?.ok_or(MISSING)?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_lowercase();
+    if !OPENABLE.contains(&ext.as_str()) {
+        return Err("Only pictures can be opened from here. Use Show in folder.".into());
+    }
+    app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(err)
+}
+
+/// Shows a file in Explorer or Finder.
+#[tauri::command]
+fn show_file(app: tauri::AppHandle, core: CoreState, hash: String) -> Result<(), String> {
+    let (path, _) = core.file(&hash).map_err(err)?.ok_or(MISSING)?;
+    app.opener().reveal_item_in_dir(path).map_err(err)
+}
+
+/// Copies a file to where the person chooses, starting in Pictures. `false` if they
+/// cancelled.
+#[tauri::command]
+async fn save_file_copy(
+    app: tauri::AppHandle,
+    core: State<'_, Arc<Core>>,
+    hash: String,
+) -> Result<bool, String> {
+    let (path, _) = core.file(&hash).map_err(err)?.ok_or(MISSING)?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut dialog = app.dialog().file().set_title("Save a copy").set_file_name(&name);
+    if let Ok(dir) = app.path().picture_dir().or_else(|_| app.path().download_dir()) {
+        dialog = dialog.set_directory(dir);
+    }
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        dialog = dialog.add_filter(ext.to_uppercase(), &[ext]);
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dialog.save_file(move |chosen| {
+        let _ = tx.send(chosen);
+    });
+    let Some(chosen) = rx.await.map_err(err)? else { return Ok(false) };
+    let to = chosen.into_path().map_err(err)?;
+    tauri::async_runtime::spawn_blocking(move || std::fs::copy(path, to))
+        .await
+        .map_err(err)?
+        .map_err(err)?;
+    Ok(true)
+}
+
+/// For a file that was moved or changed outside the app: `Core::file` has already asked
+/// for it again.
+const MISSING: &str =
+    "That file was moved or changed outside Tightbeam, so it's being fetched again.";
+
+/// Types the webview may show as an image. Not SVG, which can carry scripts.
+const SHOWABLE: &[&str] = &[
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/avif",
+    "image/bmp",
+    "image/heic",
+    "image/heif",
+];
+
+/// `tbfile://localhost/<hash>` (`http://tbfile.localhost/<hash>` on Windows): a stored
+/// file, for the webview to show. Only files still attached to a message, and never
+/// cached, so a deleted picture doesn't linger in the webview's cache.
+fn file_response(app: &tauri::AppHandle, path: &str) -> Response<Vec<u8>> {
+    let respond = |status: StatusCode, mime: &str, body: Vec<u8>| {
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, mime)
+            .header(header::CACHE_CONTROL, "no-store")
+            .header("X-Content-Type-Options", "nosniff")
+            .body(body)
+            .unwrap_or_default()
+    };
+    let hash = path.trim_start_matches('/');
+    let found = app.try_state::<Arc<Core>>().and_then(|core| core.file(hash).ok().flatten());
+    let Some((file, mime)) = found else {
+        return respond(StatusCode::NOT_FOUND, "text/plain", Vec::new());
+    };
+    let mime =
+        if SHOWABLE.contains(&mime.as_str()) { mime } else { "application/octet-stream".into() };
+    match std::fs::read(file) {
+        Ok(bytes) => respond(StatusCode::OK, &mime, bytes),
+        Err(_) => respond(StatusCode::NOT_FOUND, "text/plain", Vec::new()),
+    }
 }
 
 /// `/status`.
@@ -254,7 +379,15 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .register_asynchronous_uri_scheme_protocol("tbfile", |ctx, request, responder| {
+            let (app, path) = (ctx.app_handle().clone(), request.uri().path().to_string());
+            // Reading a big file shouldn't hold up the webview.
+            tauri::async_runtime::spawn_blocking(move || {
+                responder.respond(file_response(&app, &path));
+            });
+        })
         .setup(|app| {
             // To run two copies on one machine: give each its own TIGHTBEAM_DATA_DIR and
             // set TIGHTBEAM_LOOPBACK=1 (see Core::start_with for why).
@@ -270,7 +403,10 @@ pub fn run() {
                 match &event {
                     Event::Message(message) => desktop::on_message(&handle, message),
                     Event::Nudge => desktop::on_nudge(&handle),
-                    Event::Status(_) | Event::Updated(_) | Event::Typing => {}
+                    Event::Status(_)
+                    | Event::Updated(_)
+                    | Event::Typing
+                    | Event::Transfer { .. } => {}
                 }
                 let _ = handle.emit("tightbeam", event);
             });
@@ -307,6 +443,10 @@ pub fn run() {
             search,
             set_name,
             send_message,
+            send_file,
+            open_file,
+            show_file,
+            save_file_copy,
             react,
             edit_message,
             delete_message,

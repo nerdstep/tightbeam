@@ -17,12 +17,13 @@
         "width": 440,
         "height": 680,
         "minWidth": 340,
-        "minHeight": 420
+        "minHeight": 420,
+        "dragDropEnabled": false
       }
     ],
     "security": {
-      "csp": "default-src 'self' ipc: http://ipc.localhost",
-      "devCsp": "default-src 'self' ipc: http://ipc.localhost ws://localhost:1420; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob: tbfile: http://tbfile.localhost",
+      "devCsp": "default-src 'self' ipc: http://ipc.localhost ws://localhost:1420; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: tbfile: http://tbfile.localhost"
     }
   },
   "plugins": {
@@ -45,6 +46,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "windows": {
+      "nsis": { "installerHooks": "windows/hooks.nsh" }
+    },
     "macOS": {
       "minimumSystemVersion": "11.0",
       "signingIdentity": "-"

@@ -1,7 +1,7 @@
 //! Two real Tightbeam cores on this machine, found via mDNS and talking over QUIC.
 //! Covers pairing, live messages, delivery acks, seen receipts, catching up after one
 //! side was off, replies and reactions, edits and deletes, typing, nudges, away and back,
-//! clearing one side's history, versions, do not disturb, and vanishing messages.
+//! clearing one side's history, versions, do not disturb, vanishing messages, and files.
 
 use std::{
     path::PathBuf,
@@ -13,8 +13,8 @@ use std::{
 };
 
 use tightbeam_lib::{
-    chat::{Away, Core, Emit, Event},
-    db::Ref,
+    chat::{Away, Core, Emit, Event, NewFile},
+    db::{FileState, Ref},
 };
 
 fn quiet() -> Emit {
@@ -246,6 +246,65 @@ async fn pair_chat_and_catch_up() {
     })
     .await;
     assert!(!texts(&bob).contains(&"the code is 1234".into()));
+
+    // A picture: the message arrives, then the file, checked against its hash.
+    let bytes: Vec<u8> = (0..3_000_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let new = NewFile {
+        name: "sunset.png".into(),
+        mime: "image/png".into(),
+        width: Some(1600),
+        height: Some(900),
+        preview: Some("data:image/jpeg;base64,AAAA".into()),
+        text: "look at this".into(),
+        reply_to: None,
+    };
+    // Bob already has the first megabyte, as if a transfer had broken off: it resumes.
+    let hash = blake3::hash(&bytes).to_hex().to_string();
+    std::fs::create_dir_all(dir_b.join("files")).unwrap();
+    std::fs::write(dir_b.join("files").join(format!("{hash}.part")), &bytes[..1 << 20]).unwrap();
+    let (a, sent) = (alice.clone(), bytes.clone());
+    let photo = like_tauri(move || a.send_file(&sent, new)).unwrap();
+    let file = photo.file.clone().unwrap();
+    assert_eq!(file.state, FileState::Done, "the sender has it already");
+    let at = Ref { author: alice.id(), seq: photo.seq };
+    wait_for("bob gets the picture", 30, || {
+        find(&bob, &at).is_some_and(|m| m.file.as_ref().is_some_and(|f| f.state == FileState::Done))
+    })
+    .await;
+    let (path, mime) = bob.file(&file.info.hash).unwrap().unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(path.file_name().unwrap(), "sunset.png");
+    assert_eq!(mime, "image/png");
+    assert_eq!(find(&bob, &at).unwrap().text, "look at this");
+    let state = |core: &Core| find(core, &at).and_then(|m| m.file).map(|f| f.state);
+
+    // Bob moves the picture out of the data folder: his app gets it again from Alice.
+    let moved = dir_b.join("moved.png");
+    std::fs::rename(&path, &moved).unwrap();
+    assert!(bob.file(&file.info.hash).unwrap().is_none(), "noticed when it's next needed");
+    wait_for("bob gets it again", 30, || state(&bob) == Some(FileState::Done)).await;
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+    // Alice edits her copy in place, keeping the size, and Bob loses his. Alice won't send
+    // the edited one as the original, so neither has it any more.
+    let (alice_path, _) = alice.file(&file.info.hash).unwrap().unwrap();
+    let mut edited = bytes.clone();
+    edited[0] ^= 1;
+    std::fs::write(&alice_path, &edited).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(bob.file(&file.info.hash).unwrap().is_none());
+    wait_for("both give up", 30, || {
+        state(&bob) == Some(FileState::Gone) && state(&alice) == Some(FileState::Gone)
+    })
+    .await;
+    std::fs::rename(&moved, &path).unwrap(); // the deletes below still clean up
+
+    // Deleting it removes the file on both sides.
+    alice.delete(at.clone()).unwrap();
+    wait_for("bob sees the delete", 10, || find(&bob, &at).is_some_and(|m| m.deleted)).await;
+    assert!(alice.file(&file.info.hash).unwrap().is_none());
+    assert!(bob.file(&file.info.hash).unwrap().is_none());
+    assert!(!path.exists(), "the file itself is gone");
 
     alice.shutdown().await;
     bob.shutdown().await;

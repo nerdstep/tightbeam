@@ -54,7 +54,8 @@ New frame types or message kinds. The per-author append-only log stays as it is:
 
 ## 3. Bigger pieces
 
-- [ ] **Images and files**, including pasted screenshots. Use `iroh-blobs` for transfer. Messages carry a content hash, and the bytes sync separately.
+- [x] **Pictures**, including pasted screenshots. `Msg` carries a `file` (BLAKE3 hash, name, size, type, and for images the size and a tiny preview), sent only to peers whose `Hello` lists the `files` feature. The bytes go on QUIC streams of their own: the receiver asks for a file from the first byte it lacks, checks the whole file against the hash, and keeps it as `files/<hash>/<name>` in the data folder, with a `files` table saying which have arrived. Written directly rather than with `iroh-blobs`, which would bring a second store whose deletes we wouldn't control. Files go when no message has them any more. The webview loads them through a `tbfile` protocol that serves only those, uncached.
+- [ ] **Any file.** The transfer already handles any file; the UI only offers pictures. A file picker and drop for other kinds, sent by path rather than through the webview, so a big one isn't read into memory. Received files open only if they're a known safe kind; anything else is "Show in folder".
 - [x] **Automatic builds.** GitHub Actions (free for public repos, macOS included):
   - `ci.yml` runs the UI checks, plus rustfmt, clippy and the tests on Windows and macOS, for each push to main and each pull request.
   - `release.yml` runs CI on the tagged commit, then builds the Windows installer and the macOS `.dmg` into a draft release when a `v*` tag is pushed (`scripts/release.ps1`). The release text comes from `CHANGELOG.md`.
