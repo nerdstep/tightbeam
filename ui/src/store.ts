@@ -4,10 +4,30 @@
 
 import { createStore } from '@tanstack/react-store'
 
-import { api, type Message, type Ref, type Status, type UpdateReady } from './api'
+import {
+  api,
+  type Cursor,
+  type Hit,
+  type Message,
+  type Ref,
+  type Status,
+  type UpdateReady,
+} from './api'
 import { chime } from './lib/chime'
 
 const PAGE_SIZE = 200
+/** Search once typing pauses this long. */
+const SEARCH_DELAY_MS = 150
+
+export interface Search {
+  query: string
+  /** For `query`, newest first. Empty until the first results arrive. */
+  hits: Hit[]
+  /** Which hit Enter opens. */
+  active: number
+  /** Results for the current query haven't arrived yet. */
+  pending: boolean
+}
 
 interface State {
   status: Status | null
@@ -30,6 +50,10 @@ interface State {
   deleting: Message | null
   /** The peer is typing, as of the last few seconds. */
   peerTyping: boolean
+  /** The search bar, while it's open. */
+  search: Search | null
+  /** A message for the transcript to scroll to and highlight. `n` tells repeats apart. */
+  jump: { key: string; n: number } | null
 }
 
 export const store = createStore<State>({
@@ -44,6 +68,8 @@ export const store = createStore<State>({
   editing: null,
   deleting: null,
   peerTyping: false,
+  search: null,
+  jump: null,
 })
 
 /** How long "typing…" lasts without another signal. The sender repeats it more often. */
@@ -116,15 +142,70 @@ export function setDeleting(deleting: Message | null) {
   store.setState((s) => ({ ...s, deleting }))
 }
 
+const cursorOf = (m: Message): Cursor => ({ hlc: m.hlc, author: m.author, seq: m.seq })
+
+let searchTimer: ReturnType<typeof setTimeout> | undefined
+let searchRun = 0
+/** What was searched for last, offered again when search reopens. */
+let lastQuery = ''
+
+/** Opens search, with `query` or else the last one. */
+export function openSearch(query?: string) {
+  setSearchQuery(query ?? store.state.search?.query ?? lastQuery)
+}
+
+export function closeSearch() {
+  clearTimeout(searchTimer)
+  searchRun++
+  store.setState((s) => ({ ...s, search: null }))
+}
+
+/** Updates the query; results follow once typing pauses. */
+export function setSearchQuery(query: string) {
+  lastQuery = query
+  clearTimeout(searchTimer)
+  const ticket = ++searchRun
+  const wanted = query.trim() !== ''
+  store.setState((s) => ({
+    ...s,
+    search: { query, hits: wanted ? (s.search?.hits ?? []) : [], active: 0, pending: wanted },
+  }))
+  if (!wanted) return
+  searchTimer = setTimeout(async () => {
+    const hits = await api.search(query).catch(() => [])
+    if (ticket !== searchRun) return // the query changed, or search closed, meanwhile
+    store.setState((s) => ({ ...s, search: s.search && { ...s.search, hits, pending: false } }))
+  }, SEARCH_DELAY_MS)
+}
+
+export function setSearchActive(active: number) {
+  store.setState((s) => ({ ...s, search: s.search && { ...s.search, active } }))
+}
+
+let jumps = 0
+
+/** Scrolls the transcript to a message, loading the history back to it first if needed. */
+export async function reveal(m: Message) {
+  const key = messageKey(m)
+  const oldest = store.state.messages[0]
+  if (!loaded.has(key) && oldest) {
+    const gap = await run(api.getMessagesBetween(cursorOf(m), cursorOf(oldest)))
+    const missing = (gap ?? []).filter((g) => !loaded.has(messageKey(g)))
+    for (const g of missing) loaded.add(messageKey(g))
+    // Sorted, in case a page of older messages arrived meanwhile.
+    // oxlint-disable-next-line unicorn/no-array-sort -- a fresh array; toSorted needs ES2023
+    store.setState((s) => ({ ...s, messages: [...missing, ...s.messages].sort(compare) }))
+  }
+  store.setState((s) => ({ ...s, jump: { key, n: ++jumps } }))
+}
+
 /** Loads the page before the oldest loaded message. Safe to call repeatedly. */
 export async function loadOlder() {
   const { messages, hasOlder, loadingOlder } = store.state
   if (!hasOlder || loadingOlder) return
   store.setState((s) => ({ ...s, loadingOlder: true }))
   const oldest = messages[0]
-  const page = await run(
-    api.getMessages({ hlc: oldest.hlc, author: oldest.author, seq: oldest.seq }, PAGE_SIZE),
-  )
+  const page = await run(api.getMessages(cursorOf(oldest), PAGE_SIZE))
   const older = (page?.messages ?? []).filter((m) => !loaded.has(messageKey(m)))
   for (const m of older) loaded.add(messageKey(m))
   store.setState((s) => ({
@@ -159,6 +240,7 @@ export function shake(sound: boolean) {
 /** Erases the conversation on this computer, then shows what's left. */
 export async function clearHistory() {
   if (!(await run(api.clearHistory().then(() => true)))) return
+  closeSearch() // its matches are gone
   const page = await run(api.getMessages(undefined, PAGE_SIZE))
   if (!page) return
   loaded.clear()

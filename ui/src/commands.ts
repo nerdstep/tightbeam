@@ -2,7 +2,7 @@
 // of sending. `//` sends a message that starts with a slash.
 
 import { api } from './api'
-import { run, shake } from './store'
+import { openSearch, run, shake } from './store'
 
 /** What a command can ask of the message box. */
 export interface CommandContext {
@@ -24,6 +24,12 @@ export const commands: Command[] = [
     name: 'clear',
     description: 'Erase this conversation on this computer',
     action: (ctx) => ctx.confirmClear(),
+  },
+  {
+    name: 'search',
+    args: '[words]',
+    description: 'Search this conversation',
+    action: (_, words) => openSearch(words),
   },
   {
     name: 'away',

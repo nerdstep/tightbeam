@@ -8,6 +8,10 @@
 //! Display order comes from each entry's `hlc`, a hybrid logical clock: the author's wall
 //! clock, pushed past every entry they had stored when they wrote it. So whatever someone
 //! writes after seeing a message sorts after it, however far apart the two clocks are.
+//!
+//! The `search` table indexes each message's current text (SQLite FTS5). Storing an
+//! entry keeps it up to date: an edit replaces the text, and a delete or `clear` removes
+//! it. Deleted text is zeroed on disk (`secure_delete`), in the index too.
 
 use std::path::Path;
 
@@ -108,6 +112,14 @@ pub struct Cursor {
     pub seq: u64,
 }
 
+/// A message that matches a search.
+#[derive(Debug, Clone, Serialize)]
+pub struct Hit {
+    pub message: Message,
+    /// The matching part of its text, with each match between \u{2} and \u{3}.
+    pub snippet: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Page {
     /// Oldest first.
@@ -137,8 +149,10 @@ pub struct Db(Connection);
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        // Freed space is zeroed, so deleted and cleared text doesn't linger in the file.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
+             PRAGMA secure_delete = ON;
              CREATE TABLE IF NOT EXISTS settings (
                  key   TEXT PRIMARY KEY,
                  value BLOB NOT NULL
@@ -185,7 +199,89 @@ impl Db {
                  COMMIT;",
             )?;
         }
-        Ok(Self(conn))
+        let db = Self(conn);
+        if version < 3 {
+            // 0.5: search. Filled from the history in one go.
+            db.0.execute_batch(
+                "BEGIN;
+                 CREATE VIRTUAL TABLE search USING fts5(
+                     text, author UNINDEXED, seq UNINDEXED,
+                     tokenize = 'unicode61 remove_diacritics 2'
+                 );
+                 -- Deleting from the index removes the words, not just marks them gone.
+                 INSERT INTO search (search, rank) VALUES ('secure-delete', 1);",
+            )?;
+            let result = (|| -> Result<()> {
+                let messages = db.entries("WHERE kind = 'message'", [])?;
+                for e in messages {
+                    db.index(&Ref { author: e.author, seq: e.seq })?;
+                }
+                Ok(())
+            })();
+            db.0.execute_batch(if result.is_ok() {
+                "PRAGMA user_version = 3; COMMIT;"
+            } else {
+                "ROLLBACK"
+            })?;
+            result?;
+        }
+        Ok(db)
+    }
+
+    /// Messages matching `query`, newest first. Each word matches words starting with
+    /// it, ignoring case and accents.
+    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Hit>> {
+        // Each word becomes a quoted prefix ("word"*), so FTS5 syntax in it is just text.
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .filter(|t| t.chars().any(char::is_alphanumeric))
+            .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+            .collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let found = self
+            .0
+            .prepare_cached(
+                "SELECT search.author, search.seq,
+                        snippet(search, 0, char(2), char(3), '…', 16)
+                 FROM search JOIN messages
+                   ON messages.author = search.author AND messages.seq = search.seq
+                  AND messages.kind = 'message'
+                 WHERE search MATCH ?1
+                 ORDER BY messages.hlc DESC, messages.author DESC, messages.seq DESC
+                 LIMIT ?2",
+            )?
+            .query_map(params![terms.join(" "), limit as i64], |r| {
+                Ok((Ref { author: r.get(0)?, seq: r.get::<_, i64>(1)? as u64 }, r.get(2)?))
+            })?
+            .collect::<Result<Vec<(Ref, String)>, _>>()?;
+        let mut hits = Vec::with_capacity(found.len());
+        for (at, snippet) in found {
+            if let Some(message) = self.message(&at)? {
+                hits.push(Hit { message, snippet });
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Messages from `from` up to (not including) `before`, in display order. Fills the
+    /// gap between the oldest loaded message and one further back, like a search hit.
+    pub fn range(&self, from: &Cursor, before: &Cursor) -> Result<Vec<Message>> {
+        let entries = self.entries(
+            "WHERE kind = 'message'
+               AND (hlc, author, seq) >= (?1, ?2, ?3) AND (hlc, author, seq) < (?4, ?5, ?6)
+             ORDER BY hlc, author, seq",
+            params![
+                from.hlc,
+                from.author,
+                from.seq as i64,
+                before.hlc,
+                before.author,
+                before.seq as i64
+            ],
+        )?;
+        entries.into_iter().map(|e| self.show(e)).collect()
     }
 
     /// Up to `limit` messages before `before` in display order (or the newest, if `None`),
@@ -299,8 +395,12 @@ impl Db {
     pub fn clear(&self, keep_author: &str, keep_after: Option<u64>) -> Result<usize> {
         let keep_after = keep_after.map(|n| n as i64);
         let erase = "?2 IS NULL OR NOT (author = ?1 AND seq > ?2)";
-        self.0.execute_batch("PRAGMA secure_delete = ON; BEGIN")?;
+        self.0.execute_batch("BEGIN")?;
         let result = (|| -> Result<usize> {
+            self.0.execute(
+                &format!("DELETE FROM search WHERE {erase}"),
+                params![keep_author, keep_after],
+            )?;
             self.set(CLEARED_CLOCK, self.clock()?.to_string())?;
             self.0.execute(
                 &format!(
@@ -317,7 +417,7 @@ impl Db {
         })();
         self.0.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
         // Old copies of the pages also sit in the write-ahead log until a checkpoint.
-        self.0.execute_batch("PRAGMA secure_delete = OFF; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        self.0.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         result
     }
 
@@ -344,7 +444,45 @@ impl Db {
                 to.map(|r| r.seq as i64)
             ],
         )?;
-        Ok(changed > 0)
+        if changed == 0 {
+            return Ok(false);
+        }
+        match &e.kind {
+            Kind::Message { .. } => self.index(&Ref { author: e.author.clone(), seq: e.seq })?,
+            // Only the author's own edits and deletes count (see `current`).
+            Kind::Edit { of } | Kind::Delete { of } if of.author == e.author => {
+                self.0.execute(
+                    "DELETE FROM search WHERE author = ?1 AND seq = ?2",
+                    params![of.author, of.seq as i64],
+                )?;
+                self.index(of)?;
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// Adds a message's current text to the search index, unless it was deleted.
+    fn index(&self, at: &Ref) -> Result<()> {
+        let Some(original) = self.original(at)? else { return Ok(()) };
+        let current = self.current(at, original)?;
+        if !current.deleted {
+            self.0
+                .prepare_cached("INSERT INTO search (text, author, seq) VALUES (?1, ?2, ?3)")?
+                .execute(params![current.text, at.author, at.seq as i64])?;
+        }
+        Ok(())
+    }
+
+    /// A message's text as first sent, if it's stored here.
+    fn original(&self, at: &Ref) -> Result<Option<String>> {
+        Ok(self
+            .0
+            .prepare_cached(
+                "SELECT text FROM messages WHERE author = ?1 AND seq = ?2 AND kind = 'message'",
+            )?
+            .query_row(params![at.author, at.seq as i64], |r| r.get(0))
+            .optional()?)
     }
 
     /// Stores many entries in one transaction (for tests and seeding).
@@ -382,15 +520,7 @@ impl Db {
         }
         let reply_to = match reply_to {
             Some(to) => {
-                let original = self
-                    .0
-                    .prepare_cached(
-                        "SELECT text FROM messages
-                         WHERE author = ?1 AND seq = ?2 AND kind = 'message'",
-                    )?
-                    .query_row(params![to.author, to.seq as i64], |r| r.get::<_, String>(0))
-                    .optional()?;
-                let quoted = original.map(|text| self.current(&to, text)).transpose()?;
+                let quoted = self.original(&to)?.map(|text| self.current(&to, text)).transpose()?;
                 let deleted = quoted.as_ref().is_some_and(|q| q.deleted);
                 let text = quoted.filter(|q| !q.deleted).map(|q| q.text);
                 Some(Quote { author: to.author, seq: to.seq, text, deleted })
@@ -429,16 +559,14 @@ impl Db {
     /// Blanks the text of a deleted message and of its edits, zeroing the space. Only the
     /// message's author can delete it, so `of.author` is also whose edits these are.
     pub fn scrub(&self, of: &Ref) -> Result<()> {
-        self.0.execute_batch("PRAGMA secure_delete = ON")?;
-        let result = self.0.execute(
+        self.0.execute(
             "UPDATE messages SET text = ''
              WHERE author = ?1 AND (
                  (kind = 'message' AND seq = ?2)
                  OR (kind = 'edit' AND ref_author = ?1 AND ref_seq = ?2))",
             params![of.author, of.seq as i64],
-        );
-        self.0.execute_batch("PRAGMA secure_delete = OFF; PRAGMA wal_checkpoint(TRUNCATE);")?;
-        result?;
+        )?;
+        self.0.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     }
 
@@ -576,6 +704,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         assert_eq!(texts(&db), ["from 0.3"]);
         assert_eq!(db.all().unwrap()[0].hlc, 1, "ordered by ts, as before");
+        assert_eq!(db.search("0.3", 10).unwrap().len(), 1, "old messages are searchable");
         db.insert(&reply("me", 1, ("peer", 1))).unwrap();
         let all = db.all().unwrap();
         let mine = all.iter().find(|m| m.author == "me").unwrap();
@@ -657,5 +786,52 @@ mod tests {
         // Erasing the history doesn't wind the clock back.
         db.clear("me", None).unwrap();
         assert_eq!(db.next_hlc(now).unwrap(), 11_002);
+    }
+
+    #[test]
+    fn search() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let say =
+            |author: &str, seq: u64, text: &str| Entry::message(author, seq, seq as i64, text);
+        db.insert_many(&[
+            say("me", 1, "Lunch at the café?"),
+            say("peer", 1, "lunchtime works"),
+            say("me", 2, "great, see you there"),
+            say("peer", 2, "bring the \"book\" (the blue one)"),
+        ])
+        .unwrap();
+        let found = |q: &str| -> Vec<String> {
+            db.search(q, 10).unwrap().into_iter().map(|h| h.message.text).collect()
+        };
+
+        assert_eq!(found("lunch"), ["lunchtime works", "Lunch at the café?"], "newest first");
+        assert_eq!(found("CAFE"), ["Lunch at the café?"], "ignores case and accents");
+        assert_eq!(found("lunch cafe"), ["Lunch at the café?"], "every word must match");
+        assert_eq!(found("\"book\" (blue"), [r#"bring the "book" (the blue one)"#]);
+        assert!(found("* OR -").is_empty(), "search syntax is just text");
+        let hit = &db.search("great", 10).unwrap()[0];
+        assert_eq!(hit.snippet, "\u{2}great\u{3}, see you there");
+
+        // Edits replace the text; deletes remove it.
+        db.insert(&edit("me", 3, "dinner at the café?", ("me", 1))).unwrap();
+        assert_eq!(found("cafe"), ["dinner at the café?"]);
+        assert_eq!(found("lunch"), ["lunchtime works"]);
+        db.insert(&delete("peer", 3, ("me", 2))).unwrap(); // not theirs to delete
+        assert_eq!(found("great").len(), 1);
+        db.insert(&delete("me", 4, ("me", 2))).unwrap();
+        assert!(found("great").is_empty());
+
+        // Clearing empties the index, except what's kept.
+        db.clear("me", Some(3)).unwrap();
+        assert!(found("cafe").is_empty() && found("lunch").is_empty());
+    }
+
+    #[test]
+    fn range_fills_the_gap_to_a_message() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.insert_many(&(1..=5).map(|i| msg("me", i)).collect::<Vec<_>>()).unwrap();
+        let at = |seq: u64| Cursor { hlc: seq as i64, author: "me".into(), seq };
+        let texts: Vec<_> = db.range(&at(2), &at(5)).unwrap().into_iter().map(|m| m.text).collect();
+        assert_eq!(texts, ["me2", "me3", "me4"]);
     }
 }

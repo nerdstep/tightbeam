@@ -77,6 +77,13 @@ export interface Message {
   reactions: Reaction[]
 }
 
+/** A message that matches a search. */
+export interface Hit {
+  message: Message
+  /** The matching part of its text, with each match between \u0002 and \u0003. */
+  snippet: string
+}
+
 /** A position in display order; a page loads the messages before it. */
 export type Cursor = Pick<Message, 'hlc' | 'author' | 'seq'>
 
@@ -114,6 +121,11 @@ export const api = {
   getStatus: () => invoke<Status>('get_status'),
   getMessages: (before?: Cursor, limit?: number) =>
     invoke<Page>('get_messages', { before: before ?? null, limit: limit ?? null }),
+  /** Messages from `from` up to `before`: fills the gap back to a search hit. */
+  getMessagesBetween: (from: Cursor, before: Cursor) =>
+    invoke<Message[]>('get_messages_between', { from, before }),
+  /** Messages matching `query`, newest first, at most 100. */
+  search: (query: string) => invoke<Hit[]>('search', { query }),
   setName: (name: string) => invoke<void>('set_name', { name }),
   sendMessage: (text: string, replyTo?: Ref) =>
     invoke<Message>('send_message', { text, replyTo: replyTo ?? null }),

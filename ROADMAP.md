@@ -42,11 +42,11 @@ New frame types or message kinds. The per-author append-only log stays as it is:
   - `/clear`: erases this computer's copy of the conversation. The peer's copy is untouched, nothing goes over the wire, and sequence numbers carry on (a `cleared` table remembers the highest one erased per author), so sync never asks for the erased messages again.
   - `/nudge`: a `Nudge` frame, live only. A shake and a sound in an open window, a taskbar flash or Dock bounce behind other windows, a notification from the tray. At most one every 3 seconds each way.
   - `/away [note]` and `/back`: see the away status below.
+  - `/search [words]`: opens search.
 - [ ] **More commands:**
   - `/me waves`: shown as an action line instead of a bubble. Older builds show the raw text.
   - `/shrug` and friends: they only insert text.
-  - Later: `/search` once search exists.
-- [ ] **Search** with SQLite FTS5 over the message text.
+- [x] **Search** with SQLite FTS5. The `search` table holds each message's current text, kept up to date as entries are stored: an edit replaces it, and a delete or `/clear` removes it (FTS5's `secure-delete` plus `PRAGMA secure_delete`, so the words don't linger). Each word is a quoted prefix query, so FTS5 syntax typed in is just text. The newest 100 matches, with FTS5 snippets. Picking one loads the gap back to it (`get_messages_between`) and scrolls there.
 - [x] **Stable ordering.** Messages used to be sorted by each author's wall clock, so clock skew could misorder them. Each entry now carries `hlc`, a hybrid logical clock: the author's wall clock, or one past the highest `hlc` stored on their side, whichever is later. Anything written after seeing a message sorts after it. `ts` is still the time shown. Entries from peers before 0.5 use `ts`, and `/clear` keeps the clock from running backwards.
 
 ## 3. Bigger pieces

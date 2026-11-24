@@ -1,11 +1,20 @@
 import { shallow, useSelector } from '@tanstack/react-store'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { EllipsisIcon, PencilIcon, ReplyIcon, SmilePlusIcon, Trash2Icon, XIcon } from 'lucide-react'
+import {
+  EllipsisIcon,
+  PencilIcon,
+  ReplyIcon,
+  SearchIcon,
+  SmilePlusIcon,
+  Trash2Icon,
+  XIcon,
+} from 'lucide-react'
 import { memo, useCallback, useEffect, useRef, useState } from 'react'
 
 import { api, type Message as ChatMessage, type Quote, type Reaction } from '@/api'
 import { type Command, parse, suggest } from '@/commands'
 import { Linkified } from '@/components/Linkified'
+import { SearchBar, SearchResults } from '@/components/Search'
 import { SettingsMenu } from '@/components/SettingsMenu'
 import {
   AlertDialog,
@@ -42,6 +51,7 @@ import {
   clearHistory,
   loadOlder,
   messageKey,
+  openSearch,
   run,
   setDeleting,
   setEditing,
@@ -57,11 +67,27 @@ const TYPING_EVERY_MS = 2500
 
 /** Paired: the conversation. */
 export function Chat() {
+  // Ctrl+F (Cmd+F on macOS) opens search.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'f') {
+        e.preventDefault()
+        openSearch()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   return (
     <MessageScrollerProvider defaultScrollPosition="end">
       <section className="flex h-full flex-col">
         <Header />
-        <Transcript />
+        <SearchBar />
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <Transcript />
+          <SearchResults />
+        </div>
         <Composer />
         <DeleteDialog />
       </section>
@@ -103,7 +129,12 @@ function Header() {
           </span>
         </span>
       </div>
-      <SettingsMenu onUnpair={() => setUnpairing(true)} />
+      <div className="flex items-center gap-1">
+        <Button variant="ghost" size="icon-sm" aria-label="Search" onClick={() => openSearch()}>
+          <SearchIcon />
+        </Button>
+        <SettingsMenu onUnpair={() => setUnpairing(true)} />
+      </div>
       <UnpairDialog name={name} open={unpairing} onOpenChange={setUnpairing} />
     </header>
   )
@@ -156,7 +187,7 @@ function receiptFor(seq: number, peerHas: number, peerSeen: number): Receipt {
 
 /** Rows within this many of the oldest loaded one trigger loading the previous page. */
 const LOAD_OLDER_WITHIN = 15
-/** How long a message stays highlighted after jumping to it from a reply. */
+/** How long a message stays highlighted after jumping to it from a reply or search. */
 const HIGHLIGHT_MS = 1500
 
 /**
@@ -220,6 +251,15 @@ function VirtualTranscript({
   // Stable for the memoized rows: reads the latest messages through a ref.
   const messagesRef = useRef(messages)
   messagesRef.current = messages
+  const jump = useSelector(store, (s) => s.jump)
+  useEffect(() => {
+    if (!jump) return
+    const index = messagesRef.current.findIndex((m) => messageKey(m) === jump.key)
+    if (index < 0) return
+    virtualizer.scrollToIndex(index, { align: 'center' })
+    setHighlighted(jump.key)
+  }, [jump, virtualizer])
+
   const jumpTo = useCallback(
     (quote: Quote) => {
       const key = messageKey(quote)

@@ -7,7 +7,7 @@ mod updates;
 use std::{path::PathBuf, sync::Arc};
 
 use chat::{Core, Emit, Event, Status};
-use db::{Cursor, Message, Page, Ref};
+use db::{Cursor, Hit, Message, Page, Ref};
 use desktop::{Desktop, MAIN_WINDOW, MINIMIZED_ARG};
 use serde::Serialize;
 use tauri::{Emitter, Manager, RunEvent, State, WindowEvent};
@@ -46,6 +46,22 @@ fn get_messages(
 ) -> Result<Page, String> {
     let limit = limit.unwrap_or(200).clamp(1, 1000);
     core.page(before.as_ref(), limit).map_err(err)
+}
+
+/// Messages from `from` up to `before`: fills the gap back to a search hit.
+#[tauri::command]
+fn get_messages_between(
+    core: CoreState,
+    from: Cursor,
+    before: Cursor,
+) -> Result<Vec<Message>, String> {
+    core.range(&from, &before).map_err(err)
+}
+
+/// Messages matching `query`, newest first.
+#[tauri::command]
+fn search(core: CoreState, query: String) -> Result<Vec<Hit>, String> {
+    core.search(&query).map_err(err)
 }
 
 #[tauri::command]
@@ -270,6 +286,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             get_messages,
+            get_messages_between,
+            search,
             set_name,
             send_message,
             react,

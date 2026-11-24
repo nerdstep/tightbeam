@@ -31,7 +31,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::db::{Cursor, Db, Entry, Kind, Message, Page, Ref};
+use crate::db::{Cursor, Db, Entry, Hit, Kind, Message, Page, Ref};
 
 pub const ALPN: &[u8] = b"tightbeam/1";
 /// mDNS service name, so we only see other Tightbeam apps (`_tightbeam._udp.local`).
@@ -46,6 +46,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
 /// At most one nudge this often, each way.
 const NUDGE_EVERY: Duration = Duration::from_secs(3);
+/// Search shows at most this many matches, the newest.
+pub const SEARCH_LIMIT: usize = 100;
 /// An away note is a few words, like "lunch" or "back at 3".
 const MAX_NOTE_CHARS: usize = 100;
 
@@ -360,6 +362,16 @@ impl Core {
 
     pub fn page(&self, before: Option<&Cursor>, limit: usize) -> Result<Page> {
         self.db().page(before, limit)
+    }
+
+    /// Messages from `from` up to `before`, in display order.
+    pub fn range(&self, from: &Cursor, before: &Cursor) -> Result<Vec<Message>> {
+        self.db().range(from, before)
+    }
+
+    /// Messages matching `query`, newest first, at most `SEARCH_LIMIT`.
+    pub fn search(&self, query: &str) -> Result<Vec<Hit>> {
+        self.db().search(query, SEARCH_LIMIT)
     }
 
     // ---- Actions from the UI -------------------------------------------------------
