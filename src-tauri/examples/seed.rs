@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use iroh::SecretKey;
-use tightbeam_lib::db::{Db, Message};
+use tightbeam_lib::db::{Db, Entry};
 
 const LINES: &[&str] = &[
     "hey",
@@ -56,17 +56,17 @@ fn main() -> Result<()> {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
     let start = now - 365 * 24 * 3_600_000;
     let step = (now - 3_600_000 - start) / count as i64;
-    let messages: Vec<Message> = (0..count)
+    let messages: Vec<Entry> = (0..count)
         .map(|i| {
             // Mostly alternate, with occasional runs from one person.
             let who = ((i / 3 + i % 2) % 2) as usize;
             next[who] += 1;
-            Message {
-                author: if who == 0 { id_a.clone() } else { id_b.clone() },
-                seq: next[who],
-                ts: start + i as i64 * step,
-                text: LINES[(i as usize * 7 + who) % LINES.len()].to_string(),
-            }
+            Entry::message(
+                if who == 0 { id_a.clone() } else { id_b.clone() },
+                next[who],
+                start + i as i64 * step,
+                LINES[(i as usize * 7 + who) % LINES.len()],
+            )
         })
         .collect();
 

@@ -1,20 +1,80 @@
-//! Local storage: settings (keys, names, pairing) and the message history.
+//! Local storage: settings (keys, names, pairing) and the log.
+//!
+//! The log holds every author's numbered entries: messages, and reactions to them.
+//! Entries never change once stored; a later entry refers to an earlier one by
+//! `(author, seq)`. A reply refers to the message it answers, a reaction to the message
+//! it's on.
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct Message {
+/// An entry, by author and sequence number.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ref {
+    pub author: String,
+    pub seq: u64,
+}
+
+/// One entry in an author's log, as stored and synced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
     /// Endpoint id (public key) of whoever wrote it.
     pub author: String,
     /// Per-author sequence number, starting at 1 with no gaps.
     pub seq: u64,
     /// Milliseconds since the Unix epoch, from the author's clock.
     pub ts: i64,
+    /// The message, or the reaction's emoji ("" takes a reaction back).
     pub text: String,
+    pub kind: Kind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kind {
+    Message {
+        reply_to: Option<Ref>,
+    },
+    /// Replaces the author's earlier reaction to `to`, if any.
+    Reaction {
+        to: Ref,
+    },
+}
+
+impl Entry {
+    pub fn message(author: impl Into<String>, seq: u64, ts: i64, text: impl Into<String>) -> Self {
+        let (author, text) = (author.into(), text.into());
+        Self { author, seq, ts, text, kind: Kind::Message { reply_to: None } }
+    }
+}
+
+/// A message as the transcript shows it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Message {
+    pub author: String,
+    pub seq: u64,
+    pub ts: i64,
+    pub text: String,
+    /// The message this one answers.
+    pub reply_to: Option<Quote>,
+    /// At most one per person, in author order.
+    pub reactions: Vec<Reaction>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Quote {
+    pub author: String,
+    pub seq: u64,
+    /// `None` when that message isn't stored here (cleared, for example).
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Reaction {
+    pub author: String,
+    pub emoji: String,
 }
 
 /// A position in display order (`ts`, then `author`, then `seq`): page before this message.
@@ -32,6 +92,10 @@ pub struct Page {
     /// Whether there are messages older than the first one here.
     pub has_more: bool,
 }
+
+/// Values of the `kind` column.
+const MESSAGE: &str = "message";
+const REACTION: &str = "reaction";
 
 pub struct Db(Connection);
 
@@ -60,6 +124,21 @@ impl Db {
                  up_to  INTEGER NOT NULL
              );",
         )?;
+        // Schema changes, in order. `user_version` counts how many have been applied.
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 1 {
+            // 0.4: replies and reactions. `ref_*` is the message a reply answers or a
+            // reaction is on.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message';
+                 ALTER TABLE messages ADD COLUMN ref_author TEXT;
+                 ALTER TABLE messages ADD COLUMN ref_seq INTEGER;
+                 CREATE INDEX messages_by_ref ON messages (ref_author, ref_seq);
+                 PRAGMA user_version = 1;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self(conn))
     }
 
@@ -67,23 +146,54 @@ impl Db {
     /// returned oldest first, plus whether anything older remains.
     pub fn page(&self, before: Option<&Cursor>, limit: usize) -> Result<Page> {
         let fetch = limit as i64 + 1; // one extra row tells us whether there's more
-        let mut messages = match before {
-            Some(c) => self.query(
-                "SELECT author, seq, ts, text FROM messages
-                 WHERE (ts, author, seq) < (?1, ?2, ?3)
+        let entries = match before {
+            Some(c) => self.entries(
+                "WHERE kind = 'message' AND (ts, author, seq) < (?1, ?2, ?3)
                  ORDER BY ts DESC, author DESC, seq DESC LIMIT ?4",
                 params![c.ts, c.author, c.seq as i64, fetch],
             )?,
-            None => self.query(
-                "SELECT author, seq, ts, text FROM messages
-                 ORDER BY ts DESC, author DESC, seq DESC LIMIT ?1",
+            None => self.entries(
+                "WHERE kind = 'message' ORDER BY ts DESC, author DESC, seq DESC LIMIT ?1",
                 params![fetch],
             )?,
         };
-        let has_more = messages.len() > limit;
-        messages.truncate(limit);
+        let has_more = entries.len() > limit;
+        let mut messages =
+            entries.into_iter().take(limit).map(|e| self.show(e)).collect::<Result<Vec<_>>>()?;
         messages.reverse();
         Ok(Page { messages, has_more })
+    }
+
+    /// Every message, in display order.
+    pub fn all(&self) -> Result<Vec<Message>> {
+        let entries = self.entries("WHERE kind = 'message' ORDER BY ts, author, seq", [])?;
+        entries.into_iter().map(|e| self.show(e)).collect()
+    }
+
+    /// A message as the transcript shows it, if it's stored here.
+    pub fn message(&self, at: &Ref) -> Result<Option<Message>> {
+        let found = self.entries(
+            "WHERE kind = 'message' AND author = ?1 AND seq = ?2",
+            params![at.author, at.seq as i64],
+        )?;
+        found.into_iter().next().map(|e| self.show(e)).transpose()
+    }
+
+    /// The reactions on a message now: each person's latest, unless they took it back.
+    pub fn reactions(&self, to: &Ref) -> Result<Vec<Reaction>> {
+        let mut stmt = self.0.prepare_cached(
+            "SELECT author, text FROM messages r
+             WHERE kind = 'reaction' AND ref_author = ?1 AND ref_seq = ?2
+               AND seq = (SELECT MAX(seq) FROM messages
+                          WHERE kind = 'reaction' AND author = r.author
+                            AND ref_author = ?1 AND ref_seq = ?2)
+               AND text != ''
+             ORDER BY author",
+        )?;
+        let rows = stmt.query_map(params![to.author, to.seq as i64], |r| {
+            Ok(Reaction { author: r.get(0)?, emoji: r.get(1)? })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -123,9 +233,9 @@ impl Db {
         Ok(n as u64)
     }
 
-    /// Erases the history, except `keep_author`'s messages after `keep_after` (mine that
+    /// Erases the history, except `keep_author`'s entries after `keep_after` (mine that
     /// haven't been delivered yet). The space is zeroed rather than just freed. Returns
-    /// how many messages were erased.
+    /// how many entries were erased.
     pub fn clear(&self, keep_author: &str, keep_after: Option<u64>) -> Result<usize> {
         let keep_after = keep_after.map(|n| n as i64);
         let erase = "?2 IS NULL OR NOT (author = ?1 AND seq > ?2)";
@@ -150,45 +260,83 @@ impl Db {
         result
     }
 
-    /// Stores a message. Returns false if it was already stored.
-    pub fn insert(&self, m: &Message) -> Result<bool> {
+    /// Stores an entry. Returns false if it was already stored.
+    pub fn insert(&self, e: &Entry) -> Result<bool> {
+        let (kind, to) = match &e.kind {
+            Kind::Message { reply_to } => (MESSAGE, reply_to.as_ref()),
+            Kind::Reaction { to } => (REACTION, Some(to)),
+        };
         let changed = self.0.execute(
-            "INSERT OR IGNORE INTO messages (author, seq, ts, text) VALUES (?1, ?2, ?3, ?4)",
-            params![m.author, m.seq as i64, m.ts, m.text],
+            "INSERT OR IGNORE INTO messages (author, seq, ts, text, kind, ref_author, ref_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                e.author,
+                e.seq as i64,
+                e.ts,
+                e.text,
+                kind,
+                to.map(|r| &r.author),
+                to.map(|r| r.seq as i64)
+            ],
         )?;
         Ok(changed > 0)
     }
 
-    /// Stores many messages in one transaction (for tests and seeding).
-    pub fn insert_many(&self, messages: &[Message]) -> Result<()> {
+    /// Stores many entries in one transaction (for tests and seeding).
+    pub fn insert_many(&self, entries: &[Entry]) -> Result<()> {
         self.0.execute_batch("BEGIN")?;
-        let result = messages.iter().try_for_each(|m| self.insert(m).map(drop));
+        let result = entries.iter().try_for_each(|e| self.insert(e).map(drop));
         self.0.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
         result
     }
 
-    /// Messages by `author` with a sequence number above `after`, oldest first.
-    pub fn since(&self, author: &str, after: u64) -> Result<Vec<Message>> {
-        self.query(
-            "SELECT author, seq, ts, text FROM messages
-             WHERE author = ?1 AND seq > ?2 ORDER BY seq",
-            params![author, after as i64],
-        )
+    /// Entries by `author` with a sequence number above `after`, oldest first.
+    pub fn since(&self, author: &str, after: u64) -> Result<Vec<Entry>> {
+        self.entries("WHERE author = ?1 AND seq > ?2 ORDER BY seq", params![author, after as i64])
     }
 
-    /// Every message, in display order.
-    pub fn all(&self) -> Result<Vec<Message>> {
-        self.query("SELECT author, seq, ts, text FROM messages ORDER BY ts, author, seq", [])
+    /// Adds the quoted message and the reactions.
+    fn show(&self, e: Entry) -> Result<Message> {
+        let Kind::Message { reply_to } = e.kind else { bail!("not a message") };
+        let at = Ref { author: e.author, seq: e.seq };
+        let reply_to = match reply_to {
+            Some(to) => {
+                let text = self
+                    .0
+                    .prepare_cached(
+                        "SELECT text FROM messages
+                         WHERE author = ?1 AND seq = ?2 AND kind = 'message'",
+                    )?
+                    .query_row(params![to.author, to.seq as i64], |r| r.get(0))
+                    .optional()?;
+                Some(Quote { author: to.author, seq: to.seq, text })
+            }
+            None => None,
+        };
+        let reactions = self.reactions(&at)?;
+        Ok(Message { author: at.author, seq: at.seq, ts: e.ts, text: e.text, reply_to, reactions })
     }
 
-    fn query(&self, sql: &str, p: impl rusqlite::Params) -> Result<Vec<Message>> {
-        let mut stmt = self.0.prepare(sql)?;
+    /// Entries matching `filter`, the SQL after `FROM messages`.
+    fn entries(&self, filter: &str, p: impl rusqlite::Params) -> Result<Vec<Entry>> {
+        let mut stmt = self.0.prepare_cached(&format!(
+            "SELECT author, seq, ts, text, kind, ref_author, ref_seq FROM messages {filter}"
+        ))?;
         let rows = stmt.query_map(p, |r| {
-            Ok(Message {
+            let to = match (r.get::<_, Option<String>>(5)?, r.get::<_, Option<i64>>(6)?) {
+                (Some(author), Some(seq)) => Some(Ref { author, seq: seq as u64 }),
+                _ => None,
+            };
+            let kind = match (r.get::<_, String>(4)?.as_str(), to) {
+                (REACTION, Some(to)) => Kind::Reaction { to },
+                (_, reply_to) => Kind::Message { reply_to },
+            };
+            Ok(Entry {
                 author: r.get(0)?,
                 seq: r.get::<_, i64>(1)? as u64,
                 ts: r.get(2)?,
                 text: r.get(3)?,
+                kind,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -199,8 +347,22 @@ impl Db {
 mod tests {
     use super::*;
 
-    fn msg(author: &str, seq: u64) -> Message {
-        Message { author: author.into(), seq, ts: seq as i64, text: format!("{author}{seq}") }
+    fn msg(author: &str, seq: u64) -> Entry {
+        Entry::message(author, seq, seq as i64, format!("{author}{seq}"))
+    }
+
+    fn reply(author: &str, seq: u64, to: (&str, u64)) -> Entry {
+        let reply_to = Some(Ref { author: to.0.into(), seq: to.1 });
+        Entry { kind: Kind::Message { reply_to }, ..msg(author, seq) }
+    }
+
+    fn react(author: &str, seq: u64, emoji: &str, to: (&str, u64)) -> Entry {
+        let to = Ref { author: to.0.into(), seq: to.1 };
+        Entry { text: emoji.into(), kind: Kind::Reaction { to }, ..msg(author, seq) }
+    }
+
+    fn texts(db: &Db) -> Vec<String> {
+        db.all().unwrap().into_iter().map(|m| m.text).collect()
     }
 
     #[test]
@@ -211,8 +373,7 @@ mod tests {
 
         // The peer has my first two; the third is still waiting.
         assert_eq!(db.clear("me", Some(2)).unwrap(), 4);
-        let left: Vec<_> = db.all().unwrap().into_iter().map(|m| m.text).collect();
-        assert_eq!(left, ["me3"]);
+        assert_eq!(texts(&db), ["me3"]);
         assert_eq!(db.max_seq("me").unwrap(), 3);
         assert_eq!(db.max_seq("peer").unwrap(), 2, "sync must not ask for erased messages again");
 
@@ -225,6 +386,67 @@ mod tests {
         // New messages carry on numbering, and paging still works.
         db.insert(&msg("peer", 3)).unwrap();
         assert_eq!(db.max_seq("peer").unwrap(), 3);
-        assert_eq!(db.page(None, 10).unwrap().messages, [msg("peer", 3)]);
+        let page = db.page(None, 10).unwrap().messages;
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].text, "peer3");
+    }
+
+    #[test]
+    fn replies_quote_and_reactions_replace() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.insert_many(&[
+            msg("me", 1),
+            reply("peer", 1, ("me", 1)),
+            react("peer", 2, "👍", ("me", 1)),
+            react("me", 2, "❤️", ("me", 1)),
+            react("peer", 3, "😂", ("me", 1)), // replaces their 👍
+            react("me", 3, "", ("me", 1)),     // takes mine back
+        ])
+        .unwrap();
+
+        let messages = db.all().unwrap();
+        assert_eq!(messages.len(), 2, "reactions aren't messages");
+        assert_eq!(messages[0].reactions, [Reaction { author: "peer".into(), emoji: "😂".into() }]);
+        let quote = messages[1].reply_to.as_ref().unwrap();
+        assert_eq!(quote.text.as_deref(), Some("me1"));
+        assert_eq!(db.page(None, 10).unwrap().messages, messages);
+
+        // Reactions sync and count like messages.
+        assert_eq!(db.since("peer", 1).unwrap().len(), 2);
+        assert_eq!(db.max_seq("me").unwrap(), 3);
+
+        // A reply to a message that isn't here any more.
+        db.clear("me", None).unwrap();
+        db.insert(&reply("peer", 4, ("me", 1))).unwrap();
+        assert_eq!(db.all().unwrap()[0].reply_to.as_ref().unwrap().text, None);
+    }
+
+    #[test]
+    fn migrates_a_database_from_before_replies() {
+        let path =
+            std::env::temp_dir().join(format!("tightbeam-migrate-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE messages (author TEXT NOT NULL, seq INTEGER NOT NULL,
+                     ts INTEGER NOT NULL, text TEXT NOT NULL, PRIMARY KEY (author, seq));
+                 INSERT INTO messages VALUES ('peer', 1, 1, 'from 0.3');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(texts(&db), ["from 0.3"]);
+        db.insert(&reply("me", 1, ("peer", 1))).unwrap();
+        let all = db.all().unwrap();
+        let mine = all.iter().find(|m| m.author == "me").unwrap();
+        assert_eq!(mine.reply_to.as_ref().unwrap().text.as_deref(), Some("from 0.3"));
+        drop(db);
+        assert_eq!(
+            texts(&Db::open(&path).unwrap()).len(),
+            2,
+            "opens again without migrating twice"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

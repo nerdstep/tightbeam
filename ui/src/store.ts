@@ -4,7 +4,7 @@
 
 import { createStore } from '@tanstack/react-store'
 
-import { api, type Message, type Status, type UpdateReady } from './api'
+import { api, type Message, type Reaction, type Ref, type Status, type UpdateReady } from './api'
 import { chime } from './lib/chime'
 
 const PAGE_SIZE = 200
@@ -22,6 +22,10 @@ interface State {
   update: UpdateReady | null
   /** Counts nudges, sent and received; each one shakes the window. */
   nudges: number
+  /** The message the composer is replying to. */
+  replyingTo: Message | null
+  /** The peer is typing, as of the last few seconds. */
+  peerTyping: boolean
 }
 
 export const store = createStore<State>({
@@ -32,9 +36,14 @@ export const store = createStore<State>({
   error: null,
   update: null,
   nudges: 0,
+  replyingTo: null,
+  peerTyping: false,
 })
 
-export const messageKey = (m: Message) => `${m.author}:${m.seq}`
+/** How long "typing…" lasts without another signal. The sender repeats it more often. */
+const TYPING_LAPSE_MS = 4000
+
+export const messageKey = (m: Ref) => `${m.author}:${m.seq}`
 const loaded = new Set<string>()
 
 /** Display order, matching the SQL `ORDER BY ts, author, seq`. */
@@ -55,6 +64,28 @@ export function addMessage(m: Message) {
   let at = messages.length
   while (at > 0 && compare(messages[at - 1], m) > 0) at--
   store.setState((s) => ({ ...s, messages: [...messages.slice(0, at), m, ...messages.slice(at)] }))
+}
+
+/** New reactions on a message. Messages that aren't loaded get theirs when paged in. */
+function setReactions(to: Ref, reactions: Reaction[]) {
+  const key = messageKey(to)
+  if (!loaded.has(key)) return
+  store.setState((s) => ({
+    ...s,
+    messages: s.messages.map((m) => (messageKey(m) === key ? { ...m, reactions } : m)),
+  }))
+}
+
+let typingLapse: ReturnType<typeof setTimeout> | undefined
+
+function setPeerTyping(on: boolean) {
+  clearTimeout(typingLapse)
+  if (on) typingLapse = setTimeout(() => setPeerTyping(false), TYPING_LAPSE_MS)
+  if (store.state.peerTyping !== on) store.setState((s) => ({ ...s, peerTyping: on }))
+}
+
+export function setReplyingTo(replyingTo: Message | null) {
+  store.setState((s) => ({ ...s, replyingTo }))
 }
 
 /** Loads the page before the oldest loaded message. Safe to call repeatedly. */
@@ -104,7 +135,12 @@ export async function clearHistory() {
   if (!page) return
   loaded.clear()
   for (const m of page.messages) loaded.add(messageKey(m))
-  store.setState((s) => ({ ...s, messages: page.messages, hasOlder: page.has_more }))
+  store.setState((s) => ({
+    ...s,
+    messages: page.messages,
+    hasOlder: page.has_more,
+    replyingTo: null,
+  }))
 }
 
 export function setUpdate(update: UpdateReady | null) {
@@ -114,9 +150,26 @@ export function setUpdate(update: UpdateReady | null) {
 export async function start() {
   // Listen first so nothing that happens while loading is missed.
   await api.onEvent((event) => {
-    if (event.kind === 'status') store.setState((s) => ({ ...s, status: event.data }))
-    else if (event.kind === 'message') addMessage(event.data)
-    else shake(true)
+    switch (event.kind) {
+      case 'status':
+        store.setState((s) => ({ ...s, status: event.data }))
+        if (!event.data.connected) setPeerTyping(false)
+        break
+      case 'message':
+        // Their message arriving means they've stopped typing it.
+        if (event.data.author !== store.state.status?.me.id) setPeerTyping(false)
+        addMessage(event.data)
+        break
+      case 'reactions':
+        setReactions(event.data.to, event.data.reactions)
+        break
+      case 'typing':
+        setPeerTyping(true)
+        break
+      case 'nudge':
+        shake(true)
+        break
+    }
   })
   await api.onUpdateReady(setUpdate)
   // An update may have downloaded before the window loaded.

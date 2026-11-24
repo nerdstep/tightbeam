@@ -4,6 +4,11 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+- Replies. Hover a message and choose Reply to answer it; the reply shows the message it answers, and clicking that scrolls to it. Older versions show replies as plain messages.
+- Reactions. Hover a message and choose one of six emoji. Each person has one reaction per message: pick another to change it, or the same one to take it back. Reactions sent while the other person is offline arrive when you're both online. Older versions show a reaction as a message holding just the emoji.
+- The header shows "Typing…" while the other person is writing.
+- A bolder app icon, easier to make out in the tray and taskbar.
+
 ## 0.3.0 — 2026-11-23
 
 - Seen receipts. A sent message now shows "seen" after "delivered", once it has been on screen in the other person's Tightbeam. If they run an older version, messages stop at "delivered".

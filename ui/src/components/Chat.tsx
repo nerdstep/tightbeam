@@ -1,8 +1,9 @@
 import { shallow, useSelector } from '@tanstack/react-store'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { memo, useEffect, useRef, useState } from 'react'
+import { ReplyIcon, SmilePlusIcon, XIcon } from 'lucide-react'
+import { memo, useCallback, useEffect, useRef, useState } from 'react'
 
-import { api, type Message as ChatMessage } from '@/api'
+import { api, type Message as ChatMessage, type Quote, type Reaction } from '@/api'
 import { type Command, parse, suggest } from '@/commands'
 import { Linkified } from '@/components/Linkified'
 import { SettingsMenu } from '@/components/SettingsMenu'
@@ -16,8 +17,14 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { Bubble, BubbleContent } from '@/components/ui/bubble'
+import { Bubble, BubbleContent, BubbleReactions } from '@/components/ui/bubble'
 import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Marker } from '@/components/ui/marker'
 import { Message, MessageContent, MessageFooter } from '@/components/ui/message'
 import {
@@ -30,7 +37,13 @@ import {
 } from '@/components/ui/message-scroller'
 import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
-import { addMessage, clearHistory, loadOlder, messageKey, run, store } from '@/store'
+import { addMessage, clearHistory, loadOlder, messageKey, run, setReplyingTo, store } from '@/store'
+
+/** The reactions on offer. */
+const EMOJI = ['👍', '❤️', '😂', '😮', '😢', '🎉']
+
+/** While typing, tell the peer this often. Their "typing…" lapses a little after. */
+const TYPING_EVERY_MS = 2500
 
 /** Paired: the conversation. */
 export function Chat() {
@@ -46,9 +59,13 @@ export function Chat() {
 }
 
 function Header() {
-  const { name, connected } = useSelector(
+  const { name, connected, typing } = useSelector(
     store,
-    (s) => ({ name: s.status?.peer?.name ?? '', connected: !!s.status?.connected }),
+    (s) => ({
+      name: s.status?.peer?.name ?? '',
+      connected: !!s.status?.connected,
+      typing: s.peerTyping,
+    }),
     { compare: shallow },
   )
   const [unpairing, setUnpairing] = useState(false)
@@ -59,9 +76,13 @@ function Header() {
         <h1 className="font-semibold">{name || 'Your peer'}</h1>
         <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <span
-            className={`size-1.75 rounded-full ${connected ? 'bg-success' : 'bg-muted-foreground'}`}
+            className={`size-1.75 rounded-full ${connected ? 'bg-success' : 'bg-muted-foreground'} ${typing ? 'motion-safe:animate-pulse' : ''}`}
           />
-          {connected ? 'Connected' : 'Not connected · messages send when you’re both online'}
+          {typing
+            ? 'Typing…'
+            : connected
+              ? 'Connected'
+              : 'Not connected · messages send when you’re both online'}
         </span>
       </div>
       <SettingsMenu onUnpair={() => setUnpairing(true)} />
@@ -73,13 +94,14 @@ function Header() {
 const dayOf = (m: ChatMessage) => new Date(m.ts).toDateString()
 
 function Transcript() {
-  const { messages, hasOlder, loadingOlder, myId, peerHas, peerSeen } = useSelector(
+  const { messages, hasOlder, loadingOlder, myId, peerName, peerHas, peerSeen } = useSelector(
     store,
     (s) => ({
       messages: s.messages,
       hasOlder: s.hasOlder,
       loadingOlder: s.loadingOlder,
       myId: s.status?.me.id ?? '',
+      peerName: s.status?.peer?.name || 'Them',
       peerHas: s.status?.peer_has ?? 0,
       peerSeen: s.status?.peer_seen ?? 0,
     }),
@@ -99,6 +121,7 @@ function Transcript() {
       hasOlder={hasOlder}
       loadingOlder={loadingOlder}
       myId={myId}
+      peerName={peerName}
       peerHas={peerHas}
       peerSeen={peerSeen}
     />
@@ -115,6 +138,8 @@ function receiptFor(seq: number, peerHas: number, peerSeen: number): Receipt {
 
 /** Rows within this many of the oldest loaded one trigger loading the previous page. */
 const LOAD_OLDER_WITHIN = 15
+/** How long a message stays highlighted after jumping to it from a reply. */
+const HIGHLIGHT_MS = 1500
 
 /**
  * The transcript, virtualized: only the rows on screen (plus `overscan` either side)
@@ -130,6 +155,7 @@ function VirtualTranscript({
   hasOlder,
   loadingOlder,
   myId,
+  peerName,
   peerHas,
   peerSeen,
 }: {
@@ -137,6 +163,7 @@ function VirtualTranscript({
   hasOlder: boolean
   loadingOlder: boolean
   myId: string
+  peerName: string
   peerHas: number
   peerSeen: number
 }) {
@@ -144,6 +171,7 @@ function VirtualTranscript({
   // Ignore the first renders: before the initial jump to the end, the top rows are
   // "visible" and would trigger a pointless page load.
   const scrolledRef = useRef(false)
+  const [highlighted, setHighlighted] = useState<string | null>(null)
 
   // useVirtualizer returns a mutable instance by design. That only matters to the React
   // Compiler (not used here); the memoized rows get plain values, never the instance.
@@ -165,6 +193,25 @@ function VirtualTranscript({
       void loadOlder()
     }
   }, [firstIndex, hasOlder, loadingOlder])
+
+  useEffect(() => {
+    const timer = highlighted ? setTimeout(() => setHighlighted(null), HIGHLIGHT_MS) : undefined
+    return () => clearTimeout(timer)
+  }, [highlighted])
+
+  // Stable for the memoized rows: reads the latest messages through a ref.
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
+  const jumpTo = useCallback(
+    (quote: Quote) => {
+      const key = messageKey(quote)
+      const index = messagesRef.current.findIndex((m) => messageKey(m) === key)
+      if (index < 0) return // not loaded: older than what's paged in, or cleared
+      virtualizer.scrollToIndex(index, { align: 'center' })
+      setHighlighted(key)
+    },
+    [virtualizer],
+  )
 
   return (
     <MessageScroller className="flex-1">
@@ -190,9 +237,13 @@ function VirtualTranscript({
                   <Row
                     message={m}
                     receipt={m.author === myId ? receiptFor(m.seq, peerHas, peerSeen) : null}
+                    myId={myId}
+                    peerName={peerName}
                     newDay={!prev || dayOf(prev) !== dayOf(m)}
                     groupStart={!prev || !sameGroup(prev, m)}
                     groupEnd={!next || !sameGroup(m, next)}
+                    highlighted={highlighted === item.key}
+                    onJump={jumpTo}
                   />
                 </div>
               )
@@ -215,27 +266,44 @@ const sameGroup = (a: ChatMessage, b: ChatMessage) =>
 
 /**
  * One message. Memoized: re-renders only when its own props change (for example its
- * group ending because a new message arrived, or its delivery state).
+ * group ending because a new message arrived, its delivery state, or a reaction).
  */
 const Row = memo(function Row({
   message,
   receipt,
+  myId,
+  peerName,
   newDay,
   groupStart,
   groupEnd,
+  highlighted,
+  onJump,
 }: {
   message: ChatMessage
   /** Only for my own messages. */
   receipt: Receipt | null
+  myId: string
+  peerName: string
   newDay: boolean
   /** First in its group: space above it. */
   groupStart: boolean
   /** Last in its group: show the time and delivery state under it. */
   groupEnd: boolean
+  /** Just jumped to from a reply. */
+  highlighted: boolean
+  onJump: (quote: Quote) => void
 }) {
   const when = new Date(message.ts)
   const mine = receipt !== null
   const align = mine ? 'end' : 'start'
+  const nameOf = (author: string) => (author === myId ? 'You' : peerName)
+  const myReaction = message.reactions.find((r) => r.author === myId)?.emoji
+  // Picking my current reaction again takes it back.
+  const react = (emoji: string) =>
+    void run(
+      api.react({ author: message.author, seq: message.seq }, emoji === myReaction ? '' : emoji),
+    )
+
   return (
     <div className={groupStart ? 'pt-3' : 'pt-0.5'}>
       {newDay && (
@@ -245,10 +313,40 @@ const Row = memo(function Row({
       )}
       <Message align={align}>
         <MessageContent className="gap-1">
-          <Bubble variant={mine ? 'default' : 'secondary'} align={align}>
-            <BubbleContent className="whitespace-pre-wrap" title={when.toLocaleString()}>
+          <Bubble
+            variant={mine ? 'default' : 'secondary'}
+            align={align}
+            // Room for the reaction chip, which hangs three quarters below the bubble.
+            className={message.reactions.length > 0 ? 'mb-6' : ''}
+          >
+            <BubbleContent
+              className={`whitespace-pre-wrap transition-shadow ${highlighted ? 'ring-3 ring-ring' : ''}`}
+              title={when.toLocaleString()}
+            >
+              {message.reply_to && (
+                <QuoteButton
+                  quote={message.reply_to}
+                  name={nameOf(message.reply_to.author)}
+                  onJump={onJump}
+                />
+              )}
               <Linkified text={message.text} />
             </BubbleContent>
+            {message.reactions.length > 0 && (
+              <Reactions
+                reactions={message.reactions}
+                align={mine ? 'start' : 'end'}
+                nameOf={nameOf}
+                mine={myReaction}
+                onReact={react}
+              />
+            )}
+            <Actions
+              side={mine ? 'start' : 'end'}
+              mine={myReaction}
+              onReact={react}
+              onReply={() => setReplyingTo(message)}
+            />
           </Bubble>
           {groupEnd && (
             <MessageFooter className="text-[11px] font-normal">
@@ -261,6 +359,111 @@ const Row = memo(function Row({
     </div>
   )
 })
+
+/** The message a reply answers, at the top of its bubble. Click to jump to it. */
+function QuoteButton({
+  quote,
+  name,
+  onJump,
+}: {
+  quote: Quote
+  name: string
+  onJump: (quote: Quote) => void
+}) {
+  return (
+    <button
+      type="button"
+      className="mb-1.5 block w-full rounded-md border-l-3 border-current/70 bg-current/10 py-1 pr-2 pl-2 text-left text-xs hover:bg-current/15"
+      onClick={() => onJump(quote)}
+    >
+      <span className="font-medium">{name}</span>
+      <span className="line-clamp-2 opacity-80">
+        {quote.text ?? 'A message that isn’t on this computer'}
+      </span>
+    </button>
+  )
+}
+
+/** The reactions under a bubble. Click one to react the same, or to take yours back. */
+function Reactions({
+  reactions,
+  align,
+  nameOf,
+  mine,
+  onReact,
+}: {
+  reactions: Reaction[]
+  align: 'start' | 'end'
+  nameOf: (author: string) => string
+  mine: string | undefined
+  onReact: (emoji: string) => void
+}) {
+  // Same emoji from both people: one chip with a count.
+  const byEmoji = new Map<string, string[]>()
+  for (const r of reactions) byEmoji.set(r.emoji, [...(byEmoji.get(r.emoji) ?? []), r.author])
+  return (
+    <BubbleReactions align={align}>
+      {[...byEmoji].map(([emoji, authors]) => (
+        <button
+          key={emoji}
+          type="button"
+          className={`flex items-center gap-0.5 rounded-full px-1.5 py-0.5 ${emoji === mine ? 'bg-accent' : ''}`}
+          title={`${authors.map(nameOf).join(' and ')} reacted ${emoji}`}
+          aria-label={
+            emoji === mine
+              ? `Take back your ${emoji}`
+              : `React ${emoji}, like ${authors.map(nameOf).join(' and ')}`
+          }
+          onClick={() => onReact(emoji)}
+        >
+          {emoji}
+          {authors.length > 1 && <span className="text-xs">{authors.length}</span>}
+        </button>
+      ))}
+    </BubbleReactions>
+  )
+}
+
+/** React and Reply, beside the bubble on hover (or keyboard focus). */
+function Actions({
+  side,
+  mine,
+  onReact,
+  onReply,
+}: {
+  /** Which side of the bubble. */
+  side: 'start' | 'end'
+  mine: string | undefined
+  onReact: (emoji: string) => void
+  onReply: () => void
+}) {
+  return (
+    <div
+      className={`absolute top-1/2 flex -translate-y-1/2 items-center opacity-0 transition-opacity group-hover/bubble:opacity-100 focus-within:opacity-100 has-data-popup-open:opacity-100 ${side === 'start' ? 'right-full flex-row-reverse pr-1' : 'left-full pl-1'}`}
+    >
+      <DropdownMenu>
+        <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="React" />}>
+          <SmilePlusIcon />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent side="top" align="center" className="flex w-auto min-w-0 gap-0.5">
+          {EMOJI.map((emoji) => (
+            <DropdownMenuItem
+              key={emoji}
+              className={`px-1.5 text-lg ${emoji === mine ? 'bg-accent' : ''}`}
+              aria-label={emoji === mine ? `Take back ${emoji}` : `React ${emoji}`}
+              onClick={() => onReact(emoji)}
+            >
+              {emoji}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenu>
+      <Button variant="ghost" size="icon-sm" aria-label="Reply" onClick={onReply}>
+        <ReplyIcon />
+      </Button>
+    </div>
+  )
+}
 
 /** Browsers without CSS `field-sizing` (older WebKit) need help growing the textarea. */
 const autoSizes = typeof CSS !== 'undefined' && CSS.supports('field-sizing', 'content')
@@ -282,7 +485,22 @@ function Composer() {
   const [dismissed, setDismissed] = useState(false)
   const [clearing, setClearing] = useState(false)
   const textRef = useRef<HTMLTextAreaElement>(null)
+  const typingSentRef = useRef(0)
   const { scrollToEnd } = useMessageScroller()
+  const { replyingTo, peerName, myId } = useSelector(
+    store,
+    (s) => ({
+      replyingTo: s.replyingTo,
+      peerName: s.status?.peer?.name || 'them',
+      myId: s.status?.me.id ?? '',
+    }),
+    { compare: shallow },
+  )
+
+  // Choosing Reply on a message: start typing straight away.
+  useEffect(() => {
+    if (replyingTo) textRef.current?.focus()
+  }, [replyingTo])
 
   const suggestions = dismissed ? [] : suggest(text)
   const highlighted = suggestions[Math.min(active, suggestions.length - 1)]
@@ -292,10 +510,18 @@ function Composer() {
     setHint(null)
     setActive(0)
     setDismissed(false)
+    const now = Date.now()
+    if (value.trim() && !value.startsWith('/') && now - typingSentRef.current > TYPING_EVERY_MS) {
+      typingSentRef.current = now
+      void api.typing().catch(() => {})
+    }
   }
 
   const reset = () => {
-    change('')
+    setText('')
+    setHint(null)
+    setActive(0)
+    setDismissed(false)
     if (!autoSizes && textRef.current) textRef.current.style.height = ''
   }
 
@@ -313,13 +539,19 @@ function Composer() {
     }
     const value = parsed.text
     if (!value) return
+    const reply = replyingTo
     reset()
-    const sent = await run(api.sendMessage(value))
+    setReplyingTo(null)
+    typingSentRef.current = 0 // the next message signals typing right away
+    const to = reply ? { author: reply.author, seq: reply.seq } : undefined
+    const sent = await run(api.sendMessage(value, to))
     if (sent) {
       addMessage(sent)
       scrollToEnd({ behavior: 'smooth' })
     } else {
-      setText(value) // keep the draft if it failed
+      // Keep the draft, and what it was replying to, if it failed.
+      setText(value)
+      setReplyingTo(reply)
     }
   }
 
@@ -349,6 +581,11 @@ function Composer() {
         return
       }
     }
+    if (e.key === 'Escape' && replyingTo) {
+      e.preventDefault()
+      setReplyingTo(null)
+      return
+    }
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       void send()
@@ -357,7 +594,7 @@ function Composer() {
 
   return (
     <form
-      className="relative flex items-end gap-2 border-t bg-card px-4 py-3"
+      className="relative border-t bg-card px-4 py-3"
       onSubmit={(e) => {
         e.preventDefault()
         void send()
@@ -376,23 +613,44 @@ function Composer() {
           {hint}
         </p>
       )}
-      <Textarea
-        ref={textRef}
-        rows={1}
-        maxLength={4000}
-        placeholder="Message, or / for commands"
-        aria-label="Message"
-        className="max-h-36 min-h-9 resize-none py-1.5 text-sm"
-        value={text}
-        onChange={(e) => {
-          change(e.target.value)
-          fit(e.target)
-        }}
-        onKeyDown={onKeyDown}
-      />
-      <Button type="submit" size="lg">
-        Send
-      </Button>
+      {replyingTo && (
+        <div className="mb-2 flex items-center gap-2 rounded-md border-l-2 border-primary bg-muted py-1 pr-1 pl-2 text-xs">
+          <div className="min-w-0 flex-1">
+            <div className="font-medium">
+              Replying to {replyingTo.author === myId ? 'yourself' : peerName}
+            </div>
+            <div className="truncate text-muted-foreground">{replyingTo.text}</div>
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Cancel reply"
+            onClick={() => setReplyingTo(null)}
+          >
+            <XIcon />
+          </Button>
+        </div>
+      )}
+      <div className="flex items-end gap-2">
+        <Textarea
+          ref={textRef}
+          rows={1}
+          maxLength={4000}
+          placeholder="Message, or / for commands"
+          aria-label="Message"
+          className="max-h-36 min-h-9 resize-none py-1.5 text-sm"
+          value={text}
+          onChange={(e) => {
+            change(e.target.value)
+            fit(e.target)
+          }}
+          onKeyDown={onKeyDown}
+        />
+        <Button type="submit" size="lg">
+          Send
+        </Button>
+      </div>
       <ClearDialog open={clearing} onOpenChange={setClearing} />
     </form>
   )

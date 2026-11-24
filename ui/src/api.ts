@@ -32,12 +32,32 @@ export interface Status {
   notice: string | null
 }
 
+/** A message, by author and sequence number. */
+export interface Ref {
+  author: string
+  seq: number
+}
+
+/** The message a reply answers. */
+export interface Quote extends Ref {
+  /** `null` when that message isn't on this computer (cleared, for example). */
+  text: string | null
+}
+
+export interface Reaction {
+  author: string
+  emoji: string
+}
+
 export interface Message {
   author: string
   seq: number
   /** Milliseconds since the epoch, from the author's clock. */
   ts: number
   text: string
+  reply_to: Quote | null
+  /** At most one per person. */
+  reactions: Reaction[]
 }
 
 /** A position in display order; a page loads the messages before it. */
@@ -68,13 +88,22 @@ export type CoreEvent =
   | { kind: 'message'; data: Message }
   /** The peer nudged us. */
   | { kind: 'nudge' }
+  /** The reactions on a message changed; `reactions` is the whole new set. */
+  | { kind: 'reactions'; data: { to: Ref; reactions: Reaction[] } }
+  /** The peer is typing. Repeats every few seconds while they type. */
+  | { kind: 'typing' }
 
 export const api = {
   getStatus: () => invoke<Status>('get_status'),
   getMessages: (before?: Cursor, limit?: number) =>
     invoke<Page>('get_messages', { before: before ?? null, limit: limit ?? null }),
   setName: (name: string) => invoke<void>('set_name', { name }),
-  sendMessage: (text: string) => invoke<Message>('send_message', { text }),
+  sendMessage: (text: string, replyTo?: Ref) =>
+    invoke<Message>('send_message', { text, replyTo: replyTo ?? null }),
+  /** Sets my reaction to a message, replacing any earlier one. `''` takes it back. */
+  react: (to: Ref, emoji: string) => invoke<void>('react', { to, emoji }),
+  /** Tells the peer I'm typing. Call every few seconds while typing. */
+  typing: () => invoke<void>('typing'),
   /** Erases the conversation on this computer. Undelivered messages of mine stay. */
   clearHistory: () => invoke<void>('clear_history'),
   /** Fails when not connected, or right after another nudge. */

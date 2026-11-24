@@ -10,8 +10,10 @@ Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https:/
 - **Discovery.** Each app announces itself on the LAN over mDNS (`_tightbeam._udp.local`), along with its display name.
 - **Pairing.** You click a nearby person, and both screens show the same six-digit code, derived from both keys. The other person accepts. From then on, each app only talks to that one key.
 - **Connection.** Once paired, the app with the lower ID dials the other every few seconds until connected. The link is QUIC with TLS, authenticated by those keys.
-- **Sync.** Messages are numbered per author. On connect, each side says "the last one I have from you is #N", and the other sends everything after it. Duplicates are ignored, so resending is always safe.
+- **Sync.** Messages, and reactions to them, are numbered per author. On connect, each side says "the last one I have from you is #N", and the other sends everything after it. Duplicates are ignored, so resending is always safe.
 - **Delivery.** Your message shows "waiting" until the other app confirms it has it, then "delivered". It shows "seen" once their window has had focus with the message in it. Like delivery, "seen" is a number per person ("I've seen up to #N"), re-sent at the start of every connection.
+
+**Replies and reactions:** hover a message to reply to it or react with an emoji. Each person has one reaction per message; picking the same one again takes it back. A reply or reaction is a new numbered entry that points at the message by author and number, so the log is only ever added to. While the other person types, the header says "Typing…"; that signal is never stored.
 
 **Commands:** type `/` in the message box for a list. `/clear` erases the conversation on this computer; the other person keeps their copy, and your messages that haven't reached them yet stay so they still get delivered. The erased messages are overwritten in the database file, not just marked free. `/nudge` shakes the other person's window and plays a sound, or shows a notification if Tightbeam is in their tray. To send a message that starts with a slash, begin it with `//`.
 

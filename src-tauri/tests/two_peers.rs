@@ -1,6 +1,6 @@
 //! Two real Tightbeam cores on this machine, found via mDNS and talking over QUIC.
 //! Covers pairing, live messages, delivery acks, seen receipts, catching up after one
-//! side was off, nudges, and clearing one side's history.
+//! side was off, replies and reactions, typing, nudges, and clearing one side's history.
 
 use std::{
     path::PathBuf,
@@ -11,18 +11,21 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tightbeam_lib::chat::{Core, Emit, Event};
+use tightbeam_lib::{
+    chat::{Core, Emit, Event},
+    db::Ref,
+};
 
 fn quiet() -> Emit {
     Arc::new(|_| {})
 }
 
-/// Counts the nudges it's told about.
-fn counting_nudges(count: Arc<AtomicUsize>) -> Emit {
-    Arc::new(move |event| {
-        if let Event::Nudge = event {
-            count.fetch_add(1, Ordering::SeqCst);
-        }
+/// Counts the nudges and typing signals it's told about.
+fn counting(nudges: Arc<AtomicUsize>, typing: Arc<AtomicUsize>) -> Emit {
+    Arc::new(move |event| match event {
+        Event::Nudge => drop(nudges.fetch_add(1, Ordering::SeqCst)),
+        Event::Typing => drop(typing.fetch_add(1, Ordering::SeqCst)),
+        _ => {}
     })
 }
 
@@ -93,9 +96,9 @@ async fn pair_chat_and_catch_up() {
 
     // Live messages both ways, with delivery confirmation.
     let a = alice.clone();
-    like_tauri(move || a.send_message("hi bob")).unwrap();
+    like_tauri(move || a.send_message("hi bob", None)).unwrap();
     wait_for("bob gets alice's message", 10, || texts(&bob).contains(&"hi bob".into())).await;
-    bob.send_message("hi alice").unwrap();
+    bob.send_message("hi alice", None).unwrap();
     wait_for("alice gets bob's message", 10, || texts(&alice).contains(&"hi alice".into())).await;
     wait_for("alice sees delivery", 10, || alice.status().peer_has == 1).await;
     assert_eq!(alice.status().peer_seen, 0, "delivered isn't seen");
@@ -109,13 +112,18 @@ async fn pair_chat_and_catch_up() {
     bob.shutdown().await;
     drop(bob);
     wait_for("alice notices bob left", 40, || !alice.status().connected).await;
-    alice.send_message("you there?").unwrap();
-    alice.send_message("guess not").unwrap();
+    alice.send_message("you there?", None).unwrap();
+    alice.send_message("guess not", None).unwrap();
+    // A reaction while he's away: it syncs with the catch-up.
+    let first = Ref { author: bob_id.clone(), seq: 1 };
+    alice.react(first.clone(), "👍").unwrap();
     assert_eq!(alice.status().peer_has, 1, "undelivered messages must not show as delivered");
 
     // Bob comes back with the same identity and catches up.
-    let nudges = Arc::new(AtomicUsize::new(0));
-    bob = Core::start_with(dir_b.clone(), counting_nudges(nudges.clone()), true).await.unwrap();
+    let (nudges, typing) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    bob = Core::start_with(dir_b.clone(), counting(nudges.clone(), typing.clone()), true)
+        .await
+        .unwrap();
     assert_eq!(bob.id(), bob_id, "identity must survive a restart");
     assert_eq!(bob.status().peer.unwrap().name, "Alice", "pairing must survive a restart");
     wait_for("reconnect", 40, || alice.status().connected && bob.status().connected).await;
@@ -124,12 +132,42 @@ async fn pair_chat_and_catch_up() {
         t.contains(&"you there?".into()) && t.contains(&"guess not".into())
     })
     .await;
-    wait_for("alice sees catch-up delivered", 10, || alice.status().peer_has == 3).await;
-    assert_eq!(texts(&bob).len(), 4, "no duplicates after catch-up");
+    wait_for("alice sees catch-up delivered", 10, || alice.status().peer_has == 4).await;
+    assert_eq!(texts(&bob).len(), 4, "no duplicates after catch-up, and reactions aren't messages");
+    let reactions = |core: &Core| {
+        let messages = core.messages().unwrap();
+        let m = messages.iter().find(|m| m.author == first.author && m.seq == first.seq);
+        m.unwrap().reactions.iter().map(|r| r.emoji.clone()).collect::<Vec<_>>()
+    };
+    wait_for("bob sees the reaction", 10, || reactions(&bob) == ["👍"]).await;
     assert_eq!(alice.status().peer_seen, 1, "seen must survive the reconnect, and not grow");
     let b = bob.clone();
     like_tauri(move || b.mark_seen()).unwrap();
-    wait_for("alice sees the catch-up seen", 10, || alice.status().peer_seen == 3).await;
+    wait_for("alice sees the catch-up seen", 10, || alice.status().peer_seen == 4).await;
+
+    // Bob replies to Alice's first message. Then she takes her reaction back and he adds one.
+    let hi_bob = Ref { author: alice.id(), seq: 1 };
+    let b = bob.clone();
+    let sent = like_tauri(move || b.send_message("hi again", Some(hi_bob))).unwrap();
+    assert_eq!(sent.reply_to.unwrap().text.as_deref(), Some("hi bob"));
+    wait_for("alice gets the reply", 10, || {
+        alice.messages().unwrap().iter().any(|m| {
+            m.text == "hi again"
+                && m.reply_to.as_ref().is_some_and(|q| q.text.as_deref() == Some("hi bob"))
+        })
+    })
+    .await;
+    alice.react(first.clone(), "").unwrap();
+    bob.react(first.clone(), "😂").unwrap();
+    wait_for("reactions settle on both sides", 10, || {
+        reactions(&alice) == ["😂"] && reactions(&bob) == ["😂"]
+    })
+    .await;
+
+    // Typing reaches Bob.
+    let a = alice.clone();
+    like_tauri(move || a.typing());
+    wait_for("bob sees alice typing", 10, || typing.load(Ordering::SeqCst) == 1).await;
 
     // Alice nudges Bob. A second nudge right after is refused.
     let a = alice.clone();
@@ -141,10 +179,10 @@ async fn pair_chat_and_catch_up() {
     let b = bob.clone();
     like_tauri(move || b.clear_history()).unwrap();
     assert!(texts(&bob).is_empty());
-    assert_eq!(texts(&alice).len(), 4);
-    assert_eq!(bob.send_message("fresh start").unwrap().seq, 2);
-    wait_for("alice gets it", 10, || texts(&alice).contains(&"fresh start".into())).await;
     assert_eq!(texts(&alice).len(), 5);
+    assert_eq!(bob.send_message("fresh start", None).unwrap().seq, 4);
+    wait_for("alice gets it", 10, || texts(&alice).contains(&"fresh start".into())).await;
+    assert_eq!(texts(&alice).len(), 6);
     assert_eq!(texts(&bob), ["fresh start"]);
 
     alice.shutdown().await;

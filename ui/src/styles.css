@@ -103,6 +103,11 @@
   * {
     @apply border-border outline-ring/50;
   }
+  /* Pointer cursor on buttons, as `shadcn init --pointer` sets up. */
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
   html,
   body,
   #app {
@@ -140,4 +145,10 @@
       background-color: var(--scrollbar-thumb-hover);
     }
   }
+}
+
+/* Menu items too. Outside any layer on purpose: shadcn's items carry a `cursor-default`
+   class, and unlayered CSS beats Tailwind's utilities without editing generated code. */
+:is([role="menuitem"], [role="menuitemcheckbox"], [role="menuitemradio"]):not([data-disabled]) {
+  cursor: pointer;
 }

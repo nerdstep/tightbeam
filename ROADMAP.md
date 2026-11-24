@@ -34,9 +34,9 @@ Previously the whole history loaded at startup and every bubble re-rendered on e
 New frame types or message kinds. The per-author append-only log stays as it is: changes are new entries that refer to earlier ones, never rewrites.
 
 - [x] **Seen receipts.** `Seen { up_to }`, the same shape as `Ack`, is sent when the window gains focus or a message arrives while it's focused, and again at the start of each session. "Seen" replaces "delivered".
-- [ ] **Typing indicator.** A throwaway frame, never stored. It expires after a few seconds without a refresh.
-- [ ] **Reactions.** A message kind that targets `(author, seq)`.
-- [ ] **Replies.** A message carrying an optional `reply_to: (author, seq)`, shown as a quoted snippet.
+- [x] **Typing indicator.** A `Typing` frame, never stored, sent at most every 2.5 seconds while typing. The other side shows "Typing…" until 4 seconds pass without one, their message arrives, or the connection drops.
+- [x] **Reactions.** A log entry: `Msg` with `react_to: (author, seq)` and the emoji as its text. Each person's latest reaction to a message wins, and "" takes it back. Stored in `messages` with `kind = 'reaction'`, so they sync like messages. No notification or unread count for reactions yet.
+- [x] **Replies.** `Msg` with an optional `reply_to: (author, seq)`, shown as a quoted snippet that jumps to the original when it's loaded.
 - [ ] **Edit and delete.** New messages that say "replace or hide `(author, seq)`". The UI shows the latest version and an "edited" mark.
 - [x] **Slash commands.** Typing `/` at the start of the message box opens a filtered list of commands. Tab completes, an unknown command shows a hint instead of sending, and `//` sends a literal slash. Commands come from a small registry in `ui/src/commands.ts`. So far:
   - `/clear`: erases this computer's copy of the conversation. The peer's copy is untouched, nothing goes over the wire, and sequence numbers carry on (a `cleared` table remembers the highest one erased per author), so sync never asks for the erased messages again.

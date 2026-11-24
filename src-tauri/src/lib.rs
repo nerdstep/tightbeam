@@ -6,7 +6,7 @@ mod updates;
 use std::{path::PathBuf, sync::Arc};
 
 use chat::{Core, Emit, Event, Status};
-use db::{Cursor, Message, Page};
+use db::{Cursor, Message, Page, Ref};
 use desktop::{Desktop, MAIN_WINDOW, MINIMIZED_ARG};
 use serde::Serialize;
 use tauri::{Emitter, Manager, RunEvent, State, WindowEvent};
@@ -52,9 +52,21 @@ fn set_name(core: CoreState, name: String) -> Result<(), String> {
     core.set_name(&name).map_err(err)
 }
 
+/// `reply_to`: the message this one answers.
 #[tauri::command]
-fn send_message(core: CoreState, text: String) -> Result<Message, String> {
-    core.send_message(&text).map_err(err)
+fn send_message(core: CoreState, text: String, reply_to: Option<Ref>) -> Result<Message, String> {
+    core.send_message(&text, reply_to).map_err(err)
+}
+
+/// Sets my reaction to a message; `emoji` "" takes it back.
+#[tauri::command]
+fn react(core: CoreState, to: Ref, emoji: String) -> Result<(), String> {
+    core.react(to, &emoji).map_err(err)
+}
+
+#[tauri::command]
+fn typing(core: CoreState) {
+    core.typing()
 }
 
 /// Erases the conversation on this computer only.
@@ -200,7 +212,7 @@ pub fn run() {
                 match &event {
                     Event::Message(message) => desktop::on_message(&handle, message),
                     Event::Nudge => desktop::on_nudge(&handle),
-                    Event::Status(_) => {}
+                    Event::Status(_) | Event::Reactions { .. } | Event::Typing => {}
                 }
                 let _ = handle.emit("tightbeam", event);
             });
@@ -234,6 +246,8 @@ pub fn run() {
             get_messages,
             set_name,
             send_message,
+            react,
+            typing,
             clear_history,
             nudge,
             pair_with,

@@ -4,8 +4,8 @@
 //! Wire protocol (ALPN `tightbeam/1`): one bidirectional QUIC stream per connection,
 //! carrying length-prefixed JSON `Frame`s. A connection starts with either
 //! `PairRequest` (unpaired) or `Hello` (paired). After both sides say `Hello`, each
-//! sends the messages the other is missing, then live messages, acks, seen receipts
-//! and nudges.
+//! sends the log entries the other is missing (messages and reactions), then live
+//! entries, acks, seen receipts, typing and nudges.
 
 use std::{
     collections::BTreeMap,
@@ -31,7 +31,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::db::{Cursor, Db, Message, Page};
+use crate::db::{Cursor, Db, Entry, Kind, Message, Page, Reaction, Ref};
 
 pub const ALPN: &[u8] = b"tightbeam/1";
 /// mDNS service name, so we only see other Tightbeam apps (`_tightbeam._udp.local`).
@@ -39,6 +39,8 @@ const SERVICE: &str = "tightbeam";
 const MAX_FRAME: usize = 64 * 1024;
 const MAX_TEXT_CHARS: usize = 4000;
 const MAX_NAME_CHARS: usize = 40;
+/// Room for an emoji made of several code points, like a family or a flag.
+const MAX_EMOJI_CHARS: usize = 16;
 const PAIR_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
@@ -64,10 +66,19 @@ enum Frame {
         name: String,
         have: u64,
     },
+    /// An entry in the sender's log. Plain, it's a message.
     Msg {
         seq: u64,
         ts: i64,
         text: String,
+        /// The message this one answers. Added in 0.4; older peers show a plain message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to: Option<Ref>,
+        /// Makes this a reaction to that message: `text` is the emoji, or "" to take
+        /// the sender's reaction back. Added in 0.4; older peers show the emoji as a
+        /// message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        react_to: Option<Ref>,
     },
     Ack {
         have: u64,
@@ -80,6 +91,9 @@ enum Frame {
     /// Get the other person's attention. Live only, never stored. Added in 0.3; older
     /// peers skip it.
     Nudge,
+    /// The sender is typing. Live only, repeated every few seconds while they type; the
+    /// receiver lets it lapse after a few seconds without one. Added in 0.4.
+    Typing,
     /// A frame type from a newer version. Never sent.
     #[serde(other, skip_serializing)]
     Unknown,
@@ -123,6 +137,13 @@ pub enum Event {
     Message(Message),
     /// The peer nudged us.
     Nudge,
+    /// The reactions on a message changed. `reactions` is the whole new set.
+    Reactions {
+        to: Ref,
+        reactions: Vec<Reaction>,
+    },
+    /// The peer is typing.
+    Typing,
 }
 
 pub type Emit = Arc<dyn Fn(Event) + Send + Sync>;
@@ -322,22 +343,39 @@ impl Core {
         Ok(())
     }
 
-    pub fn send_message(&self, text: &str) -> Result<Message> {
+    /// `reply_to`: the message this one answers.
+    pub fn send_message(&self, text: &str, reply_to: Option<Ref>) -> Result<Message> {
         let text = clean(text, MAX_TEXT_CHARS);
         ensure!(!text.is_empty(), "message can't be empty");
-        ensure!(self.peer_id().is_some(), "not paired with anyone yet");
-        let msg = {
-            let db = self.db();
-            let msg =
-                Message { author: self.id(), seq: db.max_seq(&self.id())? + 1, ts: now_ms(), text };
-            db.insert(&msg)?;
-            msg
-        };
-        (self.emit)(Event::Message(msg.clone()));
-        if let Some(s) = &self.state().session {
-            let _ = s.out.send(Frame::Msg { seq: msg.seq, ts: msg.ts, text: msg.text.clone() });
+        let peer = self.peer_id().context("not paired with anyone yet")?;
+        if let Some(to) = &reply_to {
+            ensure!(self.is_ours(to, &peer.to_string()), "can't reply to that");
         }
+        let entry = self.append(text, Kind::Message { reply_to })?;
+        let at = Ref { author: entry.author.clone(), seq: entry.seq };
+        let msg = self.db().message(&at)?.context("message vanished")?;
+        (self.emit)(Event::Message(msg.clone()));
+        self.send_live(entry);
         Ok(msg)
+    }
+
+    /// Sets my reaction to a message, replacing any earlier one. `emoji` "" takes it back.
+    pub fn react(&self, to: Ref, emoji: &str) -> Result<()> {
+        let emoji = clean(emoji, MAX_EMOJI_CHARS);
+        let peer = self.peer_id().context("not paired with anyone yet")?;
+        ensure!(self.is_ours(&to, &peer.to_string()), "can't react to that");
+        let entry = self.append(emoji, Kind::Reaction { to: to.clone() })?;
+        let reactions = self.db().reactions(&to)?;
+        (self.emit)(Event::Reactions { to, reactions });
+        self.send_live(entry);
+        Ok(())
+    }
+
+    /// I'm typing. The UI calls this every few seconds while I type.
+    pub fn typing(&self) {
+        if let Some(s) = &self.state().session {
+            let _ = s.out.send(Frame::Typing);
+        }
     }
 
     /// The person is looking at the chat: everything received so far counts as seen.
@@ -716,8 +754,8 @@ impl Core {
             }
             generation
         };
-        for m in self.db().since(&self.id(), their_have)? {
-            let _ = out.send(Frame::Msg { seq: m.seq, ts: m.ts, text: m.text });
+        for entry in self.db().since(&self.id(), their_have)? {
+            let _ = out.send(to_frame(entry));
         }
         // Covers anything seen while we were apart.
         let _ = out.send(Frame::Seen { up_to: self.state().seen });
@@ -751,22 +789,37 @@ impl Core {
     ) -> Result<()> {
         loop {
             match read_frame(recv).await? {
-                Frame::Msg { seq, ts, text } => {
-                    let msg = Message {
+                Frame::Msg { seq, ts, text, reply_to, react_to } => {
+                    // Refs to anyone but the two of us are dropped: a reply becomes a
+                    // plain message, a reaction is stored but never shown.
+                    let kind = match react_to {
+                        Some(to) => Kind::Reaction { to },
+                        None => {
+                            Kind::Message { reply_to: reply_to.filter(|to| self.is_ours(to, peer)) }
+                        }
+                    };
+                    let limit = if matches!(kind, Kind::Reaction { .. }) {
+                        MAX_EMOJI_CHARS
+                    } else {
+                        MAX_TEXT_CHARS
+                    };
+                    let entry = Entry {
                         author: peer.to_string(),
                         seq,
                         ts,
-                        text: clean(&text, MAX_TEXT_CHARS),
+                        text: clean(&text, limit),
+                        kind,
                     };
                     let (is_new, have) = {
                         let db = self.db();
-                        (db.insert(&msg)?, db.max_seq(peer)?)
+                        (db.insert(&entry)?, db.max_seq(peer)?)
                     };
                     if is_new {
-                        (self.emit)(Event::Message(msg));
+                        self.announce(entry)?;
                     }
                     let _ = out.send(Frame::Ack { have });
                 }
+                Frame::Typing => (self.emit)(Event::Typing),
                 Frame::Ack { have } => self.set_peer_has(have, false)?,
                 Frame::Seen { up_to } => self.set_peer_seen(up_to)?,
                 Frame::Nudge => self.nudged(),
@@ -868,6 +921,44 @@ impl Core {
         Ok(())
     }
 
+    /// Adds an entry to my log.
+    fn append(&self, text: String, kind: Kind) -> Result<Entry> {
+        let db = self.db();
+        let entry =
+            Entry { author: self.id(), seq: db.max_seq(&self.id())? + 1, ts: now_ms(), text, kind };
+        db.insert(&entry)?;
+        Ok(entry)
+    }
+
+    /// Sends one of my entries now, if connected. Otherwise it goes with the catch-up.
+    fn send_live(&self, entry: Entry) {
+        if let Some(s) = &self.state().session {
+            let _ = s.out.send(to_frame(entry));
+        }
+    }
+
+    /// Tells the UI about a new entry from the peer.
+    fn announce(&self, entry: Entry) -> Result<()> {
+        match entry.kind {
+            Kind::Message { .. } => {
+                let at = Ref { author: entry.author, seq: entry.seq };
+                if let Some(msg) = self.db().message(&at)? {
+                    (self.emit)(Event::Message(msg));
+                }
+            }
+            Kind::Reaction { to } => {
+                let reactions = self.db().reactions(&to)?;
+                (self.emit)(Event::Reactions { to, reactions });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `to` is one of our two logs, mine or the peer's.
+    fn is_ours(&self, to: &Ref, peer: &str) -> bool {
+        to.author == self.id() || to.author == peer
+    }
+
     /// Passes a nudge on, unless one just came in.
     fn nudged(&self) {
         {
@@ -924,6 +1015,14 @@ fn is_lan(addr: &TransportAddr, allow_loopback: bool) -> bool {
     }
 }
 
+fn to_frame(entry: Entry) -> Frame {
+    let (reply_to, react_to) = match entry.kind {
+        Kind::Message { reply_to } => (reply_to, None),
+        Kind::Reaction { to } => (None, Some(to)),
+    };
+    Frame::Msg { seq: entry.seq, ts: entry.ts, text: entry.text, reply_to, react_to }
+}
+
 fn clean(s: &str, max_chars: usize) -> String {
     s.trim().chars().take(max_chars).collect()
 }
@@ -959,7 +1058,7 @@ mod tests {
 
     #[test]
     fn unknown_frame_types_parse_as_unknown() {
-        assert!(matches!(parse(r#"{"t":"typing"}"#), Frame::Unknown));
+        assert!(matches!(parse(r#"{"t":"away"}"#), Frame::Unknown));
         assert!(matches!(
             parse(r#"{"t":"reaction","target":{"author":"x","seq":3},"emoji":"+1"}"#),
             Frame::Unknown
@@ -969,8 +1068,11 @@ mod tests {
     #[test]
     fn extra_fields_on_known_frames_are_ignored() {
         let frame =
-            parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","reply_to":{"author":"x","seq":2}}"#);
+            parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","edit_of":{"author":"x","seq":2}}"#);
         assert!(matches!(frame, Frame::Msg { seq: 7, ref text, .. } if text == "hi"));
+        let frame =
+            parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","reply_to":{"author":"x","seq":2}}"#);
+        assert!(matches!(frame, Frame::Msg { reply_to: Some(Ref { seq: 2, .. }), .. }));
     }
 
     #[test]
@@ -981,5 +1083,20 @@ mod tests {
         assert_eq!(json, r#"{"t":"seen","up_to":4}"#);
         let json = serde_json::to_string(&Frame::Nudge).unwrap();
         assert_eq!(json, r#"{"t":"nudge"}"#);
+        // A plain message has no reply or reaction fields, exactly as before 0.4.
+        let plain = to_frame(Entry::message("me", 7, 1, "hi"));
+        let json = serde_json::to_string(&plain).unwrap();
+        assert_eq!(json, r#"{"t":"msg","seq":7,"ts":1,"text":"hi"}"#);
+        let to = Ref { author: "x".into(), seq: 2 };
+        let reaction = Entry {
+            text: "👍".into(),
+            kind: Kind::Reaction { to },
+            ..Entry::message("me", 8, 1, "")
+        };
+        let json = serde_json::to_string(&to_frame(reaction)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"t":"msg","seq":8,"ts":1,"text":"👍","react_to":{"author":"x","seq":2}}"#
+        );
     }
 }

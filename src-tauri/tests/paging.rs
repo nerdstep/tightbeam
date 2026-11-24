@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use tightbeam_lib::db::{Cursor, Db, Message};
+use tightbeam_lib::db::{Cursor, Db, Entry, Message};
 
 const COUNT: u64 = 50_000;
 
@@ -14,16 +14,18 @@ fn pages_through_a_long_history() {
 
     // Two authors alternating, one message a minute. Some share a timestamp to exercise
     // the (author, seq) tie-break.
-    let messages: Vec<Message> = (0..COUNT)
-        .map(|i| Message {
-            author: if i % 2 == 0 { "alice".into() } else { "bob".into() },
-            seq: i / 2 + 1,
-            ts: 1_700_000_000_000 + (i / 4) as i64 * 60_000,
-            text: format!("message {i}"),
+    let entries: Vec<Entry> = (0..COUNT)
+        .map(|i| {
+            Entry::message(
+                if i % 2 == 0 { "alice" } else { "bob" },
+                i / 2 + 1,
+                1_700_000_000_000 + (i / 4) as i64 * 60_000,
+                format!("message {i}"),
+            )
         })
         .collect();
     let started = Instant::now();
-    db.insert_many(&messages).unwrap();
+    db.insert_many(&entries).unwrap();
     println!("inserted {COUNT} in {:?}", started.elapsed());
 
     let started = Instant::now();
