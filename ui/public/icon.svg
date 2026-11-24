@@ -4,17 +4,23 @@
       <stop offset="0" stop-color="#14183a"/>
       <stop offset="1" stop-color="#070915"/>
     </linearGradient>
-    <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+    <!-- Along the beam, from one dot's edge to the other's, so each dot is solid in its
+         color. Blended in OKLCH with a paler middle: a plain sRGB blend of cyan and
+         orange goes muddy grey halfway. -->
+    <linearGradient id="beam" gradientUnits="userSpaceOnUse" x1="128" y1="0" x2="475" y2="0">
       <stop offset="0" stop-color="#7fe3ff"/>
+      <stop offset="0.167" stop-color="#9be8e5"/>
+      <stop offset="0.333" stop-color="#b7e7d3"/>
+      <stop offset="0.5" stop-color="#c7e4c4"/>
+      <stop offset="0.667" stop-color="#d3ddad"/>
+      <stop offset="0.833" stop-color="#e6cf8b"/>
       <stop offset="1" stop-color="#ffb86b"/>
     </linearGradient>
   </defs>
   <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
-  <circle cx="190" cy="250" r="3" fill="#fff" opacity=".6"/>
-  <circle cx="800" cy="180" r="4" fill="#fff" opacity=".5"/>
-  <circle cx="860" cy="760" r="3" fill="#fff" opacity=".5"/>
-  <circle cx="300" cy="840" r="4" fill="#fff" opacity=".4"/>
-  <line x1="290" y1="660" x2="734" y2="364" stroke="url(#beam)" stroke-width="40" stroke-linecap="round"/>
-  <circle cx="270" cy="674" r="96" fill="#7fe3ff"/>
-  <circle cx="754" cy="350" r="96" fill="#ffb86b"/>
+  <!-- Two dots and the beam between them, as one shape: the beam flares into each dot
+       along a curve. Drawn along the x axis, then turned into place. The beam is bold
+       enough to show in the 16 px tray icon. -->
+  <path transform="translate(276 700) rotate(-38.54)" fill="url(#beam)"
+        d="M89.96,-91.06 A170,170 0 0 0 209.43,-42.00 L394.03,-42.00 A170,170 0 0 0 513.50,-91.06 A128,128 0 1 1 513.50,91.06 A170,170 0 0 0 394.03,42.00 L209.43,42.00 A170,170 0 0 0 89.96,91.06 A128,128 0 1 1 89.96,-91.06 Z"/>
 </svg>
