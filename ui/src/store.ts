@@ -52,9 +52,9 @@ const TYPING_LAPSE_MS = 4000
 export const messageKey = (m: Ref) => `${m.author}:${m.seq}`
 const loaded = new Set<string>()
 
-/** Display order, matching the SQL `ORDER BY ts, author, seq`. */
+/** Display order, matching the SQL `ORDER BY hlc, author, seq`. */
 function compare(a: Message, b: Message) {
-  if (a.ts !== b.ts) return a.ts - b.ts
+  if (a.hlc !== b.hlc) return a.hlc - b.hlc
   if (a.author !== b.author) return a.author < b.author ? -1 : 1
   return a.seq - b.seq
 }
@@ -123,7 +123,7 @@ export async function loadOlder() {
   store.setState((s) => ({ ...s, loadingOlder: true }))
   const oldest = messages[0]
   const page = await run(
-    api.getMessages({ ts: oldest.ts, author: oldest.author, seq: oldest.seq }, PAGE_SIZE),
+    api.getMessages({ hlc: oldest.hlc, author: oldest.author, seq: oldest.seq }, PAGE_SIZE),
   )
   const older = (page?.messages ?? []).filter((m) => !loaded.has(messageKey(m)))
   for (const m of older) loaded.add(messageKey(m))

@@ -54,7 +54,10 @@ export interface Message {
   author: string
   seq: number
   /** Milliseconds since the epoch, from the author's clock. */
+  /** When it was written, by its author's clock. */
   ts: number
+  /** Display order: like `ts`, but never before a message its author had already seen. */
+  hlc: number
   /** The latest edit's text, if edited. Empty once deleted. */
   text: string
   edited: boolean
@@ -66,7 +69,7 @@ export interface Message {
 }
 
 /** A position in display order; a page loads the messages before it. */
-export type Cursor = Pick<Message, 'ts' | 'author' | 'seq'>
+export type Cursor = Pick<Message, 'hlc' | 'author' | 'seq'>
 
 export interface Page {
   /** Oldest first. */

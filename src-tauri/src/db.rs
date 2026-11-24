@@ -4,6 +4,10 @@
 //! deletes that refer to an earlier message by `(author, seq)`. A reply also refers to
 //! the message it answers. Entries are only ever added, with one exception: a delete
 //! blanks the text of the message it deletes, and of that message's edits.
+//!
+//! Display order comes from each entry's `hlc`, a hybrid logical clock: the author's wall
+//! clock, pushed past every entry they had stored when they wrote it. So whatever someone
+//! writes after seeing a message sorts after it, however far apart the two clocks are.
 
 use std::path::Path;
 
@@ -25,8 +29,11 @@ pub struct Entry {
     pub author: String,
     /// Per-author sequence number, starting at 1 with no gaps.
     pub seq: u64,
-    /// Milliseconds since the Unix epoch, from the author's clock.
+    /// Milliseconds since the Unix epoch, from the author's clock. The time shown.
     pub ts: i64,
+    /// Display order: `ts`, or one past the highest `hlc` the author had stored, if
+    /// that's later. Entries from peers before 0.5 have `hlc = ts`.
+    pub hlc: i64,
     /// The message, the reaction's emoji ("" takes a reaction back), the edit's new text,
     /// or "" for a delete.
     pub text: String,
@@ -55,7 +62,7 @@ pub enum Kind {
 impl Entry {
     pub fn message(author: impl Into<String>, seq: u64, ts: i64, text: impl Into<String>) -> Self {
         let (author, text) = (author.into(), text.into());
-        Self { author, seq, ts, text, kind: Kind::Message { reply_to: None } }
+        Self { author, seq, ts, hlc: ts, text, kind: Kind::Message { reply_to: None } }
     }
 }
 
@@ -65,6 +72,7 @@ pub struct Message {
     pub author: String,
     pub seq: u64,
     pub ts: i64,
+    pub hlc: i64,
     /// The latest edit's text, if edited. Empty once deleted.
     pub text: String,
     pub edited: bool,
@@ -92,10 +100,10 @@ pub struct Reaction {
     pub emoji: String,
 }
 
-/// A position in display order (`ts`, then `author`, then `seq`): page before this message.
+/// A position in display order (`hlc`, then `author`, then `seq`): page before this message.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Cursor {
-    pub ts: i64,
+    pub hlc: i64,
     pub author: String,
     pub seq: u64,
 }
@@ -113,6 +121,9 @@ const MESSAGE: &str = "message";
 const REACTION: &str = "reaction";
 const EDIT: &str = "edit";
 const DELETE: &str = "delete";
+
+/// Settings key: the highest `hlc` erased by `clear`, so the clock never runs backwards.
+const CLEARED_CLOCK: &str = "cleared_clock";
 
 /// What `Db::current` finds.
 struct Current {
@@ -139,8 +150,6 @@ impl Db {
                  text   TEXT    NOT NULL,
                  PRIMARY KEY (author, seq)
              );
-             -- Display order, for paging through history.
-             CREATE INDEX IF NOT EXISTS messages_by_time ON messages (ts, author, seq);
              -- The highest sequence number erased per author by `clear`. Numbering and
              -- sync carry on from here, as if the messages were still stored.
              CREATE TABLE IF NOT EXISTS cleared (
@@ -163,6 +172,19 @@ impl Db {
                  COMMIT;",
             )?;
         }
+        if version < 2 {
+            // 0.5: display order by hybrid logical clock. Existing entries keep the order
+            // they had, by `ts`.
+            conn.execute_batch(
+                "BEGIN;
+                 ALTER TABLE messages ADD COLUMN hlc INTEGER NOT NULL DEFAULT 0;
+                 UPDATE messages SET hlc = ts;
+                 DROP INDEX IF EXISTS messages_by_time;
+                 CREATE INDEX messages_by_order ON messages (hlc, author, seq);
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
         Ok(Self(conn))
     }
 
@@ -172,12 +194,12 @@ impl Db {
         let fetch = limit as i64 + 1; // one extra row tells us whether there's more
         let entries = match before {
             Some(c) => self.entries(
-                "WHERE kind = 'message' AND (ts, author, seq) < (?1, ?2, ?3)
-                 ORDER BY ts DESC, author DESC, seq DESC LIMIT ?4",
-                params![c.ts, c.author, c.seq as i64, fetch],
+                "WHERE kind = 'message' AND (hlc, author, seq) < (?1, ?2, ?3)
+                 ORDER BY hlc DESC, author DESC, seq DESC LIMIT ?4",
+                params![c.hlc, c.author, c.seq as i64, fetch],
             )?,
             None => self.entries(
-                "WHERE kind = 'message' ORDER BY ts DESC, author DESC, seq DESC LIMIT ?1",
+                "WHERE kind = 'message' ORDER BY hlc DESC, author DESC, seq DESC LIMIT ?1",
                 params![fetch],
             )?,
         };
@@ -190,7 +212,7 @@ impl Db {
 
     /// Every message, in display order.
     pub fn all(&self) -> Result<Vec<Message>> {
-        let entries = self.entries("WHERE kind = 'message' ORDER BY ts, author, seq", [])?;
+        let entries = self.entries("WHERE kind = 'message' ORDER BY hlc, author, seq", [])?;
         entries.into_iter().map(|e| self.show(e)).collect()
     }
 
@@ -257,6 +279,20 @@ impl Db {
         Ok(n as u64)
     }
 
+    /// The `hlc` for an entry I write at `now`: later than every entry stored here, and
+    /// every one erased.
+    pub fn next_hlc(&self, now: i64) -> Result<i64> {
+        Ok(now.max(self.clock()?.saturating_add(1)))
+    }
+
+    /// The highest `hlc` stored here or erased.
+    fn clock(&self) -> Result<i64> {
+        let stored: i64 =
+            self.0.query_row("SELECT COALESCE(MAX(hlc), 0) FROM messages", [], |r| r.get(0))?;
+        let erased = self.get_str(CLEARED_CLOCK)?.and_then(|v| v.parse().ok()).unwrap_or(0);
+        Ok(stored.max(erased))
+    }
+
     /// Erases the history, except `keep_author`'s entries after `keep_after` (mine that
     /// haven't been delivered yet). The space is zeroed rather than just freed. Returns
     /// how many entries were erased.
@@ -265,6 +301,7 @@ impl Db {
         let erase = "?2 IS NULL OR NOT (author = ?1 AND seq > ?2)";
         self.0.execute_batch("PRAGMA secure_delete = ON; BEGIN")?;
         let result = (|| -> Result<usize> {
+            self.set(CLEARED_CLOCK, self.clock()?.to_string())?;
             self.0.execute(
                 &format!(
                     "INSERT INTO cleared (author, up_to)
@@ -293,12 +330,14 @@ impl Db {
             Kind::Delete { of } => (DELETE, Some(of)),
         };
         let changed = self.0.execute(
-            "INSERT OR IGNORE INTO messages (author, seq, ts, text, kind, ref_author, ref_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT OR IGNORE INTO messages
+                 (author, seq, ts, hlc, text, kind, ref_author, ref_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 e.author,
                 e.seq as i64,
                 e.ts,
+                e.hlc,
                 e.text,
                 kind,
                 to.map(|r| &r.author),
@@ -326,13 +365,14 @@ impl Db {
         let Kind::Message { reply_to } = e.kind else { bail!("not a message") };
         let at = Ref { author: e.author, seq: e.seq };
         let current = self.current(&at, e.text)?;
-        let (author, seq, ts) = (at.author.clone(), at.seq, e.ts);
+        let (author, seq, ts, hlc) = (at.author.clone(), at.seq, e.ts, e.hlc);
         if current.deleted {
             let (text, reply_to, reactions) = (String::new(), None, Vec::new());
             return Ok(Message {
                 author,
                 seq,
                 ts,
+                hlc,
                 text,
                 edited: false,
                 deleted: true,
@@ -359,7 +399,7 @@ impl Db {
         };
         let reactions = self.reactions(&at)?;
         let (text, edited) = (current.text, current.edited);
-        Ok(Message { author, seq, ts, text, edited, deleted: false, reply_to, reactions })
+        Ok(Message { author, seq, ts, hlc, text, edited, deleted: false, reply_to, reactions })
     }
 
     /// A message's text now, given its original: its author's latest edit, or nothing if
@@ -405,14 +445,14 @@ impl Db {
     /// Entries matching `filter`, the SQL after `FROM messages`.
     fn entries(&self, filter: &str, p: impl rusqlite::Params) -> Result<Vec<Entry>> {
         let mut stmt = self.0.prepare_cached(&format!(
-            "SELECT author, seq, ts, text, kind, ref_author, ref_seq FROM messages {filter}"
+            "SELECT author, seq, ts, hlc, text, kind, ref_author, ref_seq FROM messages {filter}"
         ))?;
         let rows = stmt.query_map(p, |r| {
-            let to = match (r.get::<_, Option<String>>(5)?, r.get::<_, Option<i64>>(6)?) {
+            let to = match (r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?) {
                 (Some(author), Some(seq)) => Some(Ref { author, seq: seq as u64 }),
                 _ => None,
             };
-            let kind = match (r.get::<_, String>(4)?.as_str(), to) {
+            let kind = match (r.get::<_, String>(5)?.as_str(), to) {
                 (REACTION, Some(to)) => Kind::Reaction { to },
                 (EDIT, Some(of)) => Kind::Edit { of },
                 (DELETE, Some(of)) => Kind::Delete { of },
@@ -422,7 +462,8 @@ impl Db {
                 author: r.get(0)?,
                 seq: r.get::<_, i64>(1)? as u64,
                 ts: r.get(2)?,
-                text: r.get(3)?,
+                hlc: r.get(3)?,
+                text: r.get(4)?,
                 kind,
             })
         })?;
@@ -534,6 +575,7 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         assert_eq!(texts(&db), ["from 0.3"]);
+        assert_eq!(db.all().unwrap()[0].hlc, 1, "ordered by ts, as before");
         db.insert(&reply("me", 1, ("peer", 1))).unwrap();
         let all = db.all().unwrap();
         let mine = all.iter().find(|m| m.author == "me").unwrap();
@@ -593,5 +635,27 @@ mod tests {
         // The deleted text and its edits are blank in storage, so they sync blank too.
         let stored: Vec<_> = db.since("me", 0).unwrap().into_iter().map(|e| e.text).collect();
         assert_eq!(stored, ["", "me2", "", "", "", "back?"]);
+    }
+
+    #[test]
+    fn orders_by_the_clock_not_the_wall_time() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        // The peer's clock is ten seconds ahead of mine.
+        db.insert(&Entry::message("peer", 1, 11_000, "question")).unwrap();
+        let now = 1_000;
+        let hlc = db.next_hlc(now).unwrap();
+        assert_eq!(hlc, 11_001);
+        db.insert(&Entry { hlc, ..Entry::message("me", 1, now, "answer") }).unwrap();
+        assert_eq!(texts(&db), ["question", "answer"]);
+        assert_eq!(db.all().unwrap()[1].ts, now, "shown at my time");
+        let before = db.page(Some(&Cursor { hlc, author: "me".into(), seq: 1 }), 10).unwrap();
+        assert_eq!(before.messages.len(), 1, "paging goes by the clock too");
+
+        // An ordinary clock just uses the time.
+        assert_eq!(db.next_hlc(20_000).unwrap(), 20_000);
+
+        // Erasing the history doesn't wind the clock back.
+        db.clear("me", None).unwrap();
+        assert_eq!(db.next_hlc(now).unwrap(), 11_002);
     }
 }

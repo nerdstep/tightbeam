@@ -40,7 +40,7 @@ fn pages_through_a_long_history() {
     let mut page = first;
     while page.has_more {
         let oldest = &page.messages[0];
-        let cursor = Cursor { ts: oldest.ts, author: oldest.author.clone(), seq: oldest.seq };
+        let cursor = Cursor { hlc: oldest.hlc, author: oldest.author.clone(), seq: oldest.seq };
         page = db.page(Some(&cursor), 200).unwrap();
         let mut older = page.messages.clone();
         older.extend(seen);
@@ -48,7 +48,7 @@ fn pages_through_a_long_history() {
     }
 
     assert_eq!(seen.len() as u64, COUNT, "every message exactly once");
-    let key = |m: &Message| (m.ts, m.author.clone(), m.seq);
+    let key = |m: &Message| (m.hlc, m.author.clone(), m.seq);
     assert!(seen.windows(2).all(|w| key(&w[0]) < key(&w[1])), "strictly in display order");
     assert!(
         first_page_time.as_millis() < 100,

@@ -46,7 +46,7 @@ New frame types or message kinds. The per-author append-only log stays as it is:
   - `/shrug` and friends: they only insert text.
   - Later: `/away` and `/back` (see the away status below), then `/search` and `/edit` once those exist.
 - [ ] **Search** with SQLite FTS5 over the message text.
-- [ ] **Stable ordering.** Messages are sorted by each author's wall clock, so clock skew can misorder them. Use a hybrid logical clock (or Lamport timestamps) for display order.
+- [x] **Stable ordering.** Messages used to be sorted by each author's wall clock, so clock skew could misorder them. Each entry now carries `hlc`, a hybrid logical clock: the author's wall clock, or one past the highest `hlc` stored on their side, whichever is later. Anything written after seeing a message sorts after it. `ts` is still the time shown. Entries from peers before 0.5 use `ts`, and `/clear` keeps the clock from running backwards.
 
 ## 3. Bigger pieces
 

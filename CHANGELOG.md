@@ -4,6 +4,8 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+- Messages stay in the order they were written when the two computers' clocks disagree. Before, a reply could appear above the message it answered if the replier's clock was behind. Messages from older versions are still ordered by their clock.
+
 ## 0.4.0 — 2026-11-23
 
 - Replies. Hover a message and choose Reply to answer it; the reply shows the message it answers, and clicking that scrolls to it. Older versions show replies as plain messages.

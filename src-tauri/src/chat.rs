@@ -70,6 +70,9 @@ enum Frame {
     Msg {
         seq: u64,
         ts: i64,
+        /// Display order (see `Entry::hlc`). Added in 0.5; without it, `ts` is used.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hlc: Option<i64>,
         text: String,
         /// The message this one answers. Added in 0.4; older peers show a plain message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -818,7 +821,7 @@ impl Core {
     ) -> Result<()> {
         loop {
             match read_frame(recv).await? {
-                Frame::Msg { seq, ts, text, reply_to, react_to, edit_of, delete_of } => {
+                Frame::Msg { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of } => {
                     // A reply to anyone but the two of us becomes a plain message. A
                     // reaction to a stranger's message, or an edit or delete of anyone's
                     // but the sender's own, is stored but never shown.
@@ -839,6 +842,7 @@ impl Core {
                         author: peer.to_string(),
                         seq,
                         ts,
+                        hlc: hlc.unwrap_or(ts),
                         text: clean(&text, limit),
                         kind,
                     };
@@ -956,8 +960,8 @@ impl Core {
     /// Adds an entry to my log.
     fn append(&self, text: String, kind: Kind) -> Result<Entry> {
         let db = self.db();
-        let entry =
-            Entry { author: self.id(), seq: db.max_seq(&self.id())? + 1, ts: now_ms(), text, kind };
+        let (seq, ts) = (db.max_seq(&self.id())? + 1, now_ms());
+        let entry = Entry { author: self.id(), seq, ts, hlc: db.next_hlc(ts)?, text, kind };
         db.insert(&entry)?;
         Ok(entry)
     }
@@ -1078,8 +1082,8 @@ fn to_frame(entry: Entry) -> Frame {
         Kind::Edit { of } => edit_of = Some(of),
         Kind::Delete { of } => delete_of = Some(of),
     }
-    let (seq, ts, text) = (entry.seq, entry.ts, entry.text);
-    Frame::Msg { seq, ts, text, reply_to, react_to, edit_of, delete_of }
+    let (seq, ts, hlc, text) = (entry.seq, entry.ts, Some(entry.hlc), entry.text);
+    Frame::Msg { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of }
 }
 
 fn clean(s: &str, max_chars: usize) -> String {
@@ -1128,7 +1132,7 @@ mod tests {
     fn extra_fields_on_known_frames_are_ignored() {
         let frame =
             parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","pinned_by":{"author":"x","seq":2}}"#);
-        assert!(matches!(frame, Frame::Msg { seq: 7, ref text, .. } if text == "hi"));
+        assert!(matches!(frame, Frame::Msg { seq: 7, hlc: None, ref text, .. } if text == "hi"));
         let frame =
             parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","reply_to":{"author":"x","seq":2}}"#);
         assert!(matches!(frame, Frame::Msg { reply_to: Some(Ref { seq: 2, .. }), .. }));
@@ -1142,10 +1146,10 @@ mod tests {
         assert_eq!(json, r#"{"t":"seen","up_to":4}"#);
         let json = serde_json::to_string(&Frame::Nudge).unwrap();
         assert_eq!(json, r#"{"t":"nudge"}"#);
-        // A plain message has no reply or reaction fields, exactly as before 0.4.
+        // A plain message has the fields from before 0.4, plus `hlc` from 0.5.
         let plain = to_frame(Entry::message("me", 7, 1, "hi"));
         let json = serde_json::to_string(&plain).unwrap();
-        assert_eq!(json, r#"{"t":"msg","seq":7,"ts":1,"text":"hi"}"#);
+        assert_eq!(json, r#"{"t":"msg","seq":7,"ts":1,"hlc":1,"text":"hi"}"#);
         let to = Ref { author: "x".into(), seq: 2 };
         let reaction = Entry {
             text: "👍".into(),
@@ -1155,7 +1159,7 @@ mod tests {
         let json = serde_json::to_string(&to_frame(reaction)).unwrap();
         assert_eq!(
             json,
-            r#"{"t":"msg","seq":8,"ts":1,"text":"👍","react_to":{"author":"x","seq":2}}"#
+            r#"{"t":"msg","seq":8,"ts":1,"hlc":1,"text":"👍","react_to":{"author":"x","seq":2}}"#
         );
     }
 }
