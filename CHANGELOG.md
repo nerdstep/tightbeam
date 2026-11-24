@@ -4,6 +4,8 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+## 0.7.0 — 2026-11-24
+
 - Pictures: paste a screenshot, drop pictures on the window, or pick them with the new button beside the message box, with an optional caption. Click one to see it full size, open it, save a copy, or show it in its folder. Pictures can be up to 1 GB, and a transfer that's interrupted picks up where it stopped. Both computers need this version or later.
 - Windows: after an update, the Start menu, desktop and taskbar show the app's current icon instead of an old cached one.
 
