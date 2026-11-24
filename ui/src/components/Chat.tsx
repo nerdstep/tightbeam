@@ -1,6 +1,6 @@
 import { shallow, useSelector } from '@tanstack/react-store'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { ReplyIcon, SmilePlusIcon, XIcon } from 'lucide-react'
+import { EllipsisIcon, PencilIcon, ReplyIcon, SmilePlusIcon, Trash2Icon, XIcon } from 'lucide-react'
 import { memo, useCallback, useEffect, useRef, useState } from 'react'
 
 import { api, type Message as ChatMessage, type Quote, type Reaction } from '@/api'
@@ -37,7 +37,17 @@ import {
 } from '@/components/ui/message-scroller'
 import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
-import { addMessage, clearHistory, loadOlder, messageKey, run, setReplyingTo, store } from '@/store'
+import {
+  addMessage,
+  clearHistory,
+  loadOlder,
+  messageKey,
+  run,
+  setDeleting,
+  setEditing,
+  setReplyingTo,
+  store,
+} from '@/store'
 
 /** The reactions on offer. */
 const EMOJI = ['👍', '❤️', '😂', '😮', '😢', '🎉']
@@ -53,6 +63,7 @@ export function Chat() {
         <Header />
         <Transcript />
         <Composer />
+        <DeleteDialog />
       </section>
     </MessageScrollerProvider>
   )
@@ -303,14 +314,34 @@ const Row = memo(function Row({
     void run(
       api.react({ author: message.author, seq: message.seq }, emoji === myReaction ? '' : emoji),
     )
+  const footer = groupEnd && (
+    <MessageFooter className="text-[11px] font-normal">
+      {when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
+      {receipt && ` · ${receipt}`}
+    </MessageFooter>
+  )
+
+  if (message.deleted) {
+    return (
+      <div className={groupStart ? 'pt-3' : 'pt-0.5'}>
+        {newDay && <DayMarker when={when} />}
+        <Message align={align}>
+          <MessageContent className="gap-1">
+            <Bubble variant="outline" align={align}>
+              <BubbleContent className="text-muted-foreground italic" title={when.toLocaleString()}>
+                {mine ? 'You deleted this message' : 'Message deleted'}
+              </BubbleContent>
+            </Bubble>
+            {footer}
+          </MessageContent>
+        </Message>
+      </div>
+    )
+  }
 
   return (
     <div className={groupStart ? 'pt-3' : 'pt-0.5'}>
-      {newDay && (
-        <Marker variant="separator" className="mt-1 mb-3 justify-center text-xs">
-          {when.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })}
-        </Marker>
-      )}
+      {newDay && <DayMarker when={when} />}
       <Message align={align}>
         <MessageContent className="gap-1">
           <Bubble
@@ -331,6 +362,7 @@ const Row = memo(function Row({
                 />
               )}
               <Linkified text={message.text} />
+              {message.edited && <span className="ms-1.5 text-[11px] opacity-70">edited</span>}
             </BubbleContent>
             {message.reactions.length > 0 && (
               <Reactions
@@ -346,19 +378,24 @@ const Row = memo(function Row({
               mine={myReaction}
               onReact={react}
               onReply={() => setReplyingTo(message)}
+              onEdit={mine ? () => setEditing(message) : undefined}
+              onDelete={mine ? () => setDeleting(message) : undefined}
             />
           </Bubble>
-          {groupEnd && (
-            <MessageFooter className="text-[11px] font-normal">
-              {when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
-              {receipt && ` · ${receipt}`}
-            </MessageFooter>
-          )}
+          {footer}
         </MessageContent>
       </Message>
     </div>
   )
 })
+
+function DayMarker({ when }: { when: Date }) {
+  return (
+    <Marker variant="separator" className="mt-1 mb-3 justify-center text-xs">
+      {when.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })}
+    </Marker>
+  )
+}
 
 /** The message a reply answers, at the top of its bubble. Click to jump to it. */
 function QuoteButton({
@@ -378,7 +415,9 @@ function QuoteButton({
     >
       <span className="font-medium">{name}</span>
       <span className="line-clamp-2 opacity-80">
-        {quote.text ?? 'A message that isn’t on this computer'}
+        {quote.deleted
+          ? 'Deleted message'
+          : (quote.text ?? 'A message that isn’t on this computer')}
       </span>
     </button>
   )
@@ -424,18 +463,22 @@ function Reactions({
   )
 }
 
-/** React and Reply, beside the bubble on hover (or keyboard focus). */
+/** React, Reply, and (on my own messages) Edit and Delete, beside the bubble on hover. */
 function Actions({
   side,
   mine,
   onReact,
   onReply,
+  onEdit,
+  onDelete,
 }: {
   /** Which side of the bubble. */
   side: 'start' | 'end'
   mine: string | undefined
   onReact: (emoji: string) => void
   onReply: () => void
+  onEdit?: () => void
+  onDelete?: () => void
 }) {
   return (
     <div
@@ -461,8 +504,33 @@ function Actions({
       <Button variant="ghost" size="icon-sm" aria-label="Reply" onClick={onReply}>
         <ReplyIcon />
       </Button>
+      {onEdit && onDelete && (
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="ghost" size="icon-sm" aria-label="More" />}>
+            <EllipsisIcon />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side="top" align="center" className="w-32">
+            <DropdownMenuItem onClick={onEdit}>
+              <PencilIcon />
+              Edit
+            </DropdownMenuItem>
+            <DropdownMenuItem variant="destructive" onClick={onDelete}>
+              <Trash2Icon />
+              Delete…
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
     </div>
   )
+}
+
+/** My newest message that's still there to edit. (`findLast` is too new for the target.) */
+function lastOfMine(messages: ChatMessage[], myId: string) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].author === myId && !messages[i].deleted) return messages[i]
+  }
+  return undefined
 }
 
 /** Browsers without CSS `field-sizing` (older WebKit) need help growing the textarea. */
@@ -487,20 +555,41 @@ function Composer() {
   const textRef = useRef<HTMLTextAreaElement>(null)
   const typingSentRef = useRef(0)
   const { scrollToEnd } = useMessageScroller()
-  const { replyingTo, peerName, myId } = useSelector(
+  const { replyingTo, editing, peerName, myId } = useSelector(
     store,
     (s) => ({
       replyingTo: s.replyingTo,
+      editing: s.editing,
       peerName: s.status?.peer?.name || 'them',
       myId: s.status?.me.id ?? '',
     }),
     { compare: shallow },
   )
+  // What was in the box before editing started; it comes back when editing ends.
+  const draftRef = useRef<string | null>(null)
 
   // Choosing Reply on a message: start typing straight away.
   useEffect(() => {
     if (replyingTo) textRef.current?.focus()
   }, [replyingTo])
+
+  // Editing puts the message's text in the box; finishing or cancelling puts the draft back.
+  useEffect(() => {
+    if (editing) {
+      setText((current) => {
+        draftRef.current ??= current
+        return editing.text
+      })
+      textRef.current?.focus()
+    } else if (draftRef.current !== null) {
+      setText(draftRef.current)
+      draftRef.current = null
+    }
+    setHint(null)
+    setDismissed(true) // an edit is text, not a command
+    const el = textRef.current
+    if (el) requestAnimationFrame(() => fit(el))
+  }, [editing])
 
   const suggestions = dismissed ? [] : suggest(text)
   const highlighted = suggestions[Math.min(active, suggestions.length - 1)]
@@ -509,9 +598,10 @@ function Composer() {
     setText(value)
     setHint(null)
     setActive(0)
-    setDismissed(false)
+    setDismissed(!!editing)
     const now = Date.now()
-    if (value.trim() && !value.startsWith('/') && now - typingSentRef.current > TYPING_EVERY_MS) {
+    const typing = value.trim() && !value.startsWith('/') && !editing
+    if (typing && now - typingSentRef.current > TYPING_EVERY_MS) {
       typingSentRef.current = now
       void api.typing().catch(() => {})
     }
@@ -530,7 +620,20 @@ function Composer() {
     void command.action({ confirmClear: () => setClearing(true) })
   }
 
+  const saveEdit = async (of: ChatMessage) => {
+    const value = text.trim()
+    if (!value) {
+      setHint('An edit can’t be empty. To remove the message, choose Delete instead.')
+      return
+    }
+    const saved = await run(
+      api.editMessage({ author: of.author, seq: of.seq }, value).then(() => true),
+    )
+    if (saved) setEditing(null)
+  }
+
   const send = async () => {
+    if (editing) return saveEdit(editing)
     const parsed = parse(text)
     if (parsed.kind === 'command') {
       if (parsed.command) perform(parsed.command)
@@ -581,9 +684,19 @@ function Composer() {
         return
       }
     }
-    if (e.key === 'Escape' && replyingTo) {
+    if (e.key === 'Escape' && (replyingTo || editing)) {
       e.preventDefault()
-      setReplyingTo(null)
+      if (editing) setEditing(null)
+      else setReplyingTo(null)
+      return
+    }
+    // Up in an empty box edits my last message.
+    if (e.key === 'ArrowUp' && !text && !editing) {
+      const last = lastOfMine(store.state.messages, myId)
+      if (last) {
+        e.preventDefault()
+        setEditing(last)
+      }
       return
     }
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -632,6 +745,23 @@ function Composer() {
           </Button>
         </div>
       )}
+      {editing && (
+        <div className="mb-2 flex items-center gap-2 rounded-md border-l-2 border-primary bg-muted py-1 pr-1 pl-2 text-xs">
+          <div className="min-w-0 flex-1">
+            <div className="font-medium">Editing your message</div>
+            <div className="truncate text-muted-foreground">Enter to save · Esc to cancel</div>
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Cancel edit"
+            onClick={() => setEditing(null)}
+          >
+            <XIcon />
+          </Button>
+        </div>
+      )}
       <div className="flex items-end gap-2">
         <Textarea
           ref={textRef}
@@ -648,7 +778,7 @@ function Composer() {
           onKeyDown={onKeyDown}
         />
         <Button type="submit" size="lg">
-          Send
+          {editing ? 'Save' : 'Send'}
         </Button>
       </div>
       <ClearDialog open={clearing} onOpenChange={setClearing} />
@@ -721,6 +851,41 @@ function ClearDialog({
             }}
           >
             Clear
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+}
+
+/** "Delete this message?" for the message chosen in its ⋯ menu. */
+function DeleteDialog() {
+  const { deleting, name } = useSelector(
+    store,
+    (s) => ({ deleting: s.deleting, name: s.status?.peer?.name || 'the other person' }),
+    { compare: shallow },
+  )
+  return (
+    <AlertDialog open={!!deleting} onOpenChange={(open) => !open && setDeleting(null)}>
+      <AlertDialogContent size="sm">
+        <AlertDialogHeader>
+          <AlertDialogTitle>Delete this message?</AlertDialogTitle>
+          <AlertDialogDescription>
+            It’s erased for you and {name}. If they’re offline, it’s erased when they’re back.
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction
+            variant="destructive"
+            onClick={() => {
+              // AlertDialogAction is a plain button: it doesn't close the dialog itself.
+              setDeleting(null)
+              if (deleting)
+                void run(api.deleteMessage({ author: deleting.author, seq: deleting.seq }))
+            }}
+          >
+            Delete
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

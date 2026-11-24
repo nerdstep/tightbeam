@@ -40,8 +40,9 @@ export interface Ref {
 
 /** The message a reply answers. */
 export interface Quote extends Ref {
-  /** `null` when that message isn't on this computer (cleared, for example). */
+  /** Its latest text. `null` when it isn't on this computer (cleared) or was deleted. */
   text: string | null
+  deleted: boolean
 }
 
 export interface Reaction {
@@ -54,7 +55,11 @@ export interface Message {
   seq: number
   /** Milliseconds since the epoch, from the author's clock. */
   ts: number
+  /** The latest edit's text, if edited. Empty once deleted. */
   text: string
+  edited: boolean
+  /** Deleted by its author: shown as a placeholder, without reply or reactions. */
+  deleted: boolean
   reply_to: Quote | null
   /** At most one per person. */
   reactions: Reaction[]
@@ -88,8 +93,8 @@ export type CoreEvent =
   | { kind: 'message'; data: Message }
   /** The peer nudged us. */
   | { kind: 'nudge' }
-  /** The reactions on a message changed; `reactions` is the whole new set. */
-  | { kind: 'reactions'; data: { to: Ref; reactions: Reaction[] } }
+  /** A message changed: its reactions, an edit, or a delete. */
+  | { kind: 'updated'; data: Message }
   /** The peer is typing. Repeats every few seconds while they type. */
   | { kind: 'typing' }
 
@@ -102,6 +107,10 @@ export const api = {
     invoke<Message>('send_message', { text, replyTo: replyTo ?? null }),
   /** Sets my reaction to a message, replacing any earlier one. `''` takes it back. */
   react: (to: Ref, emoji: string) => invoke<void>('react', { to, emoji }),
+  /** Replaces the text of one of my messages. */
+  editMessage: (of: Ref, text: string) => invoke<void>('edit_message', { of, text }),
+  /** Deletes one of my messages, for both people. */
+  deleteMessage: (of: Ref) => invoke<void>('delete_message', { of }),
   /** Tells the peer I'm typing. Call every few seconds while typing. */
   typing: () => invoke<void>('typing'),
   /** Erases the conversation on this computer. Undelivered messages of mine stay. */

@@ -31,7 +31,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::db::{Cursor, Db, Entry, Kind, Message, Page, Reaction, Ref};
+use crate::db::{Cursor, Db, Entry, Kind, Message, Page, Ref};
 
 pub const ALPN: &[u8] = b"tightbeam/1";
 /// mDNS service name, so we only see other Tightbeam apps (`_tightbeam._udp.local`).
@@ -79,6 +79,14 @@ enum Frame {
         /// message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         react_to: Option<Ref>,
+        /// Makes this new text for one of the sender's own messages. Added in 0.4; older
+        /// peers show the new text as a message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        edit_of: Option<Ref>,
+        /// Deletes one of the sender's own messages; `text` is "". Added in 0.4; older
+        /// peers show an empty message.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delete_of: Option<Ref>,
     },
     Ack {
         have: u64,
@@ -137,11 +145,8 @@ pub enum Event {
     Message(Message),
     /// The peer nudged us.
     Nudge,
-    /// The reactions on a message changed. `reactions` is the whole new set.
-    Reactions {
-        to: Ref,
-        reactions: Vec<Reaction>,
-    },
+    /// A message changed: its reactions, an edit, or a delete.
+    Updated(Message),
     /// The peer is typing.
     Typing,
 }
@@ -365,8 +370,32 @@ impl Core {
         let peer = self.peer_id().context("not paired with anyone yet")?;
         ensure!(self.is_ours(&to, &peer.to_string()), "can't react to that");
         let entry = self.append(emoji, Kind::Reaction { to: to.clone() })?;
-        let reactions = self.db().reactions(&to)?;
-        (self.emit)(Event::Reactions { to, reactions });
+        self.updated(&to)?;
+        self.send_live(entry);
+        Ok(())
+    }
+
+    /// Replaces the text of one of my messages.
+    pub fn edit(&self, of: Ref, text: &str) -> Result<()> {
+        let text = clean(text, MAX_TEXT_CHARS);
+        ensure!(!text.is_empty(), "message can't be empty");
+        let current = self.my_message(&of)?;
+        if text == current.text {
+            return Ok(());
+        }
+        let entry = self.append(text, Kind::Edit { of: of.clone() })?;
+        self.updated(&of)?;
+        self.send_live(entry);
+        Ok(())
+    }
+
+    /// Deletes one of my messages, here and for the peer. Its text is blanked on both
+    /// sides, not just hidden.
+    pub fn delete(&self, of: Ref) -> Result<()> {
+        self.my_message(&of)?;
+        let entry = self.append(String::new(), Kind::Delete { of: of.clone() })?;
+        self.db().scrub(&of)?;
+        self.updated(&of)?;
         self.send_live(entry);
         Ok(())
     }
@@ -789,12 +818,15 @@ impl Core {
     ) -> Result<()> {
         loop {
             match read_frame(recv).await? {
-                Frame::Msg { seq, ts, text, reply_to, react_to } => {
-                    // Refs to anyone but the two of us are dropped: a reply becomes a
-                    // plain message, a reaction is stored but never shown.
-                    let kind = match react_to {
-                        Some(to) => Kind::Reaction { to },
-                        None => {
+                Frame::Msg { seq, ts, text, reply_to, react_to, edit_of, delete_of } => {
+                    // A reply to anyone but the two of us becomes a plain message. A
+                    // reaction to a stranger's message, or an edit or delete of anyone's
+                    // but the sender's own, is stored but never shown.
+                    let kind = match (delete_of, edit_of, react_to) {
+                        (Some(of), ..) => Kind::Delete { of },
+                        (None, Some(of), _) => Kind::Edit { of },
+                        (None, None, Some(to)) => Kind::Reaction { to },
+                        (None, None, None) => {
                             Kind::Message { reply_to: reply_to.filter(|to| self.is_ours(to, peer)) }
                         }
                     };
@@ -946,12 +978,35 @@ impl Core {
                     (self.emit)(Event::Message(msg));
                 }
             }
-            Kind::Reaction { to } => {
-                let reactions = self.db().reactions(&to)?;
-                (self.emit)(Event::Reactions { to, reactions });
+            Kind::Reaction { to } => self.updated(&to)?,
+            Kind::Edit { of } | Kind::Delete { of } => {
+                if of.author != entry.author {
+                    return Ok(()); // not theirs to change
+                }
+                // Blank it if it's deleted. Also catches an edit sent after the delete.
+                if self.db().message(&of)?.is_some_and(|m| m.deleted) {
+                    self.db().scrub(&of)?;
+                }
+                self.updated(&of)?;
             }
         }
         Ok(())
+    }
+
+    /// Tells the UI a message changed, if it's stored here.
+    fn updated(&self, at: &Ref) -> Result<()> {
+        if let Some(msg) = self.db().message(at)? {
+            (self.emit)(Event::Updated(msg));
+        }
+        Ok(())
+    }
+
+    /// One of my messages, still there to edit or delete.
+    fn my_message(&self, at: &Ref) -> Result<Message> {
+        ensure!(at.author == self.id(), "you can only change your own messages");
+        let msg = self.db().message(at)?.context("that message isn't here")?;
+        ensure!(!msg.deleted, "that message was deleted");
+        Ok(msg)
     }
 
     /// Whether `to` is one of our two logs, mine or the peer's.
@@ -1016,11 +1071,15 @@ fn is_lan(addr: &TransportAddr, allow_loopback: bool) -> bool {
 }
 
 fn to_frame(entry: Entry) -> Frame {
-    let (reply_to, react_to) = match entry.kind {
-        Kind::Message { reply_to } => (reply_to, None),
-        Kind::Reaction { to } => (None, Some(to)),
-    };
-    Frame::Msg { seq: entry.seq, ts: entry.ts, text: entry.text, reply_to, react_to }
+    let (mut reply_to, mut react_to, mut edit_of, mut delete_of) = (None, None, None, None);
+    match entry.kind {
+        Kind::Message { reply_to: to } => reply_to = to,
+        Kind::Reaction { to } => react_to = Some(to),
+        Kind::Edit { of } => edit_of = Some(of),
+        Kind::Delete { of } => delete_of = Some(of),
+    }
+    let (seq, ts, text) = (entry.seq, entry.ts, entry.text);
+    Frame::Msg { seq, ts, text, reply_to, react_to, edit_of, delete_of }
 }
 
 fn clean(s: &str, max_chars: usize) -> String {
@@ -1068,7 +1127,7 @@ mod tests {
     #[test]
     fn extra_fields_on_known_frames_are_ignored() {
         let frame =
-            parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","edit_of":{"author":"x","seq":2}}"#);
+            parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","pinned_by":{"author":"x","seq":2}}"#);
         assert!(matches!(frame, Frame::Msg { seq: 7, ref text, .. } if text == "hi"));
         let frame =
             parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","reply_to":{"author":"x","seq":2}}"#);

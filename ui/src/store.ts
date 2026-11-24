@@ -4,7 +4,7 @@
 
 import { createStore } from '@tanstack/react-store'
 
-import { api, type Message, type Reaction, type Ref, type Status, type UpdateReady } from './api'
+import { api, type Message, type Ref, type Status, type UpdateReady } from './api'
 import { chime } from './lib/chime'
 
 const PAGE_SIZE = 200
@@ -24,6 +24,10 @@ interface State {
   nudges: number
   /** The message the composer is replying to. */
   replyingTo: Message | null
+  /** The message of mine the composer is editing. */
+  editing: Message | null
+  /** The message of mine waiting for "Delete?" to be confirmed. */
+  deleting: Message | null
   /** The peer is typing, as of the last few seconds. */
   peerTyping: boolean
 }
@@ -37,6 +41,8 @@ export const store = createStore<State>({
   update: null,
   nudges: 0,
   replyingTo: null,
+  editing: null,
+  deleting: null,
   peerTyping: false,
 })
 
@@ -66,13 +72,26 @@ export function addMessage(m: Message) {
   store.setState((s) => ({ ...s, messages: [...messages.slice(0, at), m, ...messages.slice(at)] }))
 }
 
-/** New reactions on a message. Messages that aren't loaded get theirs when paged in. */
-function setReactions(to: Ref, reactions: Reaction[]) {
-  const key = messageKey(to)
-  if (!loaded.has(key)) return
+/**
+ * A message changed (reactions, an edit, a delete): swap in the new version, and update
+ * replies that quote it. Messages that aren't loaded are current when paged in.
+ */
+function updateMessage(updated: Message) {
+  const key = messageKey(updated)
+  const quote = { text: updated.deleted ? null : updated.text, deleted: updated.deleted }
   store.setState((s) => ({
     ...s,
-    messages: s.messages.map((m) => (messageKey(m) === key ? { ...m, reactions } : m)),
+    messages: s.messages.map((m) => {
+      if (messageKey(m) === key) return updated
+      if (m.reply_to && messageKey(m.reply_to) === key) {
+        return { ...m, reply_to: { ...m.reply_to, ...quote } }
+      }
+      return m
+    }),
+    // Don't keep replying to, or editing, a message that's gone.
+    replyingTo:
+      updated.deleted && s.replyingTo && messageKey(s.replyingTo) === key ? null : s.replyingTo,
+    editing: updated.deleted && s.editing && messageKey(s.editing) === key ? null : s.editing,
   }))
 }
 
@@ -84,8 +103,17 @@ function setPeerTyping(on: boolean) {
   if (store.state.peerTyping !== on) store.setState((s) => ({ ...s, peerTyping: on }))
 }
 
+/** Replying and editing take turns: starting one ends the other. */
 export function setReplyingTo(replyingTo: Message | null) {
-  store.setState((s) => ({ ...s, replyingTo }))
+  store.setState((s) => ({ ...s, replyingTo, editing: replyingTo ? null : s.editing }))
+}
+
+export function setEditing(editing: Message | null) {
+  store.setState((s) => ({ ...s, editing, replyingTo: editing ? null : s.replyingTo }))
+}
+
+export function setDeleting(deleting: Message | null) {
+  store.setState((s) => ({ ...s, deleting }))
 }
 
 /** Loads the page before the oldest loaded message. Safe to call repeatedly. */
@@ -140,6 +168,7 @@ export async function clearHistory() {
     messages: page.messages,
     hasOlder: page.has_more,
     replyingTo: null,
+    editing: null,
   }))
 }
 
@@ -160,8 +189,8 @@ export async function start() {
         if (event.data.author !== store.state.status?.me.id) setPeerTyping(false)
         addMessage(event.data)
         break
-      case 'reactions':
-        setReactions(event.data.to, event.data.reactions)
+      case 'updated':
+        updateMessage(event.data)
         break
       case 'typing':
         setPeerTyping(true)

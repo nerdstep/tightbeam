@@ -6,6 +6,7 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 - Replies. Hover a message and choose Reply to answer it; the reply shows the message it answers, and clicking that scrolls to it. Older versions show replies as plain messages.
 - Reactions. Hover a message and choose one of six emoji. Each person has one reaction per message: pick another to change it, or the same one to take it back. Reactions sent while the other person is offline arrive when you're both online. Older versions show a reaction as a message holding just the emoji.
+- Edit and delete your messages from the ⋯ menu that appears when you hover one, or press ↑ in an empty message box to edit your last message. Edited messages are marked "edited". A deleted message leaves a placeholder, and its text is erased on both computers, not just hidden. Older versions show an edit as a new message, and a delete as an empty one.
 - The header shows "Typing…" while the other person is writing.
 - A bolder app icon, easier to make out in the tray and taskbar.
 

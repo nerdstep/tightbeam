@@ -1,9 +1,9 @@
 //! Local storage: settings (keys, names, pairing) and the log.
 //!
-//! The log holds every author's numbered entries: messages, and reactions to them.
-//! Entries never change once stored; a later entry refers to an earlier one by
-//! `(author, seq)`. A reply refers to the message it answers, a reaction to the message
-//! it's on.
+//! The log holds every author's numbered entries: messages, and reactions, edits and
+//! deletes that refer to an earlier message by `(author, seq)`. A reply also refers to
+//! the message it answers. Entries are only ever added, with one exception: a delete
+//! blanks the text of the message it deletes, and of that message's edits.
 
 use std::path::Path;
 
@@ -27,7 +27,8 @@ pub struct Entry {
     pub seq: u64,
     /// Milliseconds since the Unix epoch, from the author's clock.
     pub ts: i64,
-    /// The message, or the reaction's emoji ("" takes a reaction back).
+    /// The message, the reaction's emoji ("" takes a reaction back), the edit's new text,
+    /// or "" for a delete.
     pub text: String,
     pub kind: Kind,
 }
@@ -40,6 +41,14 @@ pub enum Kind {
     /// Replaces the author's earlier reaction to `to`, if any.
     Reaction {
         to: Ref,
+    },
+    /// New text for one of the author's own messages. The latest edit wins.
+    Edit {
+        of: Ref,
+    },
+    /// Deletes one of the author's own messages.
+    Delete {
+        of: Ref,
     },
 }
 
@@ -56,7 +65,11 @@ pub struct Message {
     pub author: String,
     pub seq: u64,
     pub ts: i64,
+    /// The latest edit's text, if edited. Empty once deleted.
     pub text: String,
+    pub edited: bool,
+    /// Deleted by its author. Shown as a placeholder, without reply or reactions.
+    pub deleted: bool,
     /// The message this one answers.
     pub reply_to: Option<Quote>,
     /// At most one per person, in author order.
@@ -67,8 +80,10 @@ pub struct Message {
 pub struct Quote {
     pub author: String,
     pub seq: u64,
-    /// `None` when that message isn't stored here (cleared, for example).
+    /// Its latest text. `None` when it isn't stored here (cleared, for example) or was
+    /// deleted.
     pub text: Option<String>,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -96,6 +111,15 @@ pub struct Page {
 /// Values of the `kind` column.
 const MESSAGE: &str = "message";
 const REACTION: &str = "reaction";
+const EDIT: &str = "edit";
+const DELETE: &str = "delete";
+
+/// What `Db::current` finds.
+struct Current {
+    text: String,
+    edited: bool,
+    deleted: bool,
+}
 
 pub struct Db(Connection);
 
@@ -265,6 +289,8 @@ impl Db {
         let (kind, to) = match &e.kind {
             Kind::Message { reply_to } => (MESSAGE, reply_to.as_ref()),
             Kind::Reaction { to } => (REACTION, Some(to)),
+            Kind::Edit { of } => (EDIT, Some(of)),
+            Kind::Delete { of } => (DELETE, Some(of)),
         };
         let changed = self.0.execute(
             "INSERT OR IGNORE INTO messages (author, seq, ts, text, kind, ref_author, ref_seq)
@@ -295,26 +321,85 @@ impl Db {
         self.entries("WHERE author = ?1 AND seq > ?2 ORDER BY seq", params![author, after as i64])
     }
 
-    /// Adds the quoted message and the reactions.
+    /// Adds the latest edit, the quoted message and the reactions.
     fn show(&self, e: Entry) -> Result<Message> {
         let Kind::Message { reply_to } = e.kind else { bail!("not a message") };
         let at = Ref { author: e.author, seq: e.seq };
+        let current = self.current(&at, e.text)?;
+        let (author, seq, ts) = (at.author.clone(), at.seq, e.ts);
+        if current.deleted {
+            let (text, reply_to, reactions) = (String::new(), None, Vec::new());
+            return Ok(Message {
+                author,
+                seq,
+                ts,
+                text,
+                edited: false,
+                deleted: true,
+                reply_to,
+                reactions,
+            });
+        }
         let reply_to = match reply_to {
             Some(to) => {
-                let text = self
+                let original = self
                     .0
                     .prepare_cached(
                         "SELECT text FROM messages
                          WHERE author = ?1 AND seq = ?2 AND kind = 'message'",
                     )?
-                    .query_row(params![to.author, to.seq as i64], |r| r.get(0))
+                    .query_row(params![to.author, to.seq as i64], |r| r.get::<_, String>(0))
                     .optional()?;
-                Some(Quote { author: to.author, seq: to.seq, text })
+                let quoted = original.map(|text| self.current(&to, text)).transpose()?;
+                let deleted = quoted.as_ref().is_some_and(|q| q.deleted);
+                let text = quoted.filter(|q| !q.deleted).map(|q| q.text);
+                Some(Quote { author: to.author, seq: to.seq, text, deleted })
             }
             None => None,
         };
         let reactions = self.reactions(&at)?;
-        Ok(Message { author: at.author, seq: at.seq, ts: e.ts, text: e.text, reply_to, reactions })
+        let (text, edited) = (current.text, current.edited);
+        Ok(Message { author, seq, ts, text, edited, deleted: false, reply_to, reactions })
+    }
+
+    /// A message's text now, given its original: its author's latest edit, or nothing if
+    /// they deleted it. Edits and deletes by anyone else don't count.
+    fn current(&self, at: &Ref, original: String) -> Result<Current> {
+        let latest = self
+            .0
+            .prepare_cached(
+                "SELECT kind, text FROM messages
+                 WHERE ref_author = ?1 AND ref_seq = ?2 AND author = ?1
+                   AND kind IN ('edit', 'delete')
+                 ORDER BY kind = 'delete' DESC, seq DESC LIMIT 1",
+            )?
+            .query_row(params![at.author, at.seq as i64], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .optional()?;
+        Ok(match latest {
+            Some((kind, _)) if kind == DELETE => {
+                Current { text: String::new(), edited: false, deleted: true }
+            }
+            Some((_, text)) => Current { text, edited: true, deleted: false },
+            None => Current { text: original, edited: false, deleted: false },
+        })
+    }
+
+    /// Blanks the text of a deleted message and of its edits, zeroing the space. Only the
+    /// message's author can delete it, so `of.author` is also whose edits these are.
+    pub fn scrub(&self, of: &Ref) -> Result<()> {
+        self.0.execute_batch("PRAGMA secure_delete = ON")?;
+        let result = self.0.execute(
+            "UPDATE messages SET text = ''
+             WHERE author = ?1 AND (
+                 (kind = 'message' AND seq = ?2)
+                 OR (kind = 'edit' AND ref_author = ?1 AND ref_seq = ?2))",
+            params![of.author, of.seq as i64],
+        );
+        self.0.execute_batch("PRAGMA secure_delete = OFF; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        result?;
+        Ok(())
     }
 
     /// Entries matching `filter`, the SQL after `FROM messages`.
@@ -329,6 +414,8 @@ impl Db {
             };
             let kind = match (r.get::<_, String>(4)?.as_str(), to) {
                 (REACTION, Some(to)) => Kind::Reaction { to },
+                (EDIT, Some(of)) => Kind::Edit { of },
+                (DELETE, Some(of)) => Kind::Delete { of },
                 (_, reply_to) => Kind::Message { reply_to },
             };
             Ok(Entry {
@@ -359,6 +446,16 @@ mod tests {
     fn react(author: &str, seq: u64, emoji: &str, to: (&str, u64)) -> Entry {
         let to = Ref { author: to.0.into(), seq: to.1 };
         Entry { text: emoji.into(), kind: Kind::Reaction { to }, ..msg(author, seq) }
+    }
+
+    fn edit(author: &str, seq: u64, text: &str, of: (&str, u64)) -> Entry {
+        let of = Ref { author: of.0.into(), seq: of.1 };
+        Entry { text: text.into(), kind: Kind::Edit { of }, ..msg(author, seq) }
+    }
+
+    fn delete(author: &str, seq: u64, of: (&str, u64)) -> Entry {
+        let of = Ref { author: of.0.into(), seq: of.1 };
+        Entry { text: String::new(), kind: Kind::Delete { of }, ..msg(author, seq) }
     }
 
     fn texts(db: &Db) -> Vec<String> {
@@ -448,5 +545,53 @@ mod tests {
             "opens again without migrating twice"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn edits_and_deletes() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        db.insert_many(&[
+            msg("me", 1),
+            msg("me", 2),
+            reply("peer", 1, ("me", 1)),
+            reply("peer", 2, ("me", 2)),
+            edit("me", 3, "first, fixed", ("me", 1)),
+            edit("me", 4, "first, fixed again", ("me", 1)),
+            edit("peer", 3, "not yours", ("me", 2)), // only the author can edit
+            react("peer", 4, "👍", ("me", 2)),
+        ])
+        .unwrap();
+        let find = |db: &Db, author: &str, seq: u64| {
+            db.all().unwrap().into_iter().find(|m| m.author == author && m.seq == seq).unwrap()
+        };
+
+        let first = find(&db, "me", 1);
+        assert_eq!((first.text.as_str(), first.edited), ("first, fixed again", true));
+        assert_eq!(
+            find(&db, "peer", 1).reply_to.unwrap().text.as_deref(),
+            Some("first, fixed again")
+        );
+        let second = find(&db, "me", 2);
+        assert_eq!((second.text.as_str(), second.edited), ("me2", false));
+        assert_eq!(db.all().unwrap().len(), 4, "edits aren't messages");
+
+        // A delete by someone else does nothing.
+        db.insert(&delete("peer", 5, ("me", 1))).unwrap();
+        assert!(!find(&db, "me", 1).deleted);
+
+        // Deleting: a placeholder, and the quote says so.
+        db.insert(&delete("me", 5, ("me", 1))).unwrap();
+        db.scrub(&Ref { author: "me".into(), seq: 1 }).unwrap();
+        let first = find(&db, "me", 1);
+        assert!(first.deleted && first.text.is_empty() && first.reactions.is_empty());
+        let quote = find(&db, "peer", 1).reply_to.unwrap();
+        assert!(quote.deleted && quote.text.is_none());
+        // An edit after the delete doesn't bring it back.
+        db.insert(&edit("me", 6, "back?", ("me", 1))).unwrap();
+        assert!(find(&db, "me", 1).deleted);
+
+        // The deleted text and its edits are blank in storage, so they sync blank too.
+        let stored: Vec<_> = db.since("me", 0).unwrap().into_iter().map(|e| e.text).collect();
+        assert_eq!(stored, ["", "me2", "", "", "", "back?"]);
     }
 }

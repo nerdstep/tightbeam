@@ -64,6 +64,18 @@ fn react(core: CoreState, to: Ref, emoji: String) -> Result<(), String> {
     core.react(to, &emoji).map_err(err)
 }
 
+/// Replaces the text of one of my messages.
+#[tauri::command]
+fn edit_message(core: CoreState, of: Ref, text: String) -> Result<(), String> {
+    core.edit(of, &text).map_err(err)
+}
+
+/// Deletes one of my messages, for both people.
+#[tauri::command]
+fn delete_message(core: CoreState, of: Ref) -> Result<(), String> {
+    core.delete(of).map_err(err)
+}
+
 #[tauri::command]
 fn typing(core: CoreState) {
     core.typing()
@@ -212,7 +224,7 @@ pub fn run() {
                 match &event {
                     Event::Message(message) => desktop::on_message(&handle, message),
                     Event::Nudge => desktop::on_nudge(&handle),
-                    Event::Status(_) | Event::Reactions { .. } | Event::Typing => {}
+                    Event::Status(_) | Event::Updated(_) | Event::Typing => {}
                 }
                 let _ = handle.emit("tightbeam", event);
             });
@@ -247,6 +259,8 @@ pub fn run() {
             set_name,
             send_message,
             react,
+            edit_message,
+            delete_message,
             typing,
             clear_history,
             nudge,

@@ -1,6 +1,7 @@
 //! Two real Tightbeam cores on this machine, found via mDNS and talking over QUIC.
 //! Covers pairing, live messages, delivery acks, seen receipts, catching up after one
-//! side was off, replies and reactions, typing, nudges, and clearing one side's history.
+//! side was off, replies and reactions, edits and deletes, typing, nudges, and clearing
+//! one side's history.
 
 use std::{
     path::PathBuf,
@@ -164,6 +165,20 @@ async fn pair_chat_and_catch_up() {
     })
     .await;
 
+    // Bob edits his reply, then deletes it. Alice sees both, and the text is gone.
+    let again = Ref { author: bob.id(), seq: 2 };
+    bob.edit(again.clone(), "hi once more").unwrap();
+    let find = |core: &Core, at: &Ref| {
+        core.messages().unwrap().into_iter().find(|m| m.author == at.author && m.seq == at.seq)
+    };
+    wait_for("alice sees the edit", 10, || {
+        find(&alice, &again).is_some_and(|m| m.edited && m.text == "hi once more")
+    })
+    .await;
+    assert!(alice.edit(again.clone(), "not mine").is_err(), "only the author can edit");
+    bob.delete(again.clone()).unwrap();
+    wait_for("alice sees the delete", 10, || find(&alice, &again).is_some_and(|m| m.deleted)).await;
+
     // Typing reaches Bob.
     let a = alice.clone();
     like_tauri(move || a.typing());
@@ -180,7 +195,7 @@ async fn pair_chat_and_catch_up() {
     like_tauri(move || b.clear_history()).unwrap();
     assert!(texts(&bob).is_empty());
     assert_eq!(texts(&alice).len(), 5);
-    assert_eq!(bob.send_message("fresh start", None).unwrap().seq, 4);
+    assert_eq!(bob.send_message("fresh start", None).unwrap().seq, 6);
     wait_for("alice gets it", 10, || texts(&alice).contains(&"fresh start".into())).await;
     assert_eq!(texts(&alice).len(), 6);
     assert_eq!(texts(&bob), ["fresh start"]);
