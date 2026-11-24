@@ -278,7 +278,8 @@ export async function start() {
         setPeerTyping(true)
         break
       case 'nudge':
-        shake(true)
+        // Do not disturb: nudges are refused at the source, but an older build may send one.
+        if ((store.state.status?.dnd_until ?? 0) <= Date.now()) shake(true)
         break
     }
   })

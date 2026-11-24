@@ -6,6 +6,7 @@ import {
   ReplyIcon,
   SearchIcon,
   SmilePlusIcon,
+  TimerIcon,
   Trash2Icon,
   XIcon,
 } from 'lucide-react'
@@ -16,6 +17,7 @@ import { type Command, parse, suggest } from '@/commands'
 import { Linkified } from '@/components/Linkified'
 import { SearchBar, SearchResults } from '@/components/Search'
 import { SettingsMenu } from '@/components/SettingsMenu'
+import { StatusDialog } from '@/components/StatusDialog'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -46,6 +48,7 @@ import {
 } from '@/components/ui/message-scroller'
 import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
+import { formatDuration, formatUntil } from '@/lib/duration'
 import {
   addMessage,
   clearHistory,
@@ -96,7 +99,7 @@ export function Chat() {
 }
 
 function Header() {
-  const { name, connected, typing, away } = useSelector(
+  const { name, connected, typing, away, dndUntil } = useSelector(
     store,
     (s) => ({
       name: s.status?.peer?.name ?? '',
@@ -104,11 +107,19 @@ function Header() {
       typing: s.peerTyping,
       // A string so the header only re-renders when it changes: '' is away without a note.
       away: s.status?.peer_away ? (s.status.peer_away.note ?? '') : null,
+      dndUntil: s.status?.peer_dnd_until ?? null,
     }),
     { compare: shallow },
   )
   const [unpairing, setUnpairing] = useState(false)
-  const dot = !connected ? 'bg-muted-foreground' : away === null ? 'bg-success' : 'bg-warning'
+  const dnd = useUntil(dndUntil)
+  const dot = !connected
+    ? 'bg-muted-foreground'
+    : dnd
+      ? 'bg-destructive'
+      : away === null
+        ? 'bg-success'
+        : 'bg-warning'
 
   return (
     <header className="flex items-center justify-between gap-3 border-b bg-card px-4 py-3">
@@ -122,9 +133,11 @@ function Header() {
             {typing
               ? 'Typing…'
               : connected
-                ? away === null
-                  ? 'Connected'
-                  : `Away${away && ` · ${away}`}`
+                ? dnd
+                  ? 'Do not disturb'
+                  : away === null
+                    ? 'Connected'
+                    : `Away${away && ` · ${away}`}`
                 : 'Not connected · messages send when you’re both online'}
           </span>
         </span>
@@ -143,19 +156,21 @@ function Header() {
 const dayOf = (m: ChatMessage) => new Date(m.ts).toDateString()
 
 function Transcript() {
-  const { messages, hasOlder, loadingOlder, myId, peerName, peerHas, peerSeen } = useSelector(
-    store,
-    (s) => ({
-      messages: s.messages,
-      hasOlder: s.hasOlder,
-      loadingOlder: s.loadingOlder,
-      myId: s.status?.me.id ?? '',
-      peerName: s.status?.peer?.name || 'Them',
-      peerHas: s.status?.peer_has ?? 0,
-      peerSeen: s.status?.peer_seen ?? 0,
-    }),
-    { compare: shallow },
-  )
+  const { messages, hasOlder, loadingOlder, myId, myName, peerName, peerHas, peerSeen } =
+    useSelector(
+      store,
+      (s) => ({
+        messages: s.messages,
+        hasOlder: s.hasOlder,
+        loadingOlder: s.loadingOlder,
+        myId: s.status?.me.id ?? '',
+        myName: s.status?.me.name || 'You',
+        peerName: s.status?.peer?.name || 'Them',
+        peerHas: s.status?.peer_has ?? 0,
+        peerSeen: s.status?.peer_seen ?? 0,
+      }),
+      { compare: shallow },
+    )
 
   if (messages.length === 0) {
     return (
@@ -170,6 +185,7 @@ function Transcript() {
       hasOlder={hasOlder}
       loadingOlder={loadingOlder}
       myId={myId}
+      myName={myName}
       peerName={peerName}
       peerHas={peerHas}
       peerSeen={peerSeen}
@@ -204,6 +220,7 @@ function VirtualTranscript({
   hasOlder,
   loadingOlder,
   myId,
+  myName,
   peerName,
   peerHas,
   peerSeen,
@@ -212,6 +229,7 @@ function VirtualTranscript({
   hasOlder: boolean
   loadingOlder: boolean
   myId: string
+  myName: string
   peerName: string
   peerHas: number
   peerSeen: number
@@ -296,6 +314,7 @@ function VirtualTranscript({
                     message={m}
                     receipt={m.author === myId ? receiptFor(m.seq, peerHas, peerSeen) : null}
                     myId={myId}
+                    myName={myName}
                     peerName={peerName}
                     newDay={!prev || dayOf(prev) !== dayOf(m)}
                     groupStart={!prev || !sameGroup(prev, m)}
@@ -330,6 +349,7 @@ const Row = memo(function Row({
   message,
   receipt,
   myId,
+  myName,
   peerName,
   newDay,
   groupStart,
@@ -341,6 +361,7 @@ const Row = memo(function Row({
   /** Only for my own messages. */
   receipt: Receipt | null
   myId: string
+  myName: string
   peerName: string
   newDay: boolean
   /** First in its group: space above it. */
@@ -376,7 +397,11 @@ const Row = memo(function Row({
           <MessageContent className="gap-1">
             <Bubble variant="outline" align={align}>
               <BubbleContent className="text-muted-foreground italic" title={when.toLocaleString()}>
-                {mine ? 'You deleted this message' : 'Message deleted'}
+                {message.vanished
+                  ? 'Message vanished'
+                  : mine
+                    ? 'You deleted this message'
+                    : 'Message deleted'}
               </BubbleContent>
             </Bubble>
             {footer}
@@ -386,13 +411,16 @@ const Row = memo(function Row({
     )
   }
 
+  // `/me waves`: an action line, "Alex waves", instead of a bubble.
+  const action = message.text.startsWith('/me ') ? message.text.slice(4) : null
+
   return (
     <div className={groupStart ? 'pt-3' : 'pt-0.5'}>
       {newDay && <DayMarker when={when} />}
       <Message align={align}>
         <MessageContent className="gap-1">
           <Bubble
-            variant={mine ? 'default' : 'secondary'}
+            variant={action !== null ? 'ghost' : mine ? 'default' : 'secondary'}
             align={align}
             // Room for the reaction chip, which hangs three quarters below the bubble.
             className={message.reactions.length > 0 ? 'mb-6' : ''}
@@ -408,8 +436,18 @@ const Row = memo(function Row({
                   onJump={onJump}
                 />
               )}
-              <Linkified text={message.text} />
+              {action === null ? (
+                <Linkified text={message.text} />
+              ) : (
+                <span className="italic">
+                  <span className="font-semibold not-italic">{mine ? myName : peerName}</span>{' '}
+                  <Linkified text={action} />
+                </span>
+              )}
               {message.edited && <span className="ms-1.5 text-[11px] opacity-70">edited</span>}
+              {message.vanish !== null && (
+                <VanishTimer seconds={message.vanish} expires={message.expires} />
+              )}
             </BubbleContent>
             {message.reactions.length > 0 && (
               <Reactions
@@ -435,6 +473,45 @@ const Row = memo(function Row({
     </div>
   )
 })
+
+/**
+ * On a vanishing message: how long it lasts once seen, then a countdown. Ticks only
+ * while counting down.
+ */
+function VanishTimer({ seconds, expires }: { seconds: number; expires: number | null }) {
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => {
+    if (expires === null) return undefined
+    const timer = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [expires])
+  const label =
+    expires === null
+      ? `${formatDuration(seconds)} once seen`
+      : formatDuration(Math.max(0, (expires - now) / 1000))
+  return (
+    <span
+      className="ms-1.5 inline-flex items-center gap-0.5 align-[-1px] text-[11px] opacity-70"
+      title="Vanishes from both computers once the time is up"
+    >
+      <TimerIcon className="size-3" />
+      {label}
+    </span>
+  )
+}
+
+/** Whether `until` (ms) is still ahead. Re-renders when it passes. */
+function useUntil(until: number | null) {
+  const [now, setNow] = useState(Date.now)
+  useEffect(() => {
+    if (until === null) return undefined
+    // Also runs right away for a time already past. setTimeout waits at most about
+    // 24.8 days; do not disturb tops out at 7.
+    const timer = setTimeout(() => setNow(Date.now()), Math.max(0, until - Date.now()) + 50)
+    return () => clearTimeout(timer)
+  }, [until])
+  return until !== null && until > now
+}
 
 function DayMarker({ when }: { when: Date }) {
   return (
@@ -462,9 +539,13 @@ function QuoteButton({
     >
       <span className="font-medium">{name}</span>
       <span className="line-clamp-2 opacity-80">
-        {quote.deleted
-          ? 'Deleted message'
-          : (quote.text ?? 'A message that isn’t on this computer')}
+        {quote.vanished
+          ? 'Message vanished'
+          : quote.deleted
+            ? 'Deleted message'
+            : quote.text?.startsWith('/me ')
+              ? `* ${quote.text.slice(4)}`
+              : (quote.text ?? 'A message that isn’t on this computer')}
       </span>
     </button>
   )
@@ -602,7 +683,7 @@ function Composer() {
   const textRef = useRef<HTMLTextAreaElement>(null)
   const typingSentRef = useRef(0)
   const { scrollToEnd } = useMessageScroller()
-  const { replyingTo, editing, peerName, myId, away } = useSelector(
+  const { replyingTo, editing, peerName, myId, away, dndUntil } = useSelector(
     store,
     (s) => ({
       replyingTo: s.replyingTo,
@@ -610,9 +691,12 @@ function Composer() {
       peerName: s.status?.peer?.name || 'them',
       myId: s.status?.me.id ?? '',
       away: s.status?.away ? (s.status.away.note ?? '') : null,
+      dndUntil: s.status?.dnd_until ?? null,
     }),
     { compare: shallow },
   )
+  const dnd = useUntil(dndUntil)
+  const [showingStatus, setShowingStatus] = useState(false)
   // What was in the box before editing started; it comes back when editing ends.
   const draftRef = useRef<string | null>(null)
 
@@ -664,8 +748,21 @@ function Composer() {
   }
 
   const perform = (command: Command, args = '') => {
+    const typed = text
     reset()
-    void command.action({ confirmClear: () => setClearing(true) }, args)
+    void command.action(
+      {
+        confirmClear: () => setClearing(true),
+        send: (value, vanish) => sendText(value, vanish, typed),
+        hint: (message) => {
+          setText(typed) // keep what was typed, to fix it
+          setDismissed(true)
+          setHint(message)
+        },
+        showStatus: () => setShowingStatus(true),
+      },
+      args,
+    )
   }
 
   const saveEdit = async (of: ChatMessage) => {
@@ -688,20 +785,23 @@ function Composer() {
       else setHint(`There's no /${parsed.name} command. To send it as a message, start with //.`)
       return
     }
-    const value = parsed.text
-    if (!value) return
+    if (parsed.text) await sendText(parsed.text, undefined, parsed.text)
+  }
+
+  /** Sends `value`, replying if a reply was started. `draft` comes back if it fails. */
+  const sendText = async (value: string, vanish: number | undefined, draft: string) => {
     const reply = replyingTo
     reset()
     setReplyingTo(null)
     typingSentRef.current = 0 // the next message signals typing right away
     const to = reply ? { author: reply.author, seq: reply.seq } : undefined
-    const sent = await run(api.sendMessage(value, to))
+    const sent = await run(api.sendMessage(value, to, vanish))
     if (sent) {
       addMessage(sent)
       scrollToEnd({ behavior: 'smooth' })
     } else {
       // Keep the draft, and what it was replying to, if it failed.
-      setText(value)
+      setText(draft)
       setReplyingTo(reply)
     }
   }
@@ -774,6 +874,24 @@ function Composer() {
           {hint}
         </p>
       )}
+      {dnd && dndUntil !== null && (
+        <div className="mb-2 flex items-center gap-2 rounded-md border-l-2 border-destructive bg-muted py-1 pr-1 pl-2 text-xs">
+          <div className="min-w-0 flex-1">
+            <div className="truncate font-medium">Do not disturb until {formatUntil(dndUntil)}</div>
+            <div className="truncate text-muted-foreground">
+              No notifications, and nudges are paused
+            </div>
+          </div>
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            onClick={() => void run(api.setDnd(null))}
+          >
+            Turn off
+          </Button>
+        </div>
+      )}
       {away !== null && (
         <div className="mb-2 flex items-center gap-2 rounded-md border-l-2 border-warning bg-muted py-1 pr-1 pl-2 text-xs">
           <div className="min-w-0 flex-1">
@@ -843,6 +961,7 @@ function Composer() {
         </Button>
       </div>
       <ClearDialog open={clearing} onOpenChange={setClearing} />
+      <StatusDialog open={showingStatus} onOpenChange={setShowingStatus} />
     </form>
   )
 }

@@ -34,6 +34,21 @@ export interface Status {
   away: Away | null
   /** The peer is away. Only while connected. */
   peer_away: Away | null
+  /** My do not disturb is on until then (ms). `null` once it's past. */
+  dnd_until: number | null
+  /** The peer's do not disturb, by their clock. Only while connected. */
+  peer_dnd_until: number | null
+}
+
+/** For `/status`. */
+export interface ConnectionInfo {
+  my_version: string
+  /** `null` for peers before 0.6, or when we haven't been connected since. */
+  peer_version: string | null
+  /** When this session started (ms). The rest are also only while connected. */
+  since: number | null
+  address: string | null
+  rtt_ms: number | null
 }
 
 export interface Away {
@@ -51,7 +66,9 @@ export interface Ref {
 export interface Quote extends Ref {
   /** Its latest text. `null` when it isn't on this computer (cleared) or was deleted. */
   text: string | null
+  /** Deleted, or vanished. */
   deleted: boolean
+  vanished: boolean
 }
 
 export interface Reaction {
@@ -70,8 +87,14 @@ export interface Message {
   /** The latest edit's text, if edited. Empty once deleted. */
   text: string
   edited: boolean
-  /** Deleted by its author: shown as a placeholder, without reply or reactions. */
+  /** Deleted by its author, or vanished: a placeholder, without reply or reactions. */
   deleted: boolean
+  /** A vanishing message: seconds it lasts once seen. */
+  vanish: number | null
+  /** When it vanishes (ms), once its countdown has started. */
+  expires: number | null
+  /** Its time ran out. `deleted` is true too. */
+  vanished: boolean
   reply_to: Quote | null
   /** At most one per person. */
   reactions: Reaction[]
@@ -127,8 +150,13 @@ export const api = {
   /** Messages matching `query`, newest first, at most 100. */
   search: (query: string) => invoke<Hit[]>('search', { query }),
   setName: (name: string) => invoke<void>('set_name', { name }),
-  sendMessage: (text: string, replyTo?: Ref) =>
-    invoke<Message>('send_message', { text, replyTo: replyTo ?? null }),
+  /** `vanish`: seconds it lasts once they've seen it. */
+  sendMessage: (text: string, replyTo?: Ref, vanish?: number) =>
+    invoke<Message>('send_message', { text, replyTo: replyTo ?? null, vanish: vanish ?? null }),
+  /** `/dnd`: until then (ms), or `null` to turn it off. */
+  setDnd: (until: number | null) => invoke<void>('set_dnd', { until }),
+  /** `/status`. */
+  connectionInfo: () => invoke<ConnectionInfo>('connection_info'),
   /** Sets my reaction to a message, replacing any earlier one. `''` takes it back. */
   react: (to: Ref, emoji: string) => invoke<void>('react', { to, emoji }),
   /** Replaces the text of one of my messages. */

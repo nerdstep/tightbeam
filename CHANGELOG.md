@@ -4,6 +4,13 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+- More commands:
+  - `/vanish 1m your message` sends a message that erases itself from both computers once the time is up, counting from when the other person sees it. It shows a countdown, and its notification doesn't include the text. It needs this version or later on both computers.
+  - `/dnd` turns on do not disturb for an hour, or for as long as you say (`/dnd 30m`, `/dnd 2h`); `/dnd off` ends it. No notifications or nudge sounds, the other person sees "Do not disturb", and their nudges are paused.
+  - `/me waves` shows as "Alex waves" rather than a bubble.
+  - `/shrug`, `/tableflip` and `/unflip` send ¯\\_(ツ)\_/¯, (╯°□°)╯︵ ┻━┻ and ┬─┬ノ( º \_ºノ), after anything you type with them.
+  - `/status` shows the connection's address and round-trip time, and which version each app runs.
+
 ## 0.5.0 — 2026-11-24
 
 - Messages stay in the order they were written when the two computers' clocks disagree. Before, a reply could appear above the message it answered if the replier's clock was behind. Messages from older versions are still ordered by their clock.

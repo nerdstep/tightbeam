@@ -12,8 +12,15 @@
 //! The `search` table indexes each message's current text (SQLite FTS5). Storing an
 //! entry keeps it up to date: an edit replaces the text, and a delete or `clear` removes
 //! it. Deleted text is zeroed on disk (`secure_delete`), in the index too.
+//!
+//! A vanishing message carries a lifetime (`vanish`, seconds). Each side starts the
+//! countdown (`expires`, its own clock) once the recipient has seen it, then erases its
+//! copy like a delete. `expires` is local and never synced.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -48,25 +55,22 @@ pub struct Entry {
 pub enum Kind {
     Message {
         reply_to: Option<Ref>,
+        /// Seconds it lasts once seen, for a vanishing message.
+        vanish: Option<u64>,
     },
     /// Replaces the author's earlier reaction to `to`, if any.
-    Reaction {
-        to: Ref,
-    },
+    Reaction { to: Ref },
     /// New text for one of the author's own messages. The latest edit wins.
-    Edit {
-        of: Ref,
-    },
+    Edit { of: Ref },
     /// Deletes one of the author's own messages.
-    Delete {
-        of: Ref,
-    },
+    Delete { of: Ref },
 }
 
 impl Entry {
     pub fn message(author: impl Into<String>, seq: u64, ts: i64, text: impl Into<String>) -> Self {
         let (author, text) = (author.into(), text.into());
-        Self { author, seq, ts, hlc: ts, text, kind: Kind::Message { reply_to: None } }
+        let kind = Kind::Message { reply_to: None, vanish: None };
+        Self { author, seq, ts, hlc: ts, text, kind }
     }
 }
 
@@ -80,8 +84,15 @@ pub struct Message {
     /// The latest edit's text, if edited. Empty once deleted.
     pub text: String,
     pub edited: bool,
-    /// Deleted by its author. Shown as a placeholder, without reply or reactions.
+    /// Deleted by its author, or vanished. Shown as a placeholder, without reply or
+    /// reactions.
     pub deleted: bool,
+    /// A vanishing message: seconds it lasts once seen.
+    pub vanish: Option<u64>,
+    /// When it vanishes (ms, this computer's clock), once the countdown has started.
+    pub expires: Option<i64>,
+    /// Its time ran out. `deleted` is true too.
+    pub vanished: bool,
     /// The message this one answers.
     pub reply_to: Option<Quote>,
     /// At most one per person, in author order.
@@ -95,7 +106,9 @@ pub struct Quote {
     /// Its latest text. `None` when it isn't stored here (cleared, for example) or was
     /// deleted.
     pub text: Option<String>,
+    /// Deleted, or vanished.
     pub deleted: bool,
+    pub vanished: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -200,32 +213,88 @@ impl Db {
             )?;
         }
         let db = Self(conn);
-        if version < 3 {
-            // 0.5: search. Filled from the history in one go.
-            db.0.execute_batch(
-                "BEGIN;
-                 CREATE VIRTUAL TABLE search USING fts5(
-                     text, author UNINDEXED, seq UNINDEXED,
-                     tokenize = 'unicode61 remove_diacritics 2'
-                 );
-                 -- Deleting from the index removes the words, not just marks them gone.
-                 INSERT INTO search (search, rank) VALUES ('secure-delete', 1);",
-            )?;
+        if version < 4 {
+            // One transaction, so the search index is filled using the finished schema.
+            db.0.execute_batch("BEGIN")?;
             let result = (|| -> Result<()> {
-                let messages = db.entries("WHERE kind = 'message'", [])?;
-                for e in messages {
-                    db.index(&Ref { author: e.author, seq: e.seq })?;
+                if version < 3 {
+                    // 0.5: search.
+                    db.0.execute_batch(
+                        "CREATE VIRTUAL TABLE search USING fts5(
+                             text, author UNINDEXED, seq UNINDEXED,
+                             tokenize = 'unicode61 remove_diacritics 2'
+                         );
+                         -- Deleting from the index removes the words, not just marks them.
+                         INSERT INTO search (search, rank) VALUES ('secure-delete', 1);",
+                    )?;
                 }
+                // 0.6: vanishing messages. `vanish` syncs; `expires` is this computer's own.
+                db.0.execute_batch(
+                    "ALTER TABLE messages ADD COLUMN vanish INTEGER;
+                     ALTER TABLE messages ADD COLUMN expires INTEGER;
+                     CREATE INDEX messages_by_expiry ON messages (expires)
+                         WHERE expires IS NOT NULL;",
+                )?;
+                if version < 3 {
+                    // Fill the search index from the history.
+                    for e in db.entries("WHERE kind = 'message'", [])? {
+                        db.index(&Ref { author: e.author, seq: e.seq })?;
+                    }
+                }
+                db.0.execute_batch("PRAGMA user_version = 4")?;
                 Ok(())
             })();
-            db.0.execute_batch(if result.is_ok() {
-                "PRAGMA user_version = 3; COMMIT;"
-            } else {
-                "ROLLBACK"
-            })?;
+            db.0.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
             result?;
         }
         Ok(db)
+    }
+
+    /// Starts the countdown on `author`'s vanishing messages up to `up_to` (they've been
+    /// seen): each vanishes its lifetime after `now`. Returns the ones started.
+    pub fn start_vanish(&self, author: &str, up_to: u64, now: i64) -> Result<Vec<Ref>> {
+        let mut stmt = self.0.prepare_cached(
+            "UPDATE messages SET expires = ?3 + vanish * 1000
+             WHERE author = ?1 AND seq <= ?2 AND kind = 'message'
+               AND vanish IS NOT NULL AND expires IS NULL
+             RETURNING seq",
+        )?;
+        let seqs = stmt.query_map(params![author, up_to as i64, now], |r| r.get::<_, i64>(0))?;
+        let refs = seqs.map(|seq| Ok(Ref { author: author.to_string(), seq: seq? as u64 }));
+        refs.collect()
+    }
+
+    /// Erases the vanishing messages whose time is up, like a delete. Returns them.
+    pub fn expire(&self, now: i64) -> Result<Vec<Ref>> {
+        let due = self
+            .0
+            .prepare_cached(
+                "SELECT author, seq FROM messages
+                 WHERE expires <= ?1 AND kind = 'message' AND text != ''",
+            )?
+            .query_map([now], |r| Ok(Ref { author: r.get(0)?, seq: r.get::<_, i64>(1)? as u64 }))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for at in &due {
+            self.scrub(at)?;
+        }
+        Ok(due)
+    }
+
+    /// Whether a vanishing message's time is up.
+    fn vanished(&self, at: &Ref) -> Result<bool> {
+        Ok(self.expires(at)?.is_some_and(|t| t <= now_ms()))
+    }
+
+    /// When a message vanishes, if its countdown has started.
+    fn expires(&self, at: &Ref) -> Result<Option<i64>> {
+        Ok(self
+            .0
+            .prepare_cached(
+                "SELECT expires FROM messages WHERE author = ?1 AND seq = ?2 AND kind = 'message'",
+            )?
+            .query_row(params![at.author, at.seq as i64], |r| r.get(0))
+            .optional()?
+            .flatten())
     }
 
     /// Messages matching `query`, newest first. Each word matches words starting with
@@ -423,16 +492,16 @@ impl Db {
 
     /// Stores an entry. Returns false if it was already stored.
     pub fn insert(&self, e: &Entry) -> Result<bool> {
-        let (kind, to) = match &e.kind {
-            Kind::Message { reply_to } => (MESSAGE, reply_to.as_ref()),
-            Kind::Reaction { to } => (REACTION, Some(to)),
-            Kind::Edit { of } => (EDIT, Some(of)),
-            Kind::Delete { of } => (DELETE, Some(of)),
+        let (kind, to, vanish) = match &e.kind {
+            Kind::Message { reply_to, vanish } => (MESSAGE, reply_to.as_ref(), *vanish),
+            Kind::Reaction { to } => (REACTION, Some(to), None),
+            Kind::Edit { of } => (EDIT, Some(of), None),
+            Kind::Delete { of } => (DELETE, Some(of), None),
         };
         let changed = self.0.execute(
             "INSERT OR IGNORE INTO messages
-                 (author, seq, ts, hlc, text, kind, ref_author, ref_seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (author, seq, ts, hlc, text, kind, ref_author, ref_seq, vanish)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 e.author,
                 e.seq as i64,
@@ -441,7 +510,8 @@ impl Db {
                 e.text,
                 kind,
                 to.map(|r| &r.author),
-                to.map(|r| r.seq as i64)
+                to.map(|r| r.seq as i64),
+                vanish.map(|v| v as i64)
             ],
         )?;
         if changed == 0 {
@@ -466,7 +536,7 @@ impl Db {
     fn index(&self, at: &Ref) -> Result<()> {
         let Some(original) = self.original(at)? else { return Ok(()) };
         let current = self.current(at, original)?;
-        if !current.deleted {
+        if !current.deleted && !self.vanished(at)? {
             self.0
                 .prepare_cached("INSERT INTO search (text, author, seq) VALUES (?1, ?2, ?3)")?
                 .execute(params![current.text, at.author, at.seq as i64])?;
@@ -500,11 +570,13 @@ impl Db {
 
     /// Adds the latest edit, the quoted message and the reactions.
     fn show(&self, e: Entry) -> Result<Message> {
-        let Kind::Message { reply_to } = e.kind else { bail!("not a message") };
+        let Kind::Message { reply_to, vanish } = e.kind else { bail!("not a message") };
         let at = Ref { author: e.author, seq: e.seq };
         let current = self.current(&at, e.text)?;
+        let expires = self.expires(&at)?;
+        let vanished = expires.is_some_and(|t| t <= now_ms());
         let (author, seq, ts, hlc) = (at.author.clone(), at.seq, e.ts, e.hlc);
-        if current.deleted {
+        if current.deleted || vanished {
             let (text, reply_to, reactions) = (String::new(), None, Vec::new());
             return Ok(Message {
                 author,
@@ -514,6 +586,9 @@ impl Db {
                 text,
                 edited: false,
                 deleted: true,
+                vanish,
+                expires,
+                vanished,
                 reply_to,
                 reactions,
             });
@@ -521,15 +596,29 @@ impl Db {
         let reply_to = match reply_to {
             Some(to) => {
                 let quoted = self.original(&to)?.map(|text| self.current(&to, text)).transpose()?;
-                let deleted = quoted.as_ref().is_some_and(|q| q.deleted);
-                let text = quoted.filter(|q| !q.deleted).map(|q| q.text);
-                Some(Quote { author: to.author, seq: to.seq, text, deleted })
+                let vanished = self.vanished(&to)?;
+                let deleted = vanished || quoted.as_ref().is_some_and(|q| q.deleted);
+                let text = quoted.filter(|_| !deleted).map(|q| q.text);
+                Some(Quote { author: to.author, seq: to.seq, text, deleted, vanished })
             }
             None => None,
         };
         let reactions = self.reactions(&at)?;
         let (text, edited) = (current.text, current.edited);
-        Ok(Message { author, seq, ts, hlc, text, edited, deleted: false, reply_to, reactions })
+        Ok(Message {
+            author,
+            seq,
+            ts,
+            hlc,
+            text,
+            edited,
+            deleted: false,
+            vanish,
+            expires,
+            vanished: false,
+            reply_to,
+            reactions,
+        })
     }
 
     /// A message's text now, given its original: its author's latest edit, or nothing if
@@ -560,6 +649,10 @@ impl Db {
     /// message's author can delete it, so `of.author` is also whose edits these are.
     pub fn scrub(&self, of: &Ref) -> Result<()> {
         self.0.execute(
+            "DELETE FROM search WHERE author = ?1 AND seq = ?2",
+            params![of.author, of.seq as i64],
+        )?;
+        self.0.execute(
             "UPDATE messages SET text = ''
              WHERE author = ?1 AND (
                  (kind = 'message' AND seq = ?2)
@@ -573,7 +666,8 @@ impl Db {
     /// Entries matching `filter`, the SQL after `FROM messages`.
     fn entries(&self, filter: &str, p: impl rusqlite::Params) -> Result<Vec<Entry>> {
         let mut stmt = self.0.prepare_cached(&format!(
-            "SELECT author, seq, ts, hlc, text, kind, ref_author, ref_seq FROM messages {filter}"
+            "SELECT author, seq, ts, hlc, text, kind, ref_author, ref_seq, vanish
+             FROM messages {filter}"
         ))?;
         let rows = stmt.query_map(p, |r| {
             let to = match (r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?) {
@@ -584,7 +678,10 @@ impl Db {
                 (REACTION, Some(to)) => Kind::Reaction { to },
                 (EDIT, Some(of)) => Kind::Edit { of },
                 (DELETE, Some(of)) => Kind::Delete { of },
-                (_, reply_to) => Kind::Message { reply_to },
+                (_, reply_to) => Kind::Message {
+                    reply_to,
+                    vanish: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                },
             };
             Ok(Entry {
                 author: r.get(0)?,
@@ -599,6 +696,10 @@ impl Db {
     }
 }
 
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,7 +710,7 @@ mod tests {
 
     fn reply(author: &str, seq: u64, to: (&str, u64)) -> Entry {
         let reply_to = Some(Ref { author: to.0.into(), seq: to.1 });
-        Entry { kind: Kind::Message { reply_to }, ..msg(author, seq) }
+        Entry { kind: Kind::Message { reply_to, vanish: None }, ..msg(author, seq) }
     }
 
     fn react(author: &str, seq: u64, emoji: &str, to: (&str, u64)) -> Entry {
@@ -833,5 +934,55 @@ mod tests {
         let at = |seq: u64| Cursor { hlc: seq as i64, author: "me".into(), seq };
         let texts: Vec<_> = db.range(&at(2), &at(5)).unwrap().into_iter().map(|m| m.text).collect();
         assert_eq!(texts, ["me2", "me3", "me4"]);
+    }
+
+    #[test]
+    fn vanishing_messages() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let vanishing = |author: &str, seq: u64, secs: u64| Entry {
+            kind: Kind::Message { reply_to: None, vanish: Some(secs) },
+            ..Entry::message(author, seq, seq as i64, "secret plans")
+        };
+        db.insert_many(&[
+            vanishing("peer", 1, 60),
+            reply("me", 1, ("peer", 1)),
+            vanishing("peer", 2, 60),
+        ])
+        .unwrap();
+        let find = |seq: u64| {
+            db.all().unwrap().into_iter().find(|m| m.author == "peer" && m.seq == seq).unwrap()
+        };
+        assert_eq!(
+            db.since("peer", 0).unwrap()[0].kind,
+            Kind::Message { reply_to: None, vanish: Some(60) }
+        );
+
+        // Nothing happens until it's seen.
+        assert!(db.expire(i64::MAX).unwrap().is_empty());
+        assert_eq!(find(1).expires, None);
+
+        // Seen at t=1000: it vanishes a minute later. The unseen one doesn't start.
+        let started = db.start_vanish("peer", 1, 1_000).unwrap();
+        assert_eq!(started, [Ref { author: "peer".into(), seq: 1 }]);
+        assert!(db.start_vanish("peer", 1, 5_000).unwrap().is_empty(), "starts once");
+        assert_eq!(find(1).expires, Some(61_000));
+        assert_eq!(find(2).expires, None);
+        assert!(db.expire(60_999).unwrap().is_empty());
+
+        // Time's up (`expire` gets the time; `show` uses the real clock, long past 61s).
+        assert_eq!(db.expire(61_000).unwrap().len(), 1);
+        let gone = find(1);
+        assert!(gone.vanished && gone.deleted && gone.text.is_empty());
+        let quote = db.all().unwrap().into_iter().find(|m| m.author == "me").unwrap();
+        let quote = quote.reply_to.unwrap();
+        assert!(quote.vanished && quote.deleted && quote.text.is_none());
+        assert_eq!(db.search("secret", 10).unwrap().len(), 1, "only the unseen one");
+        assert_eq!(db.since("peer", 0).unwrap()[0].text, "", "erased in storage");
+        assert!(db.expire(i64::MAX).unwrap().iter().all(|at| at.seq == 2), "erased once");
+
+        // An edit that arrives after it vanished isn't indexed.
+        db.insert(&edit("peer", 3, "secret again", ("peer", 1))).unwrap();
+        assert!(find(1).vanished);
+        assert!(db.search("again", 10).unwrap().is_empty());
     }
 }

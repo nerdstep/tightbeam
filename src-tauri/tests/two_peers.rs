@@ -1,7 +1,7 @@
 //! Two real Tightbeam cores on this machine, found via mDNS and talking over QUIC.
 //! Covers pairing, live messages, delivery acks, seen receipts, catching up after one
 //! side was off, replies and reactions, edits and deletes, typing, nudges, away and back,
-//! and clearing one side's history.
+//! clearing one side's history, versions, do not disturb, and vanishing messages.
 
 use std::{
     path::PathBuf,
@@ -97,9 +97,9 @@ async fn pair_chat_and_catch_up() {
 
     // Live messages both ways, with delivery confirmation.
     let a = alice.clone();
-    like_tauri(move || a.send_message("hi bob", None)).unwrap();
+    like_tauri(move || a.send_message("hi bob", None, None)).unwrap();
     wait_for("bob gets alice's message", 10, || texts(&bob).contains(&"hi bob".into())).await;
-    bob.send_message("hi alice", None).unwrap();
+    bob.send_message("hi alice", None, None).unwrap();
     wait_for("alice gets bob's message", 10, || texts(&alice).contains(&"hi alice".into())).await;
     wait_for("alice sees delivery", 10, || alice.status().peer_has == 1).await;
     assert_eq!(alice.status().peer_seen, 0, "delivered isn't seen");
@@ -113,8 +113,8 @@ async fn pair_chat_and_catch_up() {
     bob.shutdown().await;
     drop(bob);
     wait_for("alice notices bob left", 40, || !alice.status().connected).await;
-    alice.send_message("you there?", None).unwrap();
-    alice.send_message("guess not", None).unwrap();
+    alice.send_message("you there?", None, None).unwrap();
+    alice.send_message("guess not", None, None).unwrap();
     // A reaction while he's away: it syncs with the catch-up.
     let first = Ref { author: bob_id.clone(), seq: 1 };
     alice.react(first.clone(), "👍").unwrap();
@@ -149,7 +149,7 @@ async fn pair_chat_and_catch_up() {
     // Bob replies to Alice's first message. Then she takes her reaction back and he adds one.
     let hi_bob = Ref { author: alice.id(), seq: 1 };
     let b = bob.clone();
-    let sent = like_tauri(move || b.send_message("hi again", Some(hi_bob))).unwrap();
+    let sent = like_tauri(move || b.send_message("hi again", Some(hi_bob), None)).unwrap();
     assert_eq!(sent.reply_to.unwrap().text.as_deref(), Some("hi bob"));
     wait_for("alice gets the reply", 10, || {
         alice.messages().unwrap().iter().any(|m| {
@@ -203,7 +203,7 @@ async fn pair_chat_and_catch_up() {
     like_tauri(move || b.clear_history()).unwrap();
     assert!(texts(&bob).is_empty());
     assert_eq!(texts(&alice).len(), 5);
-    assert_eq!(bob.send_message("fresh start", None).unwrap().seq, 6);
+    assert_eq!(bob.send_message("fresh start", None, None).unwrap().seq, 6);
     wait_for("alice gets it", 10, || texts(&alice).contains(&"fresh start".into())).await;
     assert_eq!(texts(&alice).len(), 6);
     assert_eq!(texts(&bob), ["fresh start"]);
@@ -216,6 +216,36 @@ async fn pair_chat_and_catch_up() {
     assert_eq!(bob.status().away, None);
     bob.set_idle(false);
     wait_for("alice sees bob back", 10, || alice.status().peer_away.is_none()).await;
+
+    // Each side knows the other's version, which is what allows vanishing messages.
+    let info = alice.connection_info();
+    assert_eq!(info.peer_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    assert!(info.since.is_some() && info.address.is_some() && info.rtt_ms.is_some());
+
+    // Do not disturb: Alice sees it, and her nudges are refused until Bob turns it off.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let later = now.as_millis() as i64 + 3_600_000;
+    bob.set_dnd(Some(later)).unwrap();
+    assert!(bob.dnd() && bob.status().dnd_until == Some(later));
+    wait_for("alice sees bob's dnd", 10, || alice.status().peer_dnd_until == Some(later)).await;
+    let refused = alice.nudge().unwrap_err().to_string();
+    assert!(refused.contains("do not disturb"), "{refused}");
+    bob.set_dnd(None).unwrap();
+    wait_for("alice sees it end", 10, || alice.status().peer_dnd_until.is_none()).await;
+
+    // A vanishing message: once Bob has seen it, it's gone from both sides 5 seconds later.
+    let secret = alice.send_message("the code is 1234", None, Some(5)).unwrap();
+    let at = Ref { author: alice.id(), seq: secret.seq };
+    wait_for("bob gets it", 10, || find(&bob, &at).is_some()).await;
+    assert_eq!(find(&bob, &at).unwrap().expires, None, "its clock starts when seen");
+    bob.mark_seen().unwrap();
+    wait_for("alice's clock starts", 10, || find(&alice, &at).is_some_and(|m| m.expires.is_some()))
+        .await;
+    wait_for("it vanishes on both sides", 15, || {
+        find(&alice, &at).is_some_and(|m| m.vanished) && find(&bob, &at).is_some_and(|m| m.vanished)
+    })
+    .await;
+    assert!(!texts(&bob).contains(&"the code is 1234".into()));
 
     alice.shutdown().await;
     bob.shutdown().await;

@@ -107,9 +107,15 @@ pub fn on_message(app: &AppHandle, message: &Message) {
     }
     let unread = desktop.unread.fetch_add(1, Ordering::Relaxed) + 1;
     show_unread(app, &window, unread);
-    if desktop.notifications() && !recently_notified(&desktop) {
-        let mut body: String = message.text.chars().take(140).collect();
-        if body.len() < message.text.len() {
+    if desktop.notifications() && !core.dnd() && !recently_notified(&desktop) {
+        // A vanishing message's text would outlive it in the notification center.
+        let text = match message.text.strip_prefix("/me ") {
+            _ if message.vanish.is_some() => "Vanishing message".to_string(),
+            Some(action) => format!("{} {action}", title(core.peer_name(), "They")),
+            None => message.text.clone(),
+        };
+        let mut body: String = text.chars().take(140).collect();
+        if body.len() < text.len() {
             body.push('…');
         }
         notify(app, &title(core.peer_name(), "New message"), &body, false);
@@ -127,6 +133,9 @@ pub fn on_nudge(app: &AppHandle) {
     ) else {
         return;
     };
+    if core.dnd() {
+        return; // the peer's side refuses nudges, but an older build may still send one
+    }
     if !window.is_visible().unwrap_or(false) {
         if desktop.notifications() {
             notify(app, &title(core.peer_name(), "Tightbeam"), "Nudged you", true);

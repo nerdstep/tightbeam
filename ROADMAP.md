@@ -43,9 +43,12 @@ New frame types or message kinds. The per-author append-only log stays as it is:
   - `/nudge`: a `Nudge` frame, live only. A shake and a sound in an open window, a taskbar flash or Dock bounce behind other windows, a notification from the tray. At most one every 3 seconds each way.
   - `/away [note]` and `/back`: see the away status below.
   - `/search [words]`: opens search.
-- [ ] **More commands:**
-  - `/me waves`: shown as an action line instead of a bubble. Older builds show the raw text.
-  - `/shrug` and friends: they only insert text.
+  - `/me waves`: sent as the text `/me waves`, shown as an action line ("Alex waves"). Older builds show the raw text.
+  - `/shrug`, `/tableflip`, `/unflip`: send the face after any text typed with it. UI only.
+  - `/status`: the connection (address and round trip from iroh's selected path) and both versions. `Hello` carries `version` from 0.6.
+  - `/dnd [time | off]`: a `Dnd { until }` frame, live only, re-sent each session and kept across restarts. No notifications or nudge sounds while it's on, and the peer's nudges are refused at their end.
+  - `/vanish <time> <message>`: `Msg` with `vanish` (seconds). Each side starts the clock once the recipient has seen it (its own seen, or the `Seen` receipt) and erases its copy like a delete; `expires` is local and never synced. Only sent to peers whose `Hello` has a version, since older ones would keep the message. Notifications say "Vanishing message" instead of the text.
+- [ ] **More commands:** `/flip`, `/roll [d20]`, `/pick a b c` (random, decided by the sender); `/undo` (delete my last message); `/export` (save the conversation as Markdown); `/spoiler`.
 - [x] **Search** with SQLite FTS5. The `search` table holds each message's current text, kept up to date as entries are stored: an edit replaces it, and a delete or `/clear` removes it (FTS5's `secure-delete` plus `PRAGMA secure_delete`, so the words don't linger). Each word is a quoted prefix query, so FTS5 syntax typed in is just text. The newest 100 matches, with FTS5 snippets. Picking one loads the gap back to it (`get_messages_between`) and scrolls there.
 - [x] **Stable ordering.** Messages used to be sorted by each author's wall clock, so clock skew could misorder them. Each entry now carries `hlc`, a hybrid logical clock: the author's wall clock, or one past the highest `hlc` stored on their side, whichever is later. Anything written after seeing a message sorts after it. `ts` is still the time shown. Entries from peers before 0.5 use `ts`, and `/clear` keeps the clock from running backwards.
 
@@ -65,6 +68,5 @@ New frame types or message kinds. The per-author append-only log stays as it is:
 ## Later
 
 - [ ] **More than one device per person** (for example a laptop plus a desktop, and eventually phones via Tauri mobile). This is the biggest architectural change: each person's log has to sync across their own devices, and pairing becomes per person rather than per device.
-- [ ] Voice notes.
 - [x] **Away status.** `Away { note }` and `Back` frames, live only, sent on change and at the start of each session. After 10 minutes without input anywhere on the computer (`GetLastInputInfo` on Windows, `CGEventSourceSecondsSinceLastEventType` on macOS, checked every 5 seconds), you're away until input resumes. `/away [note]` sets it by hand, and it lasts until `/back` or your next message. The header shows the other person as "Away", with the note if there is one.
 - [ ] Per-person colors or themes.

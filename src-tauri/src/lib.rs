@@ -6,7 +6,7 @@ mod updates;
 
 use std::{path::PathBuf, sync::Arc};
 
-use chat::{Core, Emit, Event, Status};
+use chat::{ConnectionInfo, Core, Emit, Event, Status};
 use db::{Cursor, Hit, Message, Page, Ref};
 use desktop::{Desktop, MAIN_WINDOW, MINIMIZED_ARG};
 use serde::Serialize;
@@ -69,10 +69,27 @@ fn set_name(core: CoreState, name: String) -> Result<(), String> {
     core.set_name(&name).map_err(err)
 }
 
-/// `reply_to`: the message this one answers.
+/// `reply_to`: the message this one answers. `vanish`: seconds it lasts once seen.
 #[tauri::command]
-fn send_message(core: CoreState, text: String, reply_to: Option<Ref>) -> Result<Message, String> {
-    core.send_message(&text, reply_to).map_err(err)
+fn send_message(
+    core: CoreState,
+    text: String,
+    reply_to: Option<Ref>,
+    vanish: Option<u64>,
+) -> Result<Message, String> {
+    core.send_message(&text, reply_to, vanish).map_err(err)
+}
+
+/// `/status`.
+#[tauri::command]
+fn connection_info(core: CoreState) -> ConnectionInfo {
+    core.connection_info()
+}
+
+/// `/dnd`: `until` in ms, or `None` to turn it off.
+#[tauri::command]
+fn set_dnd(core: CoreState, until: Option<i64>) -> Result<(), String> {
+    core.set_dnd(until).map_err(err)
 }
 
 /// Sets my reaction to a message; `emoji` "" takes it back.
@@ -296,6 +313,8 @@ pub fn run() {
             typing,
             set_away,
             back,
+            set_dnd,
+            connection_info,
             clear_history,
             nudge,
             pair_with,

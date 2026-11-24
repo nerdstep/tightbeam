@@ -46,6 +46,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
 /// At most one nudge this often, each way.
 const NUDGE_EVERY: Duration = Duration::from_secs(3);
+/// This build's version, sent in `Hello`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// How long a vanishing message can last once seen: 5 seconds to 7 days.
+const VANISH_SECS: std::ops::RangeInclusive<u64> = 5..=7 * 24 * 60 * 60;
 /// Search shows at most this many matches, the newest.
 pub const SEARCH_LIMIT: usize = 100;
 /// An away note is a few words, like "lunch" or "back at 3".
@@ -69,6 +73,10 @@ enum Frame {
     Hello {
         name: String,
         have: u64,
+        /// The sender's app version. Added in 0.6: a peer that sends it also handles
+        /// vanishing messages and `Dnd`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
     },
     /// An entry in the sender's log. Plain, it's a message.
     Msg {
@@ -94,6 +102,11 @@ enum Frame {
         /// peers show an empty message.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         delete_of: Option<Ref>,
+        /// A vanishing message: each side erases it this many seconds after the
+        /// recipient has seen it. Added in 0.6, and only sent to peers that say their
+        /// version in `Hello`: older ones would keep it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vanish: Option<u64>,
     },
     Ack {
         have: u64,
@@ -118,6 +131,12 @@ enum Frame {
     },
     /// The sender is no longer away. Added in 0.5.
     Back,
+    /// The sender turned do not disturb on until `until` (ms, their clock), or off with
+    /// `None`. Sent on change and at the start of each session. Added in 0.6.
+    Dnd {
+        #[serde(default)]
+        until: Option<i64>,
+    },
     /// A frame type from a newer version. Never sent.
     #[serde(other, skip_serializing)]
     Unknown,
@@ -141,6 +160,23 @@ pub struct Status {
     pub away: Option<Away>,
     /// The peer is away. Only while connected.
     pub peer_away: Option<Away>,
+    /// Do not disturb is on until then (ms). `None` once it's past.
+    pub dnd_until: Option<i64>,
+    /// The peer's do not disturb, by their clock. Only while connected.
+    pub peer_dnd_until: Option<i64>,
+}
+
+/// For `/status`: how the connection is doing, and which versions are talking.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionInfo {
+    pub my_version: String,
+    /// `None` for peers before 0.6, or when we haven't been connected since.
+    pub peer_version: Option<String>,
+    /// When this session started (ms). The rest are also only while connected.
+    pub since: Option<i64>,
+    /// The peer's address on the path in use.
+    pub address: Option<String>,
+    pub rtt_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -190,6 +226,7 @@ struct Pairing {
 
 struct Session {
     generation: u64,
+    since: i64,
     out: mpsc::UnboundedSender<Frame>,
     conn: Connection,
 }
@@ -212,6 +249,10 @@ struct State {
     /// `away` came from `/away`, so it lasts until `/back` or a message, not until input.
     away_by_hand: bool,
     peer_away: Option<Away>,
+    /// From their last `Hello`, kept between sessions.
+    peer_version: Option<String>,
+    dnd_until: Option<i64>,
+    peer_dnd_until: Option<i64>,
 }
 
 pub struct Core {
@@ -265,6 +306,8 @@ impl Core {
             |key| -> Result<u64> { Ok(db.get_str(key)?.and_then(|s| s.parse().ok()).unwrap_or(0)) };
         let (peer_has, peer_seen, seen) =
             (counter("peer_has")?, counter("peer_seen")?, counter("seen")?);
+        let peer_version = db.get_str("peer_version")?;
+        let dnd_until = db.get_str("dnd_until")?.and_then(|s| s.parse().ok());
 
         // LAN only for now: no relay servers, no public DNS, just mDNS. No UPnP either:
         // we never ask the router to open a public port, and we only ever advertise
@@ -303,6 +346,9 @@ impl Core {
                 away: None,
                 away_by_hand: false,
                 peer_away: None,
+                peer_version,
+                dnd_until,
+                peer_dnd_until: None,
             }),
             emit,
             tasks: Mutex::new(Vec::new()),
@@ -314,6 +360,7 @@ impl Core {
             tokio::spawn(core.clone().accept_loop()).abort_handle(),
             tokio::spawn(core.clone().discovery_loop(mdns)).abort_handle(),
             tokio::spawn(core.clone().dial_loop()).abort_handle(),
+            tokio::spawn(core.clone().vanish_loop()).abort_handle(),
         ];
         Ok(core)
     }
@@ -352,7 +399,35 @@ impl Core {
             notice: st.notice.clone(),
             away: st.away.clone().filter(|_| st.away_by_hand),
             peer_away: st.peer_away.clone(),
+            dnd_until: st.dnd_until.filter(|&t| t > now_ms()),
+            peer_dnd_until: st.peer_dnd_until,
         }
+    }
+
+    /// For `/status`.
+    pub fn connection_info(&self) -> ConnectionInfo {
+        let st = self.state();
+        let (mut since, mut address, mut rtt_ms) = (None, None, None);
+        if let Some(session) = &st.session {
+            since = Some(session.since);
+            let paths = session.conn.paths();
+            if let Some(path) = paths.iter().find(|p| p.is_selected()) {
+                address = Some(path.remote_addr().to_string());
+                rtt_ms = Some(path.rtt().as_secs_f64() * 1000.0);
+            }
+        }
+        ConnectionInfo {
+            my_version: VERSION.into(),
+            peer_version: st.peer_version.clone(),
+            since,
+            address,
+            rtt_ms,
+        }
+    }
+
+    /// Whether my do not disturb is on: no notifications, and nudges are refused.
+    pub fn dnd(&self) -> bool {
+        self.state().dnd_until.is_some_and(|t| t > now_ms())
     }
 
     /// The whole history, oldest first. The UI uses `page` instead.
@@ -388,21 +463,37 @@ impl Core {
         self.advertise_name();
         if let Some(out) = session {
             let have = self.peer_id().map(|p| self.db().max_seq(&p.to_string())).transpose()?;
-            let _ = out.send(Frame::Hello { name, have: have.unwrap_or(0) });
+            let version = Some(VERSION.into());
+            let _ = out.send(Frame::Hello { name, have: have.unwrap_or(0), version });
         }
         self.changed();
         Ok(())
     }
 
     /// `reply_to`: the message this one answers.
-    pub fn send_message(&self, text: &str, reply_to: Option<Ref>) -> Result<Message> {
+    /// `vanish`: seconds the message lasts once they've seen it.
+    pub fn send_message(
+        &self,
+        text: &str,
+        reply_to: Option<Ref>,
+        vanish: Option<u64>,
+    ) -> Result<Message> {
         let text = clean(text, MAX_TEXT_CHARS);
         ensure!(!text.is_empty(), "message can't be empty");
         let peer = self.peer_id().context("not paired with anyone yet")?;
         if let Some(to) = &reply_to {
             ensure!(self.is_ours(to, &peer.to_string()), "can't reply to that");
         }
-        let entry = self.append(text, Kind::Message { reply_to })?;
+        if let Some(secs) = vanish {
+            ensure!(VANISH_SECS.contains(&secs), "A vanishing message lasts 5 seconds to 7 days.");
+            let name = title_name(self.peer_name());
+            ensure!(
+                self.state().peer_version.is_some(),
+                "Vanishing messages need {name} on Tightbeam 0.6 or later. If they've \
+                 updated, try again once you've been connected."
+            );
+        }
+        let entry = self.append(text, Kind::Message { reply_to, vanish })?;
         let at = Ref { author: entry.author.clone(), seq: entry.seq };
         let msg = self.db().message(&at)?.context("message vanished")?;
         (self.emit)(Event::Message(msg.clone()));
@@ -444,6 +535,19 @@ impl Core {
         self.db().scrub(&of)?;
         self.updated(&of)?;
         self.send_live(entry);
+        Ok(())
+    }
+
+    /// `/dnd`: no notifications until `until` (ms), and the peer sees it. `None` ends it.
+    pub fn set_dnd(&self, until: Option<i64>) -> Result<()> {
+        let until = until.filter(|&t| t > now_ms());
+        match until {
+            Some(t) => self.db().set("dnd_until", t.to_string())?,
+            None => self.db().delete("dnd_until")?,
+        }
+        self.state().dnd_until = until;
+        self.send_frame(Frame::Dnd { until });
+        self.changed();
         Ok(())
     }
 
@@ -502,7 +606,7 @@ impl Core {
         if let Some(out) = out {
             let _ = out.send(Frame::Seen { up_to });
         }
-        Ok(())
+        self.start_vanish(&peer.to_string(), up_to)
     }
 
     /// Erases the conversation on this computer; the peer keeps their copy. My messages
@@ -523,6 +627,11 @@ impl Core {
                 .as_ref()
                 .map(|s| s.out.clone())
                 .context("Not connected, so the nudge can't reach them.")?;
+            ensure!(
+                !st.peer_dnd_until.is_some_and(|t| t > now_ms()),
+                "{} has do not disturb on, so nudges are paused.",
+                title_name(st.peer.as_ref().map(|(_, n)| n.clone()))
+            );
             ensure!(
                 !st.nudge_sent.is_some_and(|t| t.elapsed() < NUDGE_EVERY),
                 "You just nudged. Give it a few seconds."
@@ -591,6 +700,7 @@ impl Core {
             db.delete("peer_has")?;
             db.delete("peer_seen")?;
             db.delete("seen")?;
+            db.delete("peer_version")?;
         }
         let session = {
             let mut st = self.state();
@@ -598,6 +708,7 @@ impl Core {
             st.peer_has = 0;
             st.peer_seen = 0;
             st.seen = 0;
+            st.peer_version = None;
             st.session.take()
         };
         if let Some(s) = session {
@@ -725,12 +836,12 @@ impl Core {
         let (send, mut recv) = conn.accept_bi().await?;
         match read_frame(&mut recv).await? {
             Frame::PairRequest { name } => self.answer_pair_request(conn, send, recv, name).await,
-            Frame::Hello { name, have } => {
+            Frame::Hello { name, have, version } => {
                 if self.peer_id() != Some(remote) {
                     conn.close(1u32.into(), b"not paired");
                     return Ok(());
                 }
-                self.run_session(conn, send, recv, Some((name, have))).await
+                self.run_session(conn, send, recv, Some((name, have, version))).await
             }
             other => bail!("unexpected first frame: {other:?}"),
         }
@@ -829,22 +940,24 @@ impl Core {
         conn: Connection,
         mut send: SendStream,
         mut recv: RecvStream,
-        their_hello: Option<(String, u64)>,
+        their_hello: Option<(String, u64, Option<String>)>,
     ) -> Result<()> {
         let peer = self.peer_id().context("not paired")?;
         ensure!(conn.remote_id() == peer, "connection is not from our peer");
         let peer_str = peer.to_string();
 
         let have = self.db().max_seq(&peer_str)?;
-        write_frame(&mut send, &Frame::Hello { name: self.name(), have }).await?;
-        let (their_name, their_have) = match their_hello {
+        let hello = Frame::Hello { name: self.name(), have, version: Some(VERSION.into()) };
+        write_frame(&mut send, &hello).await?;
+        let (their_name, their_have, their_version) = match their_hello {
             Some(hello) => hello,
             None => match read_frame(&mut recv).await? {
-                Frame::Hello { name, have } => (name, have),
+                Frame::Hello { name, have, version } => (name, have, version),
                 other => bail!("expected hello, got {other:?}"),
             },
         };
         self.update_peer_name(&their_name)?;
+        self.set_peer_version(their_version)?;
         self.set_peer_has(their_have, true)?;
 
         // Register the session before reading the backlog, so a message sent in between
@@ -854,9 +967,12 @@ impl Core {
             let mut st = self.state();
             st.next_generation += 1;
             let generation = st.next_generation;
-            let old =
-                st.session.replace(Session { generation, out: out.clone(), conn: conn.clone() });
-            st.peer_away = None; // they say so again if they still are
+            let session =
+                Session { generation, since: now_ms(), out: out.clone(), conn: conn.clone() };
+            let old = st.session.replace(session);
+            // They say so again if they still are.
+            st.peer_away = None;
+            st.peer_dnd_until = None;
             if let Some(old) = old {
                 old.conn.close(0u32.into(), b"replaced");
             }
@@ -869,6 +985,9 @@ impl Core {
         let _ = out.send(Frame::Seen { up_to: self.state().seen });
         if let Some(Away { note }) = self.state().away.clone() {
             let _ = out.send(Frame::Away { note });
+        }
+        if let Some(until) = self.state().dnd_until.filter(|&t| t > now_ms()) {
+            let _ = out.send(Frame::Dnd { until: Some(until) });
         }
         self.changed();
 
@@ -887,6 +1006,7 @@ impl Core {
             if st.session.as_ref().is_some_and(|s| s.generation == generation) {
                 st.session = None;
                 st.peer_away = None;
+                st.peer_dnd_until = None;
             }
         }
         self.changed();
@@ -901,7 +1021,17 @@ impl Core {
     ) -> Result<()> {
         loop {
             match read_frame(recv).await? {
-                Frame::Msg { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of } => {
+                Frame::Msg {
+                    seq,
+                    ts,
+                    hlc,
+                    text,
+                    reply_to,
+                    react_to,
+                    edit_of,
+                    delete_of,
+                    vanish,
+                } => {
                     // A reply to anyone but the two of us becomes a plain message. A
                     // reaction to a stranger's message, or an edit or delete of anyone's
                     // but the sender's own, is stored but never shown.
@@ -910,7 +1040,10 @@ impl Core {
                         (None, Some(of), _) => Kind::Edit { of },
                         (None, None, Some(to)) => Kind::Reaction { to },
                         (None, None, None) => {
-                            Kind::Message { reply_to: reply_to.filter(|to| self.is_ours(to, peer)) }
+                            let reply_to = reply_to.filter(|to| self.is_ours(to, peer));
+                            let vanish =
+                                vanish.map(|v| v.clamp(*VANISH_SECS.start(), *VANISH_SECS.end()));
+                            Kind::Message { reply_to, vanish }
                         }
                     };
                     let limit = if matches!(kind, Kind::Reaction { .. }) {
@@ -944,6 +1077,10 @@ impl Core {
                     self.set_peer_away(Some(Away { note }));
                 }
                 Frame::Back => self.set_peer_away(None),
+                Frame::Dnd { until } => {
+                    self.state().peer_dnd_until = until;
+                    self.changed();
+                }
                 Frame::Hello { name, .. } => self.update_peer_name(&name)?,
                 // From a newer version of the app: skip it rather than drop the session.
                 Frame::Unknown => {}
@@ -1039,6 +1176,15 @@ impl Core {
         }
         self.db().set("peer_seen", up_to.to_string())?;
         self.changed();
+        self.start_vanish(&self.id(), up_to)
+    }
+
+    /// `author`'s vanishing messages up to `up_to` have been seen: start their clocks.
+    fn start_vanish(&self, author: &str, up_to: u64) -> Result<()> {
+        let started = self.db().start_vanish(author, up_to, now_ms())?;
+        for at in started {
+            self.updated(&at)?;
+        }
         Ok(())
     }
 
@@ -1049,6 +1195,35 @@ impl Core {
         let entry = Entry { author: self.id(), seq, ts, hlc: db.next_hlc(ts)?, text, kind };
         db.insert(&entry)?;
         Ok(entry)
+    }
+
+    fn set_peer_version(&self, version: Option<String>) -> Result<()> {
+        if self.state().peer_version == version {
+            return Ok(());
+        }
+        match &version {
+            Some(v) => self.db().set("peer_version", v)?,
+            None => self.db().delete("peer_version")?, // they went back to an older build
+        }
+        self.state().peer_version = version;
+        Ok(())
+    }
+
+    /// Erases vanishing messages as their time runs out.
+    async fn vanish_loop(self: Arc<Self>) {
+        let mut ticks = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            ticks.tick().await;
+            let gone = self.db().expire(now_ms());
+            match gone {
+                Ok(gone) => {
+                    for at in gone {
+                        let _ = self.updated(&at);
+                    }
+                }
+                Err(e) => eprintln!("erasing vanished messages: {e:#}"),
+            }
+        }
     }
 
     /// Sends a live-only frame, if connected.
@@ -1193,14 +1368,20 @@ fn is_lan(addr: &TransportAddr, allow_loopback: bool) -> bool {
 
 fn to_frame(entry: Entry) -> Frame {
     let (mut reply_to, mut react_to, mut edit_of, mut delete_of) = (None, None, None, None);
+    let mut vanish = None;
     match entry.kind {
-        Kind::Message { reply_to: to } => reply_to = to,
+        Kind::Message { reply_to: to, vanish: v } => (reply_to, vanish) = (to, v),
         Kind::Reaction { to } => react_to = Some(to),
         Kind::Edit { of } => edit_of = Some(of),
         Kind::Delete { of } => delete_of = Some(of),
     }
     let (seq, ts, hlc, text) = (entry.seq, entry.ts, Some(entry.hlc), entry.text);
-    Frame::Msg { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of }
+    Frame::Msg { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of, vanish }
+}
+
+/// The peer's name for messages, or a stand-in before they've named themselves.
+fn title_name(name: Option<String>) -> String {
+    name.filter(|n| !n.is_empty()).unwrap_or_else(|| "the other person".into())
 }
 
 fn clean(s: &str, max_chars: usize) -> String {
@@ -1269,6 +1450,20 @@ mod tests {
         assert_eq!(json, r#"{"t":"away","note":"lunch"}"#);
         let json = serde_json::to_string(&Frame::Back).unwrap();
         assert_eq!(json, r#"{"t":"back"}"#);
+        let json = serde_json::to_string(&Frame::Dnd { until: Some(5) }).unwrap();
+        assert_eq!(json, r#"{"t":"dnd","until":5}"#);
+        let hello = Frame::Hello { name: "a".into(), have: 1, version: Some("0.6.0".into()) };
+        let json = serde_json::to_string(&hello).unwrap();
+        assert_eq!(json, r#"{"t":"hello","name":"a","have":1,"version":"0.6.0"}"#);
+        // A Hello from before 0.6 has no version.
+        let old = parse(r#"{"t":"hello","name":"a","have":1}"#);
+        assert!(matches!(old, Frame::Hello { version: None, .. }));
+        let vanishing = Entry {
+            kind: Kind::Message { reply_to: None, vanish: Some(60) },
+            ..Entry::message("me", 9, 1, "psst")
+        };
+        let json = serde_json::to_string(&to_frame(vanishing)).unwrap();
+        assert_eq!(json, r#"{"t":"msg","seq":9,"ts":1,"hlc":1,"text":"psst","vanish":60}"#);
         // A plain message has the fields from before 0.4, plus `hlc` from 0.5.
         let plain = to_frame(Entry::message("me", 7, 1, "hi"));
         let json = serde_json::to_string(&plain).unwrap();
