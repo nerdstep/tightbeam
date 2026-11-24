@@ -1,7 +1,7 @@
 //! Two real Tightbeam cores on this machine, found via mDNS and talking over QUIC.
 //! Covers pairing, live messages, delivery acks, seen receipts, catching up after one
-//! side was off, replies and reactions, edits and deletes, typing, nudges, and clearing
-//! one side's history.
+//! side was off, replies and reactions, edits and deletes, typing, nudges, away and back,
+//! and clearing one side's history.
 
 use std::{
     path::PathBuf,
@@ -13,7 +13,7 @@ use std::{
 };
 
 use tightbeam_lib::{
-    chat::{Core, Emit, Event},
+    chat::{Away, Core, Emit, Event},
     db::Ref,
 };
 
@@ -190,6 +190,14 @@ async fn pair_chat_and_catch_up() {
     wait_for("bob gets the nudge", 10, || nudges.load(Ordering::SeqCst) == 1).await;
     assert!(alice.nudge().is_err(), "nudges are rate-limited");
 
+    // Bob goes away with a note. Using the computer doesn't end it; his next message does.
+    bob.set_away("  lunch\n  break ");
+    let lunch = Some(Away { note: Some("lunch break".into()) });
+    wait_for("alice sees bob away", 10, || alice.status().peer_away == lunch).await;
+    assert_eq!(bob.status().away, lunch);
+    bob.set_idle(false);
+    assert_eq!(bob.status().away, lunch, "still away by hand");
+
     // Bob clears his copy. Alice keeps hers, and numbering carries on.
     let b = bob.clone();
     like_tauri(move || b.clear_history()).unwrap();
@@ -199,6 +207,15 @@ async fn pair_chat_and_catch_up() {
     wait_for("alice gets it", 10, || texts(&alice).contains(&"fresh start".into())).await;
     assert_eq!(texts(&alice).len(), 6);
     assert_eq!(texts(&bob), ["fresh start"]);
+    wait_for("bob's message brings him back", 10, || alice.status().peer_away.is_none()).await;
+
+    // Idle: away without a note, until input resumes. Bob's own screen doesn't show it.
+    bob.set_idle(true);
+    let idle = Some(Away { note: None });
+    wait_for("alice sees bob idle", 10, || alice.status().peer_away == idle).await;
+    assert_eq!(bob.status().away, None);
+    bob.set_idle(false);
+    wait_for("alice sees bob back", 10, || alice.status().peer_away.is_none()).await;
 
     alice.shutdown().await;
     bob.shutdown().await;

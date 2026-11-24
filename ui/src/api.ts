@@ -30,6 +30,15 @@ export interface Status {
   nearby: Person[]
   pairing: PairPrompt | null
   notice: string | null
+  /** Set when I went away with `/away`. Away from being idle isn't shown to me. */
+  away: Away | null
+  /** The peer is away. Only while connected. */
+  peer_away: Away | null
+}
+
+export interface Away {
+  /** What they said with `/away`, if anything. */
+  note: string | null
 }
 
 /** A message, by author and sequence number. */
@@ -114,6 +123,10 @@ export const api = {
   editMessage: (of: Ref, text: string) => invoke<void>('edit_message', { of, text }),
   /** Deletes one of my messages, for both people. */
   deleteMessage: (of: Ref) => invoke<void>('delete_message', { of }),
+  /** `/away`: away until `/back` or my next message. `note` may be empty. */
+  setAway: (note: string) => invoke<void>('set_away', { note }),
+  /** `/back`. */
+  back: () => invoke<void>('back'),
   /** Tells the peer I'm typing. Call every few seconds while typing. */
   typing: () => invoke<void>('typing'),
   /** Erases the conversation on this computer. Undelivered messages of mine stay. */

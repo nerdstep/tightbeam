@@ -70,30 +70,37 @@ export function Chat() {
 }
 
 function Header() {
-  const { name, connected, typing } = useSelector(
+  const { name, connected, typing, away } = useSelector(
     store,
     (s) => ({
       name: s.status?.peer?.name ?? '',
       connected: !!s.status?.connected,
       typing: s.peerTyping,
+      // A string so the header only re-renders when it changes: '' is away without a note.
+      away: s.status?.peer_away ? (s.status.peer_away.note ?? '') : null,
     }),
     { compare: shallow },
   )
   const [unpairing, setUnpairing] = useState(false)
+  const dot = !connected ? 'bg-muted-foreground' : away === null ? 'bg-success' : 'bg-warning'
 
   return (
     <header className="flex items-center justify-between gap-3 border-b bg-card px-4 py-3">
-      <div>
+      <div className="min-w-0">
         <h1 className="font-semibold">{name || 'Your peer'}</h1>
         <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
           <span
-            className={`size-1.75 rounded-full ${connected ? 'bg-success' : 'bg-muted-foreground'} ${typing ? 'motion-safe:animate-pulse' : ''}`}
+            className={`size-1.75 shrink-0 rounded-full ${dot} ${typing ? 'motion-safe:animate-pulse' : ''}`}
           />
-          {typing
-            ? 'Typing…'
-            : connected
-              ? 'Connected'
-              : 'Not connected · messages send when you’re both online'}
+          <span className="truncate">
+            {typing
+              ? 'Typing…'
+              : connected
+                ? away === null
+                  ? 'Connected'
+                  : `Away${away && ` · ${away}`}`
+                : 'Not connected · messages send when you’re both online'}
+          </span>
         </span>
       </div>
       <SettingsMenu onUnpair={() => setUnpairing(true)} />
@@ -555,13 +562,14 @@ function Composer() {
   const textRef = useRef<HTMLTextAreaElement>(null)
   const typingSentRef = useRef(0)
   const { scrollToEnd } = useMessageScroller()
-  const { replyingTo, editing, peerName, myId } = useSelector(
+  const { replyingTo, editing, peerName, myId, away } = useSelector(
     store,
     (s) => ({
       replyingTo: s.replyingTo,
       editing: s.editing,
       peerName: s.status?.peer?.name || 'them',
       myId: s.status?.me.id ?? '',
+      away: s.status?.away ? (s.status.away.note ?? '') : null,
     }),
     { compare: shallow },
   )
@@ -615,9 +623,9 @@ function Composer() {
     if (!autoSizes && textRef.current) textRef.current.style.height = ''
   }
 
-  const perform = (command: Command) => {
+  const perform = (command: Command, args = '') => {
     reset()
-    void command.action({ confirmClear: () => setClearing(true) })
+    void command.action({ confirmClear: () => setClearing(true) }, args)
   }
 
   const saveEdit = async (of: ChatMessage) => {
@@ -636,7 +644,7 @@ function Composer() {
     if (editing) return saveEdit(editing)
     const parsed = parse(text)
     if (parsed.kind === 'command') {
-      if (parsed.command) perform(parsed.command)
+      if (parsed.command) perform(parsed.command, parsed.args)
       else setHint(`There's no /${parsed.name} command. To send it as a message, start with //.`)
       return
     }
@@ -670,7 +678,7 @@ function Composer() {
       }
       if (e.key === 'Tab') {
         e.preventDefault()
-        setText(`/${highlighted.name}`)
+        setText(`/${highlighted.name}${highlighted.args ? ' ' : ''}`)
         return
       }
       if (e.key === 'Escape') {
@@ -725,6 +733,19 @@ function Composer() {
         <p className="absolute right-4 bottom-full left-4 mb-2 rounded-lg border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-md">
           {hint}
         </p>
+      )}
+      {away !== null && (
+        <div className="mb-2 flex items-center gap-2 rounded-md border-l-2 border-warning bg-muted py-1 pr-1 pl-2 text-xs">
+          <div className="min-w-0 flex-1">
+            <div className="truncate font-medium">You’re away{away && `: ${away}`}</div>
+            <div className="truncate text-muted-foreground">
+              Until you send a message or type /back
+            </div>
+          </div>
+          <Button type="button" variant="ghost" size="xs" onClick={() => void run(api.back())}>
+            I’m back
+          </Button>
+        </div>
       )}
       {replyingTo && (
         <div className="mb-2 flex items-center gap-2 rounded-md border-l-2 border-primary bg-muted py-1 pr-1 pl-2 text-xs">
@@ -799,7 +820,7 @@ function CommandList({
   onPick: (command: Command) => void
 }) {
   return (
-    <ul className="absolute bottom-full left-4 mb-2 w-80 max-w-[calc(100%-2rem)] rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
+    <ul className="absolute bottom-full left-4 mb-2 w-md max-w-[calc(100%-2rem)] rounded-lg border bg-popover p-1 text-popover-foreground shadow-md">
       {commands.map((c) => (
         <li key={c.name}>
           <button
@@ -810,7 +831,10 @@ function CommandList({
             onMouseEnter={() => onHighlight(c)}
             onClick={() => onPick(c)}
           >
-            <span className="font-mono">/{c.name}</span>
+            <span className="shrink-0 font-mono whitespace-nowrap">
+              /{c.name}
+              {c.args && <span className="text-muted-foreground"> {c.args}</span>}
+            </span>
             <span className="text-xs text-muted-foreground">{c.description}</span>
           </button>
         </li>

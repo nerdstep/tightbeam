@@ -5,6 +5,7 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 ## Unreleased
 
 - Messages stay in the order they were written when the two computers' clocks disagree. Before, a reply could appear above the message it answered if the replier's clock was behind. Messages from older versions are still ordered by their clock.
+- Away status. After 10 minutes without keyboard or mouse input on your computer, the other person sees you as "Away" until you're back. Type `/away` to set it yourself, with an optional note like `/away lunch`; it lasts until `/back` or your next message. Older versions don't show it.
 
 ## 0.4.0 — 2026-11-23
 

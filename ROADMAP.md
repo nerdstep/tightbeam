@@ -41,10 +41,11 @@ New frame types or message kinds. The per-author append-only log stays as it is:
 - [x] **Slash commands.** Typing `/` at the start of the message box opens a filtered list of commands. Tab completes, an unknown command shows a hint instead of sending, and `//` sends a literal slash. Commands come from a small registry in `ui/src/commands.ts`. So far:
   - `/clear`: erases this computer's copy of the conversation. The peer's copy is untouched, nothing goes over the wire, and sequence numbers carry on (a `cleared` table remembers the highest one erased per author), so sync never asks for the erased messages again.
   - `/nudge`: a `Nudge` frame, live only. A shake and a sound in an open window, a taskbar flash or Dock bounce behind other windows, a notification from the tray. At most one every 3 seconds each way.
+  - `/away [note]` and `/back`: see the away status below.
 - [ ] **More commands:**
   - `/me waves`: shown as an action line instead of a bubble. Older builds show the raw text.
   - `/shrug` and friends: they only insert text.
-  - Later: `/away` and `/back` (see the away status below), then `/search` and `/edit` once those exist.
+  - Later: `/search` once search exists.
 - [ ] **Search** with SQLite FTS5 over the message text.
 - [x] **Stable ordering.** Messages used to be sorted by each author's wall clock, so clock skew could misorder them. Each entry now carries `hlc`, a hybrid logical clock: the author's wall clock, or one past the highest `hlc` stored on their side, whichever is later. Anything written after seeing a message sorts after it. `ts` is still the time shown. Entries from peers before 0.5 use `ts`, and `/clear` keeps the clock from running backwards.
 
@@ -65,5 +66,5 @@ New frame types or message kinds. The per-author append-only log stays as it is:
 
 - [ ] **More than one device per person** (for example a laptop plus a desktop, and eventually phones via Tauri mobile). This is the biggest architectural change: each person's log has to sync across their own devices, and pairing becomes per person rather than per device.
 - [ ] Voice notes.
-- [ ] An away status after a period of inactivity.
+- [x] **Away status.** `Away { note }` and `Back` frames, live only, sent on change and at the start of each session. After 10 minutes without input anywhere on the computer (`GetLastInputInfo` on Windows, `CGEventSourceSecondsSinceLastEventType` on macOS, checked every 5 seconds), you're away until input resumes. `/away [note]` sets it by hand, and it lasts until `/back` or your next message. The header shows the other person as "Away", with the note if there is one.
 - [ ] Per-person colors or themes.

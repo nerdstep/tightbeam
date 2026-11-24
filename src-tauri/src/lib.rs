@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod db;
 mod desktop;
+mod idle;
 mod updates;
 
 use std::{path::PathBuf, sync::Arc};
@@ -74,6 +75,18 @@ fn edit_message(core: CoreState, of: Ref, text: String) -> Result<(), String> {
 #[tauri::command]
 fn delete_message(core: CoreState, of: Ref) -> Result<(), String> {
     core.delete(of).map_err(err)
+}
+
+/// `/away`, with an optional note.
+#[tauri::command]
+fn set_away(core: CoreState, note: String) {
+    core.set_away(&note);
+}
+
+/// `/back`.
+#[tauri::command]
+fn back(core: CoreState) {
+    core.back();
 }
 
 #[tauri::command]
@@ -232,6 +245,7 @@ pub fn run() {
             let notifications = core.pref("notifications")?.as_deref() != Some("0");
             app.state::<Desktop>().set_notifications(notifications);
             app.manage(Updates::new(core.pref("updates")?.as_deref() != Some("0")));
+            idle::watch(core.clone());
             app.manage(core);
             updates::start(app.handle());
 
@@ -262,6 +276,8 @@ pub fn run() {
             edit_message,
             delete_message,
             typing,
+            set_away,
+            back,
             clear_history,
             nudge,
             pair_with,

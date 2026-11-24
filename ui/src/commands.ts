@@ -12,8 +12,11 @@ export interface CommandContext {
 
 export interface Command {
   name: string
+  /** Shown after the name in the list, like `[note]`. */
+  args?: string
   description: string
-  action: (ctx: CommandContext) => void | Promise<void>
+  /** `args` is whatever follows the name, trimmed. */
+  action: (ctx: CommandContext, args: string) => void | Promise<void>
 }
 
 export const commands: Command[] = [
@@ -21,6 +24,17 @@ export const commands: Command[] = [
     name: 'clear',
     description: 'Erase this conversation on this computer',
     action: (ctx) => ctx.confirmClear(),
+  },
+  {
+    name: 'away',
+    args: '[note]',
+    description: 'Show as away until /back or your next message',
+    action: (_, note) => void run(api.setAway(note)),
+  },
+  {
+    name: 'back',
+    description: 'Stop showing as away',
+    action: () => void run(api.back()),
   },
   {
     name: 'nudge',
@@ -34,7 +48,7 @@ export const commands: Command[] = [
 export type Parsed =
   | { kind: 'text'; text: string }
   /** `command` is undefined when no command has that name. */
-  | { kind: 'command'; name: string; command: Command | undefined }
+  | { kind: 'command'; name: string; args: string; command: Command | undefined }
 
 /**
  * Reads the message box. A command is a slash and a word at the very start, like
@@ -46,7 +60,8 @@ export function parse(text: string): Parsed {
   const match = /^\/([a-z]+)(?:\s|$)/i.exec(value)
   if (!match) return { kind: 'text', text: value }
   const name = match[1].toLowerCase()
-  return { kind: 'command', name, command: commands.find((c) => c.name === name) }
+  const args = value.slice(match[0].length).trim()
+  return { kind: 'command', name, args, command: commands.find((c) => c.name === name) }
 }
 
 /** The commands to suggest while a command's name is being typed: `/`, `/nu`, … */

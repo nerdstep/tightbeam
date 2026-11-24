@@ -46,6 +46,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
 /// At most one nudge this often, each way.
 const NUDGE_EVERY: Duration = Duration::from_secs(3);
+/// An away note is a few words, like "lunch" or "back at 3".
+const MAX_NOTE_CHARS: usize = 100;
 
 /// Compatibility rules, since the two peers often run different builds:
 /// - New frame types are fine: older peers read them as `Unknown` and skip them.
@@ -105,6 +107,15 @@ enum Frame {
     /// The sender is typing. Live only, repeated every few seconds while they type; the
     /// receiver lets it lapse after a few seconds without one. Added in 0.4.
     Typing,
+    /// The sender is away: idle for a while, or by `/away`, with an optional note. Sent
+    /// when it starts and at the start of each session; lasts until `Back` or the
+    /// session ends. Added in 0.5.
+    Away {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// The sender is no longer away. Added in 0.5.
+    Back,
     /// A frame type from a newer version. Never sent.
     #[serde(other, skip_serializing)]
     Unknown,
@@ -123,6 +134,17 @@ pub struct Status {
     pub nearby: Vec<Person>,
     pub pairing: Option<PairPrompt>,
     pub notice: Option<String>,
+    /// Set when I went away with `/away`. Away from being idle isn't shown: by the time I
+    /// could see it, I'm back.
+    pub away: Option<Away>,
+    /// The peer is away. Only while connected.
+    pub peer_away: Option<Away>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct Away {
+    /// What they said with `/away`, if anything.
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -184,6 +206,10 @@ struct State {
     notice: Option<String>,
     nudge_sent: Option<Instant>,
     nudge_received: Option<Instant>,
+    away: Option<Away>,
+    /// `away` came from `/away`, so it lasts until `/back` or a message, not until input.
+    away_by_hand: bool,
+    peer_away: Option<Away>,
 }
 
 pub struct Core {
@@ -272,6 +298,9 @@ impl Core {
                 notice: None,
                 nudge_sent: None,
                 nudge_received: None,
+                away: None,
+                away_by_hand: false,
+                peer_away: None,
             }),
             emit,
             tasks: Mutex::new(Vec::new()),
@@ -319,6 +348,8 @@ impl Core {
                 .collect(),
             pairing: st.pairing.as_ref().map(|p| p.prompt.clone()),
             notice: st.notice.clone(),
+            away: st.away.clone().filter(|_| st.away_by_hand),
+            peer_away: st.peer_away.clone(),
         }
     }
 
@@ -364,6 +395,7 @@ impl Core {
         let msg = self.db().message(&at)?.context("message vanished")?;
         (self.emit)(Event::Message(msg.clone()));
         self.send_live(entry);
+        self.back(); // writing a message means I'm here
         Ok(msg)
     }
 
@@ -405,8 +437,39 @@ impl Core {
 
     /// I'm typing. The UI calls this every few seconds while I type.
     pub fn typing(&self) {
-        if let Some(s) = &self.state().session {
-            let _ = s.out.send(Frame::Typing);
+        self.send_frame(Frame::Typing);
+    }
+
+    /// `/away`: away until `back`, or until I send a message. `note` says why, if anything.
+    pub fn set_away(&self, note: &str) {
+        let note = clean(&note.split_whitespace().collect::<Vec<_>>().join(" "), MAX_NOTE_CHARS);
+        self.go_away(Away { note: Some(note).filter(|n| !n.is_empty()) }, true);
+    }
+
+    /// No longer away, whether that was from `/away` or from being idle.
+    pub fn back(&self) {
+        let was = {
+            let mut st = self.state();
+            st.away_by_hand = false;
+            st.away.take()
+        };
+        if was.is_some() {
+            self.send_frame(Frame::Back);
+            self.changed();
+        }
+    }
+
+    /// Whether the computer has gone unused for a while. Being idle makes me away, and
+    /// input brings me back, except while I'm away by `/away`.
+    pub fn set_idle(&self, idle: bool) {
+        let (away, by_hand) = {
+            let st = self.state();
+            (st.away.is_some(), st.away_by_hand)
+        };
+        if idle && !away {
+            self.go_away(Away::default(), false);
+        } else if !idle && away && !by_hand {
+            self.back();
         }
     }
 
@@ -781,6 +844,7 @@ impl Core {
             let generation = st.next_generation;
             let old =
                 st.session.replace(Session { generation, out: out.clone(), conn: conn.clone() });
+            st.peer_away = None; // they say so again if they still are
             if let Some(old) = old {
                 old.conn.close(0u32.into(), b"replaced");
             }
@@ -791,6 +855,9 @@ impl Core {
         }
         // Covers anything seen while we were apart.
         let _ = out.send(Frame::Seen { up_to: self.state().seen });
+        if let Some(Away { note }) = self.state().away.clone() {
+            let _ = out.send(Frame::Away { note });
+        }
         self.changed();
 
         let writer = tokio::spawn(async move {
@@ -807,6 +874,7 @@ impl Core {
             let mut st = self.state();
             if st.session.as_ref().is_some_and(|s| s.generation == generation) {
                 st.session = None;
+                st.peer_away = None;
             }
         }
         self.changed();
@@ -859,6 +927,11 @@ impl Core {
                 Frame::Ack { have } => self.set_peer_has(have, false)?,
                 Frame::Seen { up_to } => self.set_peer_seen(up_to)?,
                 Frame::Nudge => self.nudged(),
+                Frame::Away { note } => {
+                    let note = note.map(|n| clean(&n, MAX_NOTE_CHARS)).filter(|n| !n.is_empty());
+                    self.set_peer_away(Some(Away { note }));
+                }
+                Frame::Back => self.set_peer_away(None),
                 Frame::Hello { name, .. } => self.update_peer_name(&name)?,
                 // From a newer version of the app: skip it rather than drop the session.
                 Frame::Unknown => {}
@@ -964,6 +1037,38 @@ impl Core {
         let entry = Entry { author: self.id(), seq, ts, hlc: db.next_hlc(ts)?, text, kind };
         db.insert(&entry)?;
         Ok(entry)
+    }
+
+    /// Sends a live-only frame, if connected.
+    fn send_frame(&self, frame: Frame) {
+        if let Some(s) = &self.state().session {
+            let _ = s.out.send(frame);
+        }
+    }
+
+    fn go_away(&self, away: Away, by_hand: bool) {
+        {
+            let mut st = self.state();
+            if st.away.as_ref() == Some(&away) && st.away_by_hand == by_hand {
+                return;
+            }
+            st.away = Some(away.clone());
+            st.away_by_hand = by_hand;
+        }
+        self.send_frame(Frame::Away { note: away.note });
+        self.changed();
+    }
+
+    fn set_peer_away(&self, away: Option<Away>) {
+        let changed = {
+            let mut st = self.state();
+            let changed = st.peer_away != away;
+            st.peer_away = away;
+            changed
+        };
+        if changed {
+            self.changed();
+        }
     }
 
     /// Sends one of my entries now, if connected. Otherwise it goes with the catch-up.
@@ -1121,7 +1226,7 @@ mod tests {
 
     #[test]
     fn unknown_frame_types_parse_as_unknown() {
-        assert!(matches!(parse(r#"{"t":"away"}"#), Frame::Unknown));
+        assert!(matches!(parse(r#"{"t":"pin"}"#), Frame::Unknown));
         assert!(matches!(
             parse(r#"{"t":"reaction","target":{"author":"x","seq":3},"emoji":"+1"}"#),
             Frame::Unknown
@@ -1146,6 +1251,12 @@ mod tests {
         assert_eq!(json, r#"{"t":"seen","up_to":4}"#);
         let json = serde_json::to_string(&Frame::Nudge).unwrap();
         assert_eq!(json, r#"{"t":"nudge"}"#);
+        let json = serde_json::to_string(&Frame::Away { note: None }).unwrap();
+        assert_eq!(json, r#"{"t":"away"}"#);
+        let json = serde_json::to_string(&Frame::Away { note: Some("lunch".into()) }).unwrap();
+        assert_eq!(json, r#"{"t":"away","note":"lunch"}"#);
+        let json = serde_json::to_string(&Frame::Back).unwrap();
+        assert_eq!(json, r#"{"t":"back"}"#);
         // A plain message has the fields from before 0.4, plus `hlc` from 0.5.
         let plain = to_frame(Entry::message("me", 7, 1, "hi"));
         let json = serde_json::to_string(&plain).unwrap();
