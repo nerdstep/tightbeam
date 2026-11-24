@@ -4,6 +4,8 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+## 0.5.0 — 2026-11-24
+
 - Messages stay in the order they were written when the two computers' clocks disagree. Before, a reply could appear above the message it answered if the replier's clock was behind. Messages from older versions are still ordered by their clock.
 - Away status. After 10 minutes without keyboard or mouse input on your computer, the other person sees you as "Away" until you're back. Type `/away` to set it yourself, with an optional note like `/away lunch`; it lasts until `/back` or your next message. Older versions don't show it.
 - Search. Click the magnifier in the header, press Ctrl+F (Cmd+F on macOS), or type `/search` and some words. Matches are listed newest first with the words highlighted; pick one to jump to it. Edited messages are found by their new text, and deleted ones aren't found.
