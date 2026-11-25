@@ -4,18 +4,11 @@
 
 import { createStore } from '@tanstack/react-store'
 
-import {
-  api,
-  type Attachment,
-  type Cursor,
-  type Hit,
-  type Message,
-  type Ref,
-  type Status,
-  type UpdateReady,
-} from './api'
+import { api, type Attachment, type Hit, type Message, type Status, type UpdateReady } from './api'
 import { chime } from './lib/chime'
 import { formatBytes, isPicture, MAX_FILE_BYTES, type Staged, stage, unstage } from './lib/files'
+import * as transcript from './transcript'
+import { messageKey, type Transcript } from './transcript'
 
 const PAGE_SIZE = 200
 /** Search once typing pauses this long. */
@@ -33,10 +26,8 @@ export interface Search {
 
 interface State {
   status: Status | null
-  /** The loaded window of history, oldest first, in display order. */
-  messages: Message[]
-  /** Whether older messages exist that aren't loaded yet. */
-  hasOlder: boolean
+  /** The messages shown, as far back as they're loaded. */
+  transcript: Transcript
   loadingOlder: boolean
   /** A UI-side error (a failed command), shown in place of the engine's notice. */
   error: string | null
@@ -66,8 +57,7 @@ interface State {
 
 export const store = createStore<State>({
   status: null,
-  messages: [],
-  hasOlder: false,
+  transcript: transcript.empty,
   loadingOlder: false,
   error: null,
   update: null,
@@ -86,63 +76,31 @@ export const store = createStore<State>({
 /** How long "typing…" lasts without another signal. The sender repeats it more often. */
 const TYPING_LAPSE_MS = 4000
 
-export const messageKey = (m: Ref) => `${m.author}:${m.seq}`
-const loaded = new Set<string>()
-
-/** Display order, matching the SQL `ORDER BY hlc, author, seq`. */
-function compare(a: Message, b: Message) {
-  if (a.hlc !== b.hlc) return a.hlc - b.hlc
-  if (a.author !== b.author) return a.author < b.author ? -1 : 1
-  return a.seq - b.seq
-}
-
-/** Adds a live message in display order. Usually it's the newest, so search from the end. */
+/** Shows a live message (see `transcript.add`). */
 export function addMessage(m: Message) {
-  const key = messageKey(m)
-  if (loaded.has(key)) return
-  const { messages, hasOlder } = store.state
-  // Older than everything loaded while older pages remain: it will show when paged in.
-  if (hasOlder && messages.length > 0 && compare(m, messages[0]) < 0) return
-  loaded.add(key)
-  let at = messages.length
-  while (at > 0 && compare(messages[at - 1], m) > 0) at--
-  store.setState((s) => ({ ...s, messages: [...messages.slice(0, at), m, ...messages.slice(at)] }))
+  const next = transcript.add(store.state.transcript, m)
+  if (next !== store.state.transcript) store.setState((s) => ({ ...s, transcript: next }))
 }
 
-/**
- * A message changed (reactions, an edit, a delete): swap in the new version, and update
- * replies that quote it. Messages that aren't loaded are current when paged in.
- */
+/** A message changed (reactions, an edit, a delete). */
 function updateMessage(updated: Message) {
   const key = messageKey(updated)
-  const quote = {
-    text: updated.deleted ? null : updated.text,
-    deleted: updated.deleted,
-    file: updated.file,
-  }
   store.setState((s) => ({
     ...s,
-    messages: s.messages.map((m) => {
-      if (messageKey(m) === key) return updated
-      if (m.reply_to && messageKey(m.reply_to) === key) {
-        return { ...m, reply_to: { ...m.reply_to, ...quote } }
-      }
-      return m
-    }),
+    transcript: transcript.update(s.transcript, updated),
     // Don't keep replying to, or editing, a message that's gone.
     replyingTo:
       updated.deleted && s.replyingTo && messageKey(s.replyingTo) === key ? null : s.replyingTo,
     editing: updated.deleted && s.editing && messageKey(s.editing) === key ? null : s.editing,
     // Nor keep showing a picture that was deleted.
     viewing:
-      updated.deleted && s.viewing && fileOf(s.messages, key)?.hash === s.viewing.hash
+      updated.deleted &&
+      s.viewing &&
+      transcript.find(s.transcript, updated)?.file?.hash === s.viewing.hash
         ? null
         : s.viewing,
   }))
 }
-
-const fileOf = (messages: Message[], key: string) =>
-  messages.find((m) => messageKey(m) === key)?.file
 
 /**
  * Adds pictures to the message box, to go with the next message. Anything else, or
@@ -202,8 +160,6 @@ export function setDeleting(deleting: Message | null) {
   store.setState((s) => ({ ...s, deleting }))
 }
 
-const cursorOf = (m: Message): Cursor => ({ hlc: m.hlc, author: m.author, seq: m.seq })
-
 let searchTimer: ReturnType<typeof setTimeout> | undefined
 let searchRun = 0
 /** What was searched for last, offered again when search reopens. */
@@ -246,32 +202,25 @@ let jumps = 0
 
 /** Scrolls the transcript to a message, loading the history back to it first if needed. */
 export async function reveal(m: Message) {
-  const key = messageKey(m)
-  const oldest = store.state.messages[0]
-  if (!loaded.has(key) && oldest) {
-    const gap = await run(api.getMessagesBetween(cursorOf(m), cursorOf(oldest)))
-    const missing = (gap ?? []).filter((g) => !loaded.has(messageKey(g)))
-    for (const g of missing) loaded.add(messageKey(g))
-    // Sorted, in case a page of older messages arrived meanwhile.
-    // oxlint-disable-next-line unicorn/no-array-sort -- a fresh array; toSorted needs ES2023
-    store.setState((s) => ({ ...s, messages: [...missing, ...s.messages].sort(compare) }))
+  const gap = transcript.gapTo(store.state.transcript, transcript.cursorOf(m))
+  if (gap) {
+    const missing = await run(api.getMessagesBetween(gap.from, gap.before))
+    // Against the latest transcript, in case a page of older messages arrived meanwhile.
+    store.setState((s) => ({ ...s, transcript: transcript.fill(s.transcript, missing ?? []) }))
   }
-  store.setState((s) => ({ ...s, jump: { key, n: ++jumps } }))
+  store.setState((s) => ({ ...s, jump: { key: messageKey(m), n: ++jumps } }))
 }
 
 /** Loads the page before the oldest loaded message. Safe to call repeatedly. */
 export async function loadOlder() {
-  const { messages, hasOlder, loadingOlder } = store.state
-  if (!hasOlder || loadingOlder) return
+  const { transcript: shown, loadingOlder } = store.state
+  const oldest = shown.messages[0]
+  if (!shown.hasOlder || !oldest || loadingOlder) return
   store.setState((s) => ({ ...s, loadingOlder: true }))
-  const oldest = messages[0]
-  const page = await run(api.getMessages(cursorOf(oldest), PAGE_SIZE))
-  const older = (page?.messages ?? []).filter((m) => !loaded.has(messageKey(m)))
-  for (const m of older) loaded.add(messageKey(m))
+  const page = await run(api.getMessages(transcript.cursorOf(oldest), PAGE_SIZE))
   store.setState((s) => ({
     ...s,
-    messages: [...older, ...s.messages],
-    hasOlder: page ? page.has_more : s.hasOlder,
+    transcript: page ? transcript.prepend(s.transcript, page) : s.transcript,
     loadingOlder: false,
   }))
 }
@@ -303,12 +252,9 @@ export async function clearHistory() {
   closeSearch() // its matches are gone
   const page = await run(api.getMessages(undefined, PAGE_SIZE))
   if (!page) return
-  loaded.clear()
-  for (const m of page.messages) loaded.add(messageKey(m))
   store.setState((s) => ({
     ...s,
-    messages: page.messages,
-    hasOlder: page.has_more,
+    transcript: transcript.fromPage(page),
     replyingTo: null,
     editing: null,
   }))
@@ -351,13 +297,6 @@ export async function start() {
   setUpdate(await api.getUpdate())
   const status = await api.getStatus()
   const page = await api.getMessages(undefined, PAGE_SIZE)
-  const fresh = page.messages.filter((m) => !loaded.has(messageKey(m)))
-  for (const m of fresh) loaded.add(messageKey(m))
-  store.setState((s) => ({
-    ...s,
-    status,
-    // Anything that arrived live while loading is newer; keep it after the page.
-    messages: [...fresh, ...s.messages],
-    hasOlder: page.has_more,
-  }))
+  // Anything that arrived live while loading is newer, and stays after the page.
+  store.setState((s) => ({ ...s, status, transcript: transcript.prepend(s.transcript, page) }))
 }
