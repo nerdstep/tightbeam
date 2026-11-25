@@ -94,6 +94,8 @@ export interface FileInfo {
 /** A message's file on this computer: still to come, here, or gone from the sender. */
 export interface Attachment extends FileInfo {
   state: 'pending' | 'done' | 'gone'
+  /** It may open in its default app; if not, it can only be shown in its folder. */
+  openable: boolean
 }
 
 /** A file from disk, staged in Rust to be sent by path. */

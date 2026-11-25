@@ -14,9 +14,6 @@ import { run, setViewing, store, unstageFile } from '@/store'
 /** Largest a picture shows in the transcript. */
 const PICTURE_MAX = { width: 260, height: 300 }
 
-/** Kinds of file that open in their default app (the same list as Rust's). */
-const OPENABLE = /\.(jpe?g|png|gif|webp|avif|bmp|heic|heif|tiff?)$/i
-
 const onMac = navigator.userAgent.includes('Mac')
 const SHOW_IN_FOLDER = onMac ? 'Show in Finder' : 'Show in folder'
 const SAVE_A_COPY = 'Save a copy…'
@@ -101,7 +98,7 @@ function FileCard({ file, peer }: { file: Attachment; peer: string }) {
           <TransferNote file={file} peer={peer} />
         </div>
       </div>
-      {done && OPENABLE.test(file.name) && (
+      {done && file.openable && (
         <Button
           variant="ghost"
           size="icon-sm"
@@ -187,7 +184,7 @@ export function Viewer() {
                 <span className="w-full truncate text-center">
                   {viewing.name} · {formatBytes(viewing.size)}
                 </span>
-                {OPENABLE.test(viewing.name) && (
+                {viewing.openable && (
                   <Button
                     variant="secondary"
                     size="sm"

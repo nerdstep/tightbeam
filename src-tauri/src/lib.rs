@@ -259,18 +259,14 @@ fn uncached(status: StatusCode, mime: &str, body: Vec<u8>) -> Response<Vec<u8>> 
         .unwrap_or_default()
 }
 
-/// Kinds of file that open in their default app. Anything else, like a program, can only
-/// be shown in its folder.
-const OPENABLE: &[&str] =
-    &["jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "heic", "heif", "tif", "tiff"];
-
-/// Opens a received or sent picture in its default app.
+/// Opens a received or sent file in its default app, if it's a kind that may open
+/// (`files::may_open`).
 #[tauri::command]
 fn open_file(app: tauri::AppHandle, core: CoreState, hash: String) -> Result<(), String> {
     let (path, _) = core.file(&hash).map_err(err)?.ok_or(MISSING)?;
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_lowercase();
-    if !OPENABLE.contains(&ext.as_str()) {
-        return Err("Only pictures can be opened from here. Use Show in folder.".into());
+    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    if !files::may_open(&name) {
+        return Err("That kind of file can't be opened from here. Use Show in folder.".into());
     }
     app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(err)
 }
