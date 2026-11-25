@@ -21,16 +21,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use std::{borrow::Cow, net::IpAddr};
-
-use iroh::{
-    Endpoint, EndpointId, SecretKey, TransportAddr,
-    address_lookup::AddrFilter,
-    endpoint::{Connection, Incoming, PortmapperConfig, RecvStream, SendStream, presets},
-    endpoint_info::UserData,
-};
-use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
-use n0_future::StreamExt;
+use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
@@ -45,11 +36,9 @@ use crate::{
         Entry, FileInfo, Kind, MAX_EMOJI_CHARS, MAX_FILE_BYTES, MAX_TEXT_CHARS, Ref, VANISH_SECS,
         Wire, checked_file, clean, is_hash,
     },
+    net::{Accepting, Conn, Discoveries, Discovery, Network, RecvStream, SendStream},
 };
 
-pub const ALPN: &[u8] = b"tightbeam/1";
-/// mDNS service name, so we only see other Tightbeam apps (`_tightbeam._udp.local`).
-const SERVICE: &str = "tightbeam";
 const MAX_FRAME: usize = 64 * 1024;
 const MAX_NAME_CHARS: usize = 40;
 const PAIR_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -254,7 +243,7 @@ struct Session {
     generation: u64,
     since: i64,
     out: mpsc::UnboundedSender<Frame>,
-    conn: Connection,
+    conn: Conn,
 }
 
 struct State {
@@ -284,7 +273,7 @@ struct State {
 }
 
 pub struct Core {
-    endpoint: Endpoint,
+    net: Network,
     me: EndpointId,
     db: Mutex<Db>,
     /// Wall-clock time, shared with `db`.
@@ -309,16 +298,24 @@ impl Core {
     }
 
     /// `loopback_only` binds to 127.0.0.1, for running two copies on one machine in tests.
-    /// (Windows refuses to send from a LAN address to that same address, so same-machine
-    /// tests over the LAN address are flaky.)
     pub async fn start_with(
         data_dir: PathBuf,
         emit: Emit,
         loopback_only: bool,
     ) -> Result<Arc<Self>> {
+        let network = |secret| Network::iroh(secret, loopback_only);
+        Self::start_on(data_dir, emit, Clock::system(), network).await
+    }
+
+    /// Starts on the network `network` makes from this computer's secret key.
+    pub(crate) async fn start_on<F: Future<Output = Result<Network>>>(
+        data_dir: PathBuf,
+        emit: Emit,
+        clock: Clock,
+        network: impl FnOnce(SecretKey) -> F,
+    ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating {}", data_dir.display()))?;
-        let clock = Clock::system();
         let db = Db::open_with(&data_dir.join("tightbeam.db"), clock.clone())?;
 
         let secret = match db.get("secret_key")? {
@@ -345,26 +342,12 @@ impl Core {
         let peer_features = features_from(db.get_str("peer_features")?.as_deref());
         let dnd_until = db.get_str("dnd_until")?.and_then(|s| s.parse().ok());
 
-        // LAN only for now: no relay servers, no public DNS, just mDNS. No UPnP either:
-        // we never ask the router to open a public port, and we only ever advertise
-        // private addresses.
-        let mut builder = Endpoint::builder(presets::Minimal)
-            .secret_key(secret)
-            .alpns(vec![ALPN.to_vec()])
-            .portmapper_config(PortmapperConfig::Disabled)
-            .addr_filter(AddrFilter::new(move |addrs| {
-                Cow::Owned(addrs.iter().filter(|a| is_lan(a, loopback_only)).cloned().collect())
-            }));
-        if loopback_only {
-            builder = builder.clear_ip_transports().bind_addr("127.0.0.1:0")?;
-        }
-        let endpoint = builder.bind().await?;
-        let mdns = MdnsAddressLookup::builder().service_name(SERVICE).build(endpoint.id())?;
-        endpoint.address_lookup()?.add(mdns.clone());
+        let net = network(secret).await?;
+        let discoveries = net.discoveries().await;
 
         let core = Arc::new(Self {
-            me: endpoint.id(),
-            endpoint,
+            me: net.id(),
+            net,
             db: Mutex::new(db),
             clock,
             files_dir: data_dir.join("files"),
@@ -399,7 +382,7 @@ impl Core {
 
         *core.tasks.lock().unwrap() = vec![
             tokio::spawn(core.clone().accept_loop()).abort_handle(),
-            tokio::spawn(core.clone().discovery_loop(mdns)).abort_handle(),
+            tokio::spawn(core.clone().discovery_loop(discoveries)).abort_handle(),
             tokio::spawn(core.clone().dial_loop()).abort_handle(),
             tokio::spawn(core.clone().vanish_loop()).abort_handle(),
         ];
@@ -411,7 +394,7 @@ impl Core {
         for task in self.tasks.lock().unwrap().drain(..) {
             task.abort();
         }
-        self.endpoint.close().await;
+        self.net.close().await;
     }
 
     // ---- Queries -------------------------------------------------------------------
@@ -451,10 +434,8 @@ impl Core {
         let (mut since, mut address, mut rtt_ms) = (None, None, None);
         if let Some(session) = &st.session {
             since = Some(session.since);
-            let paths = session.conn.paths();
-            if let Some(path) = paths.iter().find(|p| p.is_selected()) {
-                address = Some(path.remote_addr().to_string());
-                rtt_ms = Some(path.rtt().as_secs_f64() * 1000.0);
+            if let Some(route) = session.conn.route() {
+                (address, rtt_ms) = (Some(route.address), Some(route.rtt_ms));
             }
         }
         ConnectionInfo {
@@ -831,7 +812,7 @@ impl Core {
             st.session.take()
         };
         if let Some(s) = session {
-            s.conn.close(0u32.into(), b"unpaired");
+            s.conn.close(0, b"unpaired");
         }
         self.changed();
         Ok(())
@@ -859,38 +840,28 @@ impl Core {
     // ---- Background tasks ----------------------------------------------------------
 
     async fn accept_loop(self: Arc<Self>) {
-        while let Some(incoming) = self.endpoint.accept().await {
+        while let Some(accepting) = self.net.accept().await {
             let core = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = core.handle_incoming(incoming).await {
+                if let Err(e) = core.handle_incoming(accepting).await {
                     eprintln!("incoming connection: {e:#}");
                 }
             });
         }
     }
 
-    async fn discovery_loop(self: Arc<Self>, mdns: MdnsAddressLookup) {
-        let mut events = mdns.subscribe().await;
-        while let Some(event) = events.next().await {
+    async fn discovery_loop(self: Arc<Self>, mut discoveries: Discoveries) {
+        while let Some(event) = discoveries.next().await {
             {
                 let mut st = self.state();
                 match event {
-                    DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                        let id = endpoint_info.endpoint_id;
-                        if id == self.me {
-                            continue;
-                        }
-                        let name = endpoint_info
-                            .data
-                            .user_data()
-                            .map(|u| u.to_string())
-                            .unwrap_or_default();
+                    Discovery::Found { id, .. } if id == self.me => continue,
+                    Discovery::Found { id, name } => {
                         st.nearby.insert(id.to_string(), name);
                     }
-                    DiscoveryEvent::Expired { endpoint_id } => {
-                        st.nearby.remove(&endpoint_id.to_string());
+                    Discovery::Lost(id) => {
+                        st.nearby.remove(&id.to_string());
                     }
-                    _ => continue,
                 }
             }
             self.changed();
@@ -917,7 +888,7 @@ impl Core {
             };
             let Some(peer) = target else { continue };
             let started = std::time::Instant::now();
-            let conn = match timeout(CONNECT_TIMEOUT, self.endpoint.connect(peer, ALPN)).await {
+            let conn = match timeout(CONNECT_TIMEOUT, self.net.connect(peer)).await {
                 Ok(Ok(conn)) => conn,
                 Ok(Err(e)) => {
                     eprintln!(
@@ -949,15 +920,15 @@ impl Core {
 
     // ---- Connection handling -------------------------------------------------------
 
-    async fn handle_incoming(self: Arc<Self>, incoming: Incoming) -> Result<()> {
-        let conn = incoming.await?;
+    async fn handle_incoming(self: Arc<Self>, accepting: Accepting) -> Result<()> {
+        let conn = accepting.connected().await?;
         let remote = conn.remote_id();
         let (send, mut recv) = conn.accept_bi().await?;
         match read_frame(&mut recv).await? {
             Frame::PairRequest { name } => self.answer_pair_request(conn, send, recv, name).await,
             Frame::Hello { name, have, version, features } => {
                 if self.peer_id() != Some(remote) {
-                    conn.close(1u32.into(), b"not paired");
+                    conn.close(1, b"not paired");
                     return Ok(());
                 }
                 let theirs = TheirHello { name, have, version, features };
@@ -969,7 +940,7 @@ impl Core {
 
     async fn answer_pair_request(
         self: Arc<Self>,
-        conn: Connection,
+        conn: Conn,
         mut send: SendStream,
         recv: RecvStream,
         their_name: String,
@@ -1032,7 +1003,7 @@ impl Core {
     }
 
     async fn request_pairing(self: &Arc<Self>, remote: EndpointId) -> Result<()> {
-        let conn = timeout(CONNECT_TIMEOUT, self.endpoint.connect(remote, ALPN))
+        let conn = timeout(CONNECT_TIMEOUT, self.net.connect(remote))
             .await
             .context("timed out connecting")??;
         let (mut send, mut recv) = conn.open_bi().await?;
@@ -1057,7 +1028,7 @@ impl Core {
     /// Runs one connected session with the paired peer until the connection drops.
     async fn run_session(
         self: &Arc<Self>,
-        conn: Connection,
+        conn: Conn,
         mut send: SendStream,
         mut recv: RecvStream,
         their_hello: Option<TheirHello>,
@@ -1100,7 +1071,7 @@ impl Core {
             st.peer_away = None;
             st.peer_dnd_until = None;
             if let Some(old) = old {
-                old.conn.close(0u32.into(), b"replaced");
+                old.conn.close(0, b"replaced");
             }
             generation
         };
@@ -1133,7 +1104,7 @@ impl Core {
         writer.abort();
         serving.abort();
         fetching.abort();
-        conn.close(0u32.into(), b"bye");
+        conn.close(0, b"bye");
         {
             let mut st = self.state();
             if st.session.as_ref().is_some_and(|s| s.generation == generation) {
@@ -1209,9 +1180,7 @@ impl Core {
     }
 
     fn advertise_name(&self) {
-        let name = self.name();
-        let data = if name.is_empty() { None } else { UserData::try_from(name).ok() };
-        self.endpoint.set_user_data_for_address_lookup(data);
+        self.net.advertise(&self.name());
     }
 
     fn save_peer(&self, id: EndpointId, name: &str) -> Result<()> {
@@ -1325,7 +1294,7 @@ impl Core {
     // ---- Files ---------------------------------------------------------------------
 
     /// Answers the peer's file requests for this session.
-    async fn serve_files(self: Arc<Self>, conn: Connection) {
+    async fn serve_files(self: Arc<Self>, conn: Conn) {
         while let Ok((send, recv)) = conn.accept_bi().await {
             let core = self.clone();
             tokio::spawn(async move {
@@ -1383,7 +1352,7 @@ impl Core {
 
     /// Downloads the files this computer still needs, one at a time, newest first, for
     /// as long as the session lasts.
-    async fn fetch_files(self: Arc<Self>, conn: Connection) {
+    async fn fetch_files(self: Arc<Self>, conn: Conn) {
         // Ones that failed this session: tried again next time.
         let mut failed = HashSet::new();
         loop {
@@ -1406,7 +1375,7 @@ impl Core {
         }
     }
 
-    async fn fetch_file(&self, conn: &Connection, file: &FileInfo) -> Result<()> {
+    async fn fetch_file(&self, conn: &Conn, file: &FileInfo) -> Result<()> {
         tokio::fs::create_dir_all(&self.files_dir).await?;
         let part_path = self.files_dir.join(format!("{}.part", file.hash));
         let mut part = tokio::fs::OpenOptions::new()
@@ -1654,17 +1623,6 @@ fn pair_code(a: EndpointId, b: EndpointId) -> String {
 }
 
 /// Private-network addresses only (192.168.x, 10.x, 172.16-31.x, link-local, IPv6 ULA).
-fn is_lan(addr: &TransportAddr, allow_loopback: bool) -> bool {
-    match addr {
-        TransportAddr::Ip(sock) => match sock.ip() {
-            IpAddr::V4(ip) if ip.is_loopback() => allow_loopback,
-            IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
-            IpAddr::V6(ip) => ip.is_unique_local() || ip.is_unicast_link_local(),
-        },
-        _ => false,
-    }
-}
-
 /// My `Hello`: who I am, the last of their entries I have, and what this build does.
 fn hello(name: String, have: u64) -> Frame {
     let features = FEATURES.iter().map(|f| f.to_string()).collect();

@@ -4,6 +4,7 @@ pub mod db;
 mod desktop;
 pub mod entry;
 mod idle;
+mod net;
 mod updates;
 
 use std::{path::PathBuf, sync::Arc};
