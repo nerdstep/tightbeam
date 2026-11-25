@@ -372,3 +372,269 @@ async fn a_vanishing_message_lasts_from_when_it_is_seen() {
     .await;
     assert!(alice.find(&at).unwrap().text.is_empty() && bob.find(&at).unwrap().text.is_empty());
 }
+
+// ---- Other builds --------------------------------------------------------------------
+
+/// Another build of the app on the network, played by the test frame by frame.
+struct Played {
+    id: String,
+    conn: Conn,
+    send: SendStream,
+    recv: RecvStream,
+    _net: Network,
+}
+
+impl Played {
+    /// Asks `peer` to pair (they accept), then says `hello`.
+    async fn pair(world: &World, peer: &Peer, hello: Frame) -> Self {
+        let net = world.lan.join(SecretKey::generate());
+        let id = net.id().to_string();
+        let conn = net.connect(peer.me).await.unwrap();
+        let (mut send, recv) = conn.open_bi().await.unwrap();
+        write_frame(&mut send, &Frame::PairRequest { name: "Old".into() }).await.unwrap();
+        until("they're asked", || peer.status().pairing.is_some()).await;
+        peer.answer_pair(true);
+        let mut played = Self { id, conn, send, recv, _net: net };
+        played.next("their answer", |f| matches!(f, Frame::PairAccept { .. })).await;
+        played.next("their hello", |f| matches!(f, Frame::Hello { .. })).await;
+        played.say(&hello).await;
+        until("connected", || peer.status().connected).await;
+        played
+    }
+
+    async fn say(&mut self, frame: &Frame) {
+        write_frame(&mut self.send, frame).await.unwrap();
+    }
+
+    /// An entry in my log, as a `msg` frame.
+    async fn write(&mut self, entry: Entry) {
+        self.say(&Frame::Msg(entry.into_wire().unwrap())).await;
+    }
+
+    /// Reads frames until one matches.
+    async fn next(&mut self, what: &str, wanted: impl Fn(&Frame) -> bool) -> Frame {
+        let read = async {
+            loop {
+                let frame = read_frame(&mut self.recv).await.unwrap();
+                if wanted(&frame) {
+                    return frame;
+                }
+            }
+        };
+        timeout(Duration::from_secs(60), read).await.unwrap_or_else(|_| panic!("no {what}"))
+    }
+
+    fn at(&self, seq: u64) -> Ref {
+        Ref { author: self.id.clone(), seq }
+    }
+}
+
+fn hello_from(version: Option<&str>, features: &[&str]) -> Frame {
+    let features = features.iter().map(|f| f.to_string()).collect();
+    Frame::Hello { name: "Old".into(), have: 0, version: version.map(Into::into), features }
+}
+
+fn picture() -> NewFile {
+    NewFile {
+        name: "sunset.png".into(),
+        mime: "image/png".into(),
+        width: Some(1600),
+        height: Some(900),
+        preview: None,
+        text: "look at this".into(),
+        reply_to: None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_from_before_0_6_gets_neither_vanishing_messages_nor_files() {
+    let world = World::new();
+    let alice = world.start("alice", "Alice").await;
+    let mut old = Played::pair(&world, &alice, hello_from(None, &[])).await;
+
+    let refused = alice.send_message("psst", None, Some(60)).unwrap_err().to_string();
+    assert!(refused.contains("0.6 or later"), "{refused}");
+    let refused = alice.send_file(b"png", picture()).unwrap_err().to_string();
+    assert!(refused.contains("0.7 or later"), "{refused}");
+    alice.send_message("plain is fine", None, None).unwrap();
+    let wanted = |f: &Frame| matches!(f, Frame::Msg(w) if w.text == "plain is fine");
+    old.next("the message", wanted).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_on_0_6_gets_vanishing_messages_but_not_files() {
+    let world = World::new();
+    let alice = world.start("alice", "Alice").await;
+    let mut old = Played::pair(&world, &alice, hello_from(Some("0.6.0"), &[])).await;
+
+    alice.send_message("psst", None, Some(60)).unwrap();
+    let vanishing = |f: &Frame| matches!(f, Frame::Msg(w) if w.vanish == Some(60));
+    old.next("the vanishing message", vanishing).await;
+    let refused = alice.send_file(b"png", picture()).unwrap_err().to_string();
+    assert!(refused.contains("0.7 or later"), "{refused}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn frames_from_a_newer_build_are_skipped() {
+    let world = World::new();
+    let alice = world.start("alice", "Alice").await;
+    let mut newer = Played::pair(&world, &alice, hello_from(Some("9.0.0"), &["files"])).await;
+
+    let pin = serde_json::json!({"t": "pin", "to": {"author": "x", "seq": 1}});
+    write_json(&mut newer.send, &pin).await.unwrap();
+    newer.write(Entry::message(newer.id.clone(), 1, EPOCH_MS, "after the pin")).await;
+    until("the message after it arrives", || alice.texts() == ["after the pin"]).await;
+    assert!(alice.status().connected, "the session carried on");
+}
+
+// ---- Files ---------------------------------------------------------------------------
+
+/// Three megabytes that aren't all the same.
+fn photo_bytes() -> Vec<u8> {
+    (0..3_000_000u32).map(|i| (i * 7 % 251) as u8).collect()
+}
+
+fn info_for(bytes: &[u8]) -> FileInfo {
+    FileInfo {
+        hash: blake3::hash(bytes).to_hex().to_string(),
+        name: "sunset.png".into(),
+        size: bytes.len() as u64,
+        mime: "image/png".into(),
+        width: None,
+        height: None,
+        preview: None,
+    }
+}
+
+fn with_file(author: &str, seq: u64, file: FileInfo) -> Entry {
+    let kind = Kind::Message { reply_to: None, vanish: None, file: Some(file) };
+    Entry { kind, ..Entry::message(author, seq, EPOCH_MS, "") }
+}
+
+fn file_state(peer: &Peer, at: &Ref) -> Option<FileState> {
+    peer.find(at).and_then(|m| m.file).map(|f| f.state)
+}
+
+/// Where `folder`'s app keeps its files.
+fn files_in(world: &World, folder: &str) -> PathBuf {
+    world.root.join(folder).join("files")
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_picture_arrives_after_its_message() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    let bytes = photo_bytes();
+    let sent = alice.send_file(&bytes, picture()).unwrap();
+    assert_eq!(sent.file.as_ref().unwrap().state, FileState::Done, "the sender has it");
+    let at = Ref { author: alice.id(), seq: sent.seq };
+    until("bob has it", || file_state(&bob, &at) == Some(FileState::Done)).await;
+    let (path, mime) = bob.file(&sent.file.unwrap().info.hash).unwrap().unwrap();
+    assert_eq!((std::fs::read(&path).unwrap(), mime.as_str()), (bytes, "image/png"));
+    assert_eq!(path.file_name().unwrap(), "sunset.png");
+    assert_eq!(bob.find(&at).unwrap().text, "look at this");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_transfer_resumes_where_it_broke_off() {
+    let world = World::new();
+    let alice = world.start("alice", "Alice").await;
+    let mut sender = Played::pair(&world, &alice, hello_from(Some("0.7.0"), &["files"])).await;
+    let bytes = photo_bytes();
+    let info = info_for(&bytes);
+    // Alice already has the first megabyte, from a transfer that broke off.
+    let files = files_in(&world, "alice");
+    std::fs::create_dir_all(&files).unwrap();
+    std::fs::write(files.join(format!("{}.part", info.hash)), &bytes[..1 << 20]).unwrap();
+
+    let me = sender.id.clone();
+    sender.write(with_file(&me, 1, info.clone())).await;
+    let (mut send, mut recv) = sender.conn.accept_bi().await.unwrap();
+    let request: FileRequest = read_json(&mut recv).await.unwrap();
+    assert_eq!((request.hash.as_str(), request.from), (info.hash.as_str(), 1 << 20));
+    write_json(&mut send, &FileReply { found: true }).await.unwrap();
+    send.write_all(&bytes[1 << 20..]).await.unwrap();
+    send.finish().unwrap();
+
+    let at = sender.at(1);
+    until("alice has it", || file_state(&alice, &at) == Some(FileState::Done)).await;
+    let (path, _) = alice.file(&info.hash).unwrap().unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_that_does_not_match_its_hash_is_not_kept() {
+    let world = World::new();
+    let alice = world.start("alice", "Alice").await;
+    let mut sender = Played::pair(&world, &alice, hello_from(Some("0.7.0"), &["files"])).await;
+    let bytes = photo_bytes();
+    let info = info_for(&bytes);
+
+    let me = sender.id.clone();
+    sender.write(with_file(&me, 1, info.clone())).await;
+    let (mut send, mut recv) = sender.conn.accept_bi().await.unwrap();
+    let _: FileRequest = read_json(&mut recv).await.unwrap();
+    write_json(&mut send, &FileReply { found: true }).await.unwrap();
+    send.write_all(&vec![0; bytes.len()]).await.unwrap(); // the right size, the wrong bytes
+    send.finish().unwrap();
+    send.stopped().await; // alice has read it all and given up
+
+    let at = sender.at(1);
+    assert_eq!(file_state(&alice, &at), Some(FileState::Pending), "still to come");
+    assert!(alice.file(&info.hash).unwrap().is_none());
+    let part = files_in(&world, "alice").join(format!("{}.part", info.hash));
+    assert!(!part.exists(), "nothing half-kept");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_deleted_on_its_way_is_not_kept() {
+    let world = World::new();
+    let alice = world.start("alice", "Alice").await;
+    let mut sender = Played::pair(&world, &alice, hello_from(Some("0.7.0"), &["files"])).await;
+    let bytes = photo_bytes();
+    let info = info_for(&bytes);
+    let me = sender.id.clone();
+
+    sender.write(with_file(&me, 1, info.clone())).await;
+    let (mut send, mut recv) = sender.conn.accept_bi().await.unwrap();
+    let _: FileRequest = read_json(&mut recv).await.unwrap();
+    write_json(&mut send, &FileReply { found: true }).await.unwrap();
+    send.write_all(&bytes[..1 << 20]).await.unwrap();
+
+    // Halfway through, the sender deletes the message.
+    let at = sender.at(1);
+    let delete = Kind::Delete { of: at.clone() };
+    sender.write(Entry { kind: delete, ..Entry::message(&me, 2, EPOCH_MS, "") }).await;
+    until("alice sees the delete", || alice.find(&at).unwrap().deleted).await;
+    send.write_all(&bytes[1 << 20..]).await.unwrap();
+    send.finish().unwrap();
+    send.stopped().await;
+
+    assert!(alice.file(&info.hash).unwrap().is_none());
+    let files = files_in(&world, "alice");
+    assert!(!files.join(&info.hash).exists(), "not kept");
+    assert!(!files.join(format!("{}.part", info.hash)).exists(), "nor half-kept");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_file_the_sender_no_longer_has_ends_up_gone() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    bob.stop().await;
+    until("alice notices", || !alice.status().connected).await;
+
+    let sent = alice.send_file(&photo_bytes(), picture()).unwrap();
+    let hash = sent.file.unwrap().info.hash;
+    let (path, _) = alice.file(&hash).unwrap().unwrap();
+    std::fs::remove_file(path).unwrap(); // tidied away by hand
+
+    let bob = world.start("bob", "Bob").await;
+    let at = Ref { author: alice.id(), seq: sent.seq };
+    until("both give up", || {
+        file_state(&bob, &at) == Some(FileState::Gone)
+            && file_state(&alice, &at) == Some(FileState::Gone)
+    })
+    .await;
+}
