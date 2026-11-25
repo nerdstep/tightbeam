@@ -38,6 +38,7 @@ ui/src/commands.ts        slash commands
 ui/src/components/        the screens: Setup, Pair, Chat, Search, Files, PairDialog, Notice
 ui/src/components/ui/     shadcn/ui components (generated; update with the shadcn CLI)
 src-tauri/src/chat.rs     the engine: discovery, pairing, protocol, sync
+src-tauri/src/entry.rs    log entries: each kind, its wire form, admission of a peer's
 src-tauri/src/db.rs       SQLite storage and history paging
 src-tauri/src/lib.rs      Tauri commands and events
 src-tauri/src/desktop.rs  tray, unread count, notifications
