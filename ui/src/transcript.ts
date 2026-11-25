@@ -108,6 +108,11 @@ export function quoteOf(m: Message): Pick<Quote, 'text' | 'deleted' | 'vanished'
   }
 }
 
+/** Where a reply's quoted message sits, or `null` if it isn't on this computer. */
+export function targetOf(q: Quote): Cursor | null {
+  return q.hlc === null ? null : { hlc: q.hlc, author: q.author, seq: q.seq }
+}
+
 export function find(t: Transcript, at: Ref): Message | undefined {
   const key = messageKey(at)
   return t.keys.has(key) ? t.messages.find((m) => messageKey(m) === key) : undefined

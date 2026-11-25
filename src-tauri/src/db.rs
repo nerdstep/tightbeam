@@ -89,6 +89,9 @@ pub struct Message {
 pub struct Quote {
     pub author: String,
     pub seq: u64,
+    /// Its place in display order, to load the history back to it. `None` when it isn't
+    /// stored here.
+    pub hlc: Option<i64>,
     /// Its latest text. `None` when it isn't stored here (cleared, for example) or was
     /// deleted.
     pub text: Option<String>,
@@ -647,7 +650,7 @@ impl Db {
     /// Adds a message's current text, and its file's name, to the search index, unless
     /// it was deleted.
     fn index(&self, at: &Ref) -> Result<()> {
-        let Some(original) = self.original(at)? else { return Ok(()) };
+        let Some((original, _)) = self.original(at)? else { return Ok(()) };
         let current = self.current(at, original)?;
         if !current.deleted && !self.vanished(at)? {
             let text = match self.file_of(at)? {
@@ -674,14 +677,14 @@ impl Db {
         Ok(json.flatten().and_then(|j| serde_json::from_str(&j).ok()))
     }
 
-    /// A message's text as first sent, if it's stored here.
-    fn original(&self, at: &Ref) -> Result<Option<String>> {
+    /// A message's text as first sent, and its place in display order, if it's stored here.
+    fn original(&self, at: &Ref) -> Result<Option<(String, i64)>> {
         Ok(self
             .0
             .prepare_cached(
-                "SELECT text FROM messages WHERE author = ?1 AND seq = ?2 AND kind = 'message'",
+                "SELECT text, hlc FROM messages WHERE author = ?1 AND seq = ?2 AND kind = 'message'",
             )?
-            .query_row(params![at.author, at.seq as i64], |r| r.get(0))
+            .query_row(params![at.author, at.seq as i64], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?)
     }
 
@@ -726,12 +729,15 @@ impl Db {
         }
         let reply_to = match reply_to {
             Some(to) => {
-                let quoted = self.original(&to)?.map(|text| self.current(&to, text)).transpose()?;
+                let stored = self.original(&to)?;
+                let hlc = stored.as_ref().map(|(_, hlc)| *hlc);
+                let quoted = stored.map(|(text, _)| self.current(&to, text)).transpose()?;
                 let vanished = self.vanished(&to)?;
                 let deleted = vanished || quoted.as_ref().is_some_and(|q| q.deleted);
                 let text = quoted.filter(|_| !deleted).map(|q| q.text);
                 let file = if deleted { None } else { self.file_of(&to)? };
-                Some(Quote { author: to.author, seq: to.seq, text, deleted, vanished, file })
+                let (author, seq) = (to.author, to.seq);
+                Some(Quote { author, seq, hlc, text, deleted, vanished, file })
             }
             None => None,
         };
@@ -916,7 +922,7 @@ mod tests {
         assert_eq!(messages.len(), 2, "reactions aren't messages");
         assert_eq!(messages[0].reactions, [Reaction { author: "peer".into(), emoji: "😂".into() }]);
         let quote = messages[1].reply_to.as_ref().unwrap();
-        assert_eq!(quote.text.as_deref(), Some("me1"));
+        assert_eq!((quote.text.as_deref(), quote.hlc), (Some("me1"), Some(1)));
         assert_eq!(db.page(None, 10).unwrap().messages, messages);
 
         // Reactions sync and count like messages.
@@ -926,7 +932,8 @@ mod tests {
         // A reply to a message that isn't here any more.
         db.clear("me", None).unwrap();
         db.insert(&reply("peer", 4, ("me", 1))).unwrap();
-        assert_eq!(db.all().unwrap()[0].reply_to.as_ref().unwrap().text, None);
+        let gone = db.all().unwrap()[0].reply_to.clone().unwrap();
+        assert_eq!((gone.text, gone.hlc), (None, None), "nowhere to jump to");
     }
 
     #[test]

@@ -11,7 +11,7 @@ import {
   Trash2Icon,
   XIcon,
 } from 'lucide-react'
-import { memo, useCallback, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useRef, useState } from 'react'
 
 import { api, type Message as ChatMessage, type Quote, type Reaction } from '@/api'
 import { type Command, parse, suggest } from '@/commands'
@@ -56,6 +56,7 @@ import {
   clearHistory,
   loadOlder,
   openSearch,
+  reveal,
   run,
   setDeleting,
   setEditing,
@@ -64,7 +65,7 @@ import {
   store,
   unstageFile,
 } from '@/store'
-import { messageKey } from '@/transcript'
+import { indexOf, messageKey, targetOf } from '@/transcript'
 
 /** The reactions on offer. */
 const EMOJI = ['👍', '❤️', '😂', '😮', '😢', '🎉']
@@ -301,28 +302,14 @@ function VirtualTranscript({
     return () => clearTimeout(timer)
   }, [highlighted])
 
-  // Stable for the memoized rows: reads the latest messages through a ref.
-  const messagesRef = useRef(messages)
-  messagesRef.current = messages
   const jump = useSelector(store, (s) => s.jump)
   useEffect(() => {
     if (!jump) return
-    const index = messagesRef.current.findIndex((m) => messageKey(m) === jump.key)
+    const index = indexOf(store.state.transcript, jump.at)
     if (index < 0) return
     virtualizer.scrollToIndex(index, { align: 'center' })
-    setHighlighted(jump.key)
+    setHighlighted(messageKey(jump.at))
   }, [jump, virtualizer])
-
-  const jumpTo = useCallback(
-    (quote: Quote) => {
-      const key = messageKey(quote)
-      const index = messagesRef.current.findIndex((m) => messageKey(m) === key)
-      if (index < 0) return // not loaded: older than what's paged in, or cleared
-      virtualizer.scrollToIndex(index, { align: 'center' })
-      setHighlighted(key)
-    },
-    [virtualizer],
-  )
 
   return (
     <MessageScroller className="flex-1">
@@ -355,7 +342,7 @@ function VirtualTranscript({
                     groupStart={!prev || !sameGroup(prev, m)}
                     groupEnd={!next || !sameGroup(m, next)}
                     highlighted={highlighted === item.key}
-                    onJump={jumpTo}
+                    onJump={jumpToQuote}
                   />
                 </div>
               )
@@ -571,6 +558,12 @@ function DayMarker({ when }: { when: Date }) {
       {when.toLocaleDateString([], { weekday: 'long', month: 'short', day: 'numeric' })}
     </Marker>
   )
+}
+
+/** Jumps from a reply to the message it quotes, if it's on this computer. */
+function jumpToQuote(quote: Quote) {
+  const target = targetOf(quote)
+  if (target) void reveal(target)
 }
 
 /** The message a reply answers, at the top of its bubble. Click to jump to it. */

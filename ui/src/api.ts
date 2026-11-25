@@ -64,6 +64,8 @@ export interface Ref {
 
 /** The message a reply answers. */
 export interface Quote extends Ref {
+  /** Its place in display order, to load the history back to it. `null` when it isn't on this computer. */
+  hlc: number | null
   /** Its latest text. `null` when it isn't on this computer (cleared) or was deleted. */
   text: string | null
   /** Deleted, or vanished. */
