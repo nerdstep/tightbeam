@@ -35,6 +35,7 @@ Windows and macOS. Rust + [Tauri](https://tauri.app) for the app, [iroh](https:/
 ui/src/api.ts             typed wrappers for the Rust commands, plus the shared types
 ui/src/store.ts           app state (TanStack Store), fed by events from Rust; history paging
 ui/src/transcript.ts      the transcript: what a page, a live message or an update does to it
+ui/src/people.ts          whose name each message shows
 ui/src/commands.ts        slash commands
 ui/src/components/        the screens: Setup, Pair, Chat, Search, Files, PairDialog, Notice
 ui/src/components/ui/     shadcn/ui components (generated; update with the shadcn CLI)

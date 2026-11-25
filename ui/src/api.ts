@@ -28,6 +28,8 @@ export interface Status {
   /** Highest of my sequence numbers the peer has seen. Always 0 with peers before 0.3. */
   peer_seen: number
   nearby: Person[]
+  /** Everyone I've been paired with, by their last known name, to label their messages. */
+  people: Person[]
   pairing: PairPrompt | null
   notice: string | null
   /** Set when I went away with `/away`. Away from being idle isn't shown to me. */

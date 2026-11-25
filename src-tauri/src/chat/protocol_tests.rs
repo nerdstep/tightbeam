@@ -307,6 +307,31 @@ async fn a_new_peer_gets_only_what_is_written_after_pairing() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn messages_keep_their_author_s_name_after_pairing_someone_new() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    let names = |peer: &Peer| -> Vec<(String, String)> {
+        peer.status().people.into_iter().map(|p| (p.id, p.name)).collect()
+    };
+    assert_eq!(names(&alice), [(bob.id(), "Bob".to_string())]);
+    bob.set_name("Robert").unwrap();
+    until("alice hears his new name", || names(&alice) == [(bob.id(), "Robert".into())]).await;
+
+    alice.unpair().unwrap();
+    let carol = world.start("carol", "Carol").await;
+    world.pair(&alice, &carol).await;
+    let mut expected = vec![(bob.id(), "Robert".to_string()), (carol.id(), "Carol".to_string())];
+    expected.sort();
+    assert_eq!(names(&alice), expected, "bob's name stays for his messages");
+
+    // And it lasts across a restart.
+    alice.stop().await;
+    let alice = world.start("alice", "Alice").await;
+    assert_eq!(names(&alice), expected);
+}
+
+#[tokio::test(start_paused = true)]
 async fn pairing_again_with_the_same_key_still_catches_up() {
     let world = World::new();
     let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);

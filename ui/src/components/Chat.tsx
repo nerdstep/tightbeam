@@ -11,7 +11,7 @@ import {
   Trash2Icon,
   XIcon,
 } from 'lucide-react'
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 
 import { api, type Message as ChatMessage, type Quote, type Reaction } from '@/api'
 import { type Command, parse, suggest } from '@/commands'
@@ -51,6 +51,7 @@ import {
 import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
 import { formatDuration, formatUntil } from '@/lib/duration'
+import { namer, peopleKey } from '@/people'
 import {
   addMessage,
   clearHistory,
@@ -192,7 +193,7 @@ function Header() {
 const dayOf = (m: ChatMessage) => new Date(m.ts).toDateString()
 
 function Transcript() {
-  const { messages, hasOlder, loadingOlder, myId, myName, peerName, peerHas, peerSeen } =
+  const { messages, hasOlder, loadingOlder, myId, myName, peerName, people, peerHas, peerSeen } =
     useSelector(
       store,
       (s) => ({
@@ -202,11 +203,14 @@ function Transcript() {
         myId: s.status?.me.id ?? '',
         myName: s.status?.me.name || 'You',
         peerName: s.status?.peer?.name || 'Them',
+        people: peopleKey(s.status?.people),
         peerHas: s.status?.peer_has ?? 0,
         peerSeen: s.status?.peer_seen ?? 0,
       }),
       { compare: shallow },
     )
+  // Stable while nobody's name changes, so the memoized rows stay put.
+  const nameOf = useMemo(() => namer(people, myId, peerName), [people, myId, peerName])
 
   if (messages.length === 0) {
     return (
@@ -223,6 +227,7 @@ function Transcript() {
       myId={myId}
       myName={myName}
       peerName={peerName}
+      nameOf={nameOf}
       peerHas={peerHas}
       peerSeen={peerSeen}
     />
@@ -258,6 +263,7 @@ function VirtualTranscript({
   myId,
   myName,
   peerName,
+  nameOf,
   peerHas,
   peerSeen,
 }: {
@@ -267,6 +273,7 @@ function VirtualTranscript({
   myId: string
   myName: string
   peerName: string
+  nameOf: (author: string) => string
   peerHas: number
   peerSeen: number
 }) {
@@ -338,6 +345,7 @@ function VirtualTranscript({
                     myId={myId}
                     myName={myName}
                     peerName={peerName}
+                    nameOf={nameOf}
                     newDay={!prev || dayOf(prev) !== dayOf(m)}
                     groupStart={!prev || !sameGroup(prev, m)}
                     groupEnd={!next || !sameGroup(m, next)}
@@ -373,6 +381,7 @@ const Row = memo(function Row({
   myId,
   myName,
   peerName,
+  nameOf,
   newDay,
   groupStart,
   groupEnd,
@@ -384,7 +393,10 @@ const Row = memo(function Row({
   receipt: Receipt | null
   myId: string
   myName: string
+  /** Whoever I'm paired with now. */
   peerName: string
+  /** An author's name: "You" for me, and the name they last had for anyone else. */
+  nameOf: (author: string) => string
   newDay: boolean
   /** First in its group: space above it. */
   groupStart: boolean
@@ -397,7 +409,6 @@ const Row = memo(function Row({
   const when = new Date(message.ts)
   const mine = receipt !== null
   const align = mine ? 'end' : 'start'
-  const nameOf = (author: string) => (author === myId ? 'You' : peerName)
   const myReaction = message.reactions.find((r) => r.author === myId)?.emoji
   // Picking my current reaction again takes it back.
   const react = (emoji: string) =>
@@ -442,7 +453,7 @@ const Row = memo(function Row({
         <Linkified text={message.text} />
       ) : (
         <span className="italic">
-          <span className="font-semibold not-italic">{mine ? myName : peerName}</span>{' '}
+          <span className="font-semibold not-italic">{mine ? myName : nameOf(message.author)}</span>{' '}
           <Linkified text={action} />
         </span>
       )}
@@ -479,7 +490,11 @@ const Row = memo(function Row({
               {file ? (
                 <>
                   {/* Keyed by state: a picture that failed to load gets another go once it comes back. */}
-                  <FileView key={file.state} file={file} peer={peerName} />
+                  <FileView
+                    key={file.state}
+                    file={file}
+                    peer={mine ? peerName : nameOf(message.author)}
+                  />
                   {(message.text || message.edited) && (
                     <div className="px-2 pt-1 pb-0.5">{words}</div>
                   )}
