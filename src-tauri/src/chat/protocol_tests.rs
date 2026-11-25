@@ -638,3 +638,202 @@ async fn a_file_the_sender_no_longer_has_ends_up_gone() {
     })
     .await;
 }
+
+// ---- Changing messages ---------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn edits_and_deletes_reach_the_other_side() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    let sent = alice.send_message("hi bob", None, None).unwrap();
+    let at = Ref { author: alice.id(), seq: sent.seq };
+    until("bob gets it", || bob.find(&at).is_some()).await;
+
+    alice.edit(at.clone(), "hi bob!").unwrap();
+    until("bob sees the edit", || bob.find(&at).is_some_and(|m| m.edited && m.text == "hi bob!"))
+        .await;
+    let refused = bob.edit(at.clone(), "hi alice").unwrap_err().to_string();
+    assert!(refused.contains("only change your own"), "{refused}");
+    assert!(bob.delete(at.clone()).is_err(), "nor delete it");
+
+    alice.delete(at.clone()).unwrap();
+    until("bob sees the delete", || bob.find(&at).is_some_and(|m| m.deleted)).await;
+    for side in [&alice, &bob] {
+        let gone = side.find(&at).unwrap();
+        assert!(gone.text.is_empty() && !gone.edited, "blanked on both sides");
+    }
+    assert!(alice.edit(at.clone(), "back").is_err(), "a deleted message stays deleted");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reply_quotes_its_message_on_both_sides() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    let first = alice.send_message("lunch?", None, None).unwrap();
+    let to = Ref { author: alice.id(), seq: first.seq };
+    until("bob gets it", || bob.find(&to).is_some()).await;
+
+    let reply = bob.send_message("yes", Some(to.clone()), None).unwrap();
+    assert_eq!(reply.reply_to.unwrap().text.as_deref(), Some("lunch?"));
+    let at = Ref { author: bob.id(), seq: reply.seq };
+    until("alice gets the reply", || alice.find(&at).is_some()).await;
+    let quote = alice.find(&at).unwrap().reply_to.unwrap();
+    assert_eq!(
+        (quote.author, quote.seq, quote.text.as_deref()),
+        (to.author, to.seq, Some("lunch?"))
+    );
+
+    let stranger = Ref { author: "someone else".into(), seq: 1 };
+    assert!(bob.send_message("eh", Some(stranger), None).is_err(), "only to the two of us");
+}
+
+#[tokio::test(start_paused = true)]
+async fn clearing_one_side_leaves_the_other_and_numbering_carries_on() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    alice.send_message("one", None, None).unwrap();
+    bob.send_message("two", None, None).unwrap();
+    until("both have both", || alice.texts().len() == 2 && bob.texts().len() == 2).await;
+
+    bob.clear_history().unwrap();
+    assert!(bob.texts().is_empty());
+    assert_eq!(alice.texts().len(), 2, "her copy stays");
+    let next = bob.send_message("fresh start", None, None).unwrap();
+    assert_eq!(next.seq, 2, "his numbering carries on");
+    until("alice gets it", || alice.texts().len() == 3).await;
+    assert_eq!(bob.texts(), ["fresh start"]);
+
+    // Catch-up never sends him the cleared messages again.
+    world.lan.drop_out(dialer_first(&alice, &bob).0.me);
+    until("reconnected", || !alice.status().connected || !bob.status().connected).await;
+    until("back", || alice.status().connected && bob.status().connected).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(bob.texts(), ["fresh start"]);
+}
+
+// ---- Presence ------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn typing_reaches_the_other_side() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    alice.typing();
+    until("bob sees it", || bob.count(|e| matches!(e, Event::Typing)) == 1).await;
+    assert_eq!(alice.count(|e| matches!(e, Event::Typing)), 0, "not on her own screen");
+}
+
+#[tokio::test(start_paused = true)]
+async fn nudges_are_rate_limited_each_way() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    let refused = alice.nudge().unwrap_err().to_string();
+    assert!(refused.contains("Not connected"), "{refused}");
+    world.pair(&alice, &bob).await;
+    let nudges = |peer: &Peer| peer.count(|e| matches!(e, Event::Nudge));
+
+    alice.nudge().unwrap();
+    until("bob is nudged", || nudges(&bob) == 1).await;
+    let refused = alice.nudge().unwrap_err().to_string();
+    assert!(refused.contains("just nudged"), "{refused}");
+    tokio::time::sleep(NUDGE_EVERY).await;
+    alice.nudge().unwrap();
+    until("bob is nudged again", || nudges(&bob) == 2).await;
+
+    // A build that doesn't limit them still only gets through every few seconds.
+    let carol = world.start("carol", "Carol").await;
+    let mut eager = Played::pair(&world, &carol, hello_from(Some("9.0.0"), &[])).await;
+    eager.say(&Frame::Nudge).await;
+    eager.say(&Frame::Nudge).await;
+    until("carol is nudged", || nudges(&carol) >= 1).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(nudges(&carol), 1, "the second came too soon");
+    tokio::time::sleep(NUDGE_EVERY).await;
+    eager.say(&Frame::Nudge).await;
+    until("carol is nudged again", || nudges(&carol) == 2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn away_by_hand_lasts_until_back_or_a_message() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    let lunch = Some(Away { note: Some("lunch break".into()) });
+
+    bob.set_away("  lunch\n  break ");
+    until("alice sees it", || alice.status().peer_away == lunch).await;
+    assert_eq!(bob.status().away, lunch, "his own screen says so");
+    bob.set_idle(false); // using the computer doesn't end it
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!((bob.status().away, alice.status().peer_away), (lunch.clone(), lunch.clone()));
+
+    bob.send_message("back now", None, None).unwrap();
+    until("his message brings him back", || alice.status().peer_away.is_none()).await;
+    assert_eq!(bob.status().away, None);
+
+    bob.set_away("");
+    until("away without a note", || alice.status().peer_away == Some(Away::default())).await;
+    bob.back();
+    until("back", || alice.status().peer_away.is_none()).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_is_away_until_input_and_ends_with_the_session() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+
+    bob.set_idle(true);
+    until("alice sees him idle", || alice.status().peer_away == Some(Away::default())).await;
+    assert_eq!(bob.status().away, None, "his own screen doesn't show idle");
+    bob.set_idle(false);
+    until("alice sees him back", || alice.status().peer_away.is_none()).await;
+
+    // What she knows of him lasts only as long as the session.
+    bob.set_away("gone fishing");
+    until("alice sees it", || alice.status().peer_away.is_some()).await;
+    bob.stop().await;
+    until("disconnected", || !alice.status().connected).await;
+    assert_eq!(alice.status().peer_away, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn do_not_disturb_pauses_nudges_until_it_ends() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+
+    let later = world.clock.now_ms() + 3_600_000;
+    bob.set_dnd(Some(later)).unwrap();
+    assert!(bob.dnd() && bob.status().dnd_until == Some(later));
+    until("alice sees it", || alice.status().peer_dnd_until == Some(later)).await;
+    let refused = alice.nudge().unwrap_err().to_string();
+    assert!(refused.contains("do not disturb"), "{refused}");
+
+    // It lasts across a restart, and he says so again when they reconnect.
+    bob.stop().await;
+    until("disconnected", || !alice.status().connected).await;
+    assert_eq!(alice.status().peer_dnd_until, None, "only while connected");
+    let bob = world.start("bob", "Bob").await;
+    assert!(bob.dnd());
+    until("alice sees it again", || alice.status().peer_dnd_until == Some(later)).await;
+
+    bob.set_dnd(None).unwrap();
+    until("alice sees it end", || alice.status().peer_dnd_until.is_none()).await;
+    alice.nudge().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn do_not_disturb_ends_on_its_own() {
+    let world = World::new();
+    let bob = world.start("bob", "Bob").await;
+    bob.set_dnd(Some(world.clock.now_ms() + 60_000)).unwrap();
+    assert!(bob.dnd());
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert!(!bob.dnd() && bob.status().dnd_until.is_none());
+    assert!(bob.set_dnd(Some(world.clock.now_ms() - 1)).is_ok(), "a time past turns it off");
+    assert!(!bob.dnd());
+}
