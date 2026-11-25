@@ -1,16 +1,19 @@
 //! An in-memory network for tests. Every node that joins a `Lan` discovers the others
 //! by name, connects to them instantly, and streams bytes through channels.
 //!
-//! Like QUIC, closing a connection is abrupt: reads and writes on its streams fail at
-//! once, on both sides. A node that closes (its app shut down) drops off the LAN: the
-//! others see it go, and its connections end.
+//! Like QUIC, a connection ends abruptly: reads and writes on its streams fail at once.
+//! Closing it, or dropping every handle to one side of it, ends it for both sides. A node
+//! that closes (its app shut down) leaves the LAN: the others see it go, and its
+//! connections end. A node can also drop out (`Lan::drop_out`): its connections end on
+//! its side only, while the other side notices nothing, the way a laptop that loses its
+//! Wi-Fi leaves the other end waiting for a timeout.
 
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use iroh::{EndpointId, SecretKey};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -26,8 +29,8 @@ struct Joined {
     name: String,
     incoming: mpsc::UnboundedSender<Conn>,
     watchers: Vec<mpsc::UnboundedSender<Discovery>>,
-    /// Every connection this node is part of, to end when it leaves.
-    conns: Vec<Arc<watch::Sender<bool>>>,
+    /// Every connection this node is part of, and which side of it is this node's.
+    links: Vec<(Arc<Link>, usize)>,
 }
 
 impl Lan {
@@ -40,9 +43,18 @@ impl Lan {
             old.leave();
         }
         nodes.tell_others(id, || Discovery::Found { id, name: String::new() });
-        let joined = Joined { name: String::new(), incoming, watchers: vec![], conns: vec![] };
+        let joined = Joined { name: String::new(), incoming, watchers: vec![], links: vec![] };
         nodes.0.insert(id, joined);
         Network::Memory(Node { id, lan: self.clone(), accept: tokio::sync::Mutex::new(accept) })
+    }
+
+    /// `id` loses its connections without closing them: they end on its side only.
+    pub fn drop_out(&self, id: EndpointId) {
+        if let Some(node) = self.0.lock().unwrap().0.get_mut(&id) {
+            for (link, side) in node.links.drain(..) {
+                link.cut[side].send_replace(true);
+            }
+        }
     }
 }
 
@@ -56,8 +68,8 @@ impl Nodes {
 
 impl Joined {
     fn leave(self) {
-        for conn in self.conns {
-            conn.send_replace(true);
+        for (link, _) in self.links {
+            link.closed.send_replace(true);
         }
     }
 }
@@ -99,12 +111,16 @@ impl Node {
             bail!("this node has left the network");
         }
         let Some(them) = nodes.0.get_mut(&peer) else { bail!("{peer} isn't on the network") };
-        let (mine, theirs, closed) = Conn::pair(self.id, peer);
+        let (mine, theirs) = Conn::pair(self.id, peer);
+        let link = mine.link.clone();
         if them.incoming.send(theirs).is_err() {
             bail!("{peer} isn't accepting connections");
         }
-        them.conns.push(closed.clone());
-        nodes.0.get_mut(&self.id).unwrap().conns.push(closed);
+        them.links.retain(|(l, _)| !l.is_closed());
+        them.links.push((link.clone(), 1));
+        let me = nodes.0.get_mut(&self.id).unwrap();
+        me.links.retain(|(l, _)| !l.is_closed());
+        me.links.push((link, 0));
         Ok(mine)
     }
 
@@ -124,79 +140,126 @@ impl Node {
     }
 }
 
+/// What both ends of one connection share.
+struct Link {
+    /// Ended for both sides.
+    closed: watch::Sender<bool>,
+    /// Ended for one side only (`Lan::drop_out`), by side.
+    cut: [watch::Sender<bool>; 2],
+}
+
+impl Link {
+    fn is_closed(&self) -> bool {
+        *self.closed.borrow()
+    }
+
+    /// Ends the connection for both sides, unless `side` has dropped out: then the other
+    /// side never hears of it.
+    fn close_from(&self, side: usize) {
+        if !*self.cut[side].borrow() {
+            self.closed.send_replace(true);
+        }
+    }
+
+    fn is_down(&self, side: usize) -> bool {
+        self.is_closed() || *self.cut[side].borrow()
+    }
+
+    /// Resolves once the connection has ended for `side`.
+    async fn down(&self, side: usize) {
+        let (mut closed, mut cut) = (self.closed.subscribe(), self.cut[side].subscribe());
+        tokio::select! {
+            _ = closed.wait_for(|c| *c) => {}
+            _ = cut.wait_for(|c| *c) => {}
+        }
+    }
+}
+
+/// One side's handles; when the last is dropped, the connection closes, as in QUIC.
+struct Handle(Arc<Link>, usize);
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.0.close_from(self.1);
+    }
+}
+
 /// Streams the other side opened, waiting to be accepted.
 type Streams = mpsc::UnboundedReceiver<(Send, Recv)>;
 
 #[derive(Clone)]
 pub(crate) struct Conn {
     remote: EndpointId,
+    link: Arc<Link>,
+    side: usize,
     to_peer: mpsc::UnboundedSender<(Send, Recv)>,
     from_peer: Arc<tokio::sync::Mutex<Streams>>,
-    /// `true` once either side closes; shared by both sides and all their streams.
-    closer: Arc<watch::Sender<bool>>,
+    _handle: Arc<Handle>,
 }
 
 impl Conn {
-    /// Both ends of a new connection, and the switch that ends it.
-    fn pair(a: EndpointId, b: EndpointId) -> (Conn, Conn, Arc<watch::Sender<bool>>) {
-        let closer = Arc::new(watch::Sender::new(false));
+    /// Both ends of a new connection from `a` (side 0) to `b` (side 1).
+    fn pair(a: EndpointId, b: EndpointId) -> (Conn, Conn) {
+        let link = Arc::new(Link {
+            closed: watch::Sender::new(false),
+            cut: [watch::Sender::new(false), watch::Sender::new(false)],
+        });
         let (a_to_b, b_from_a) = mpsc::unbounded_channel();
         let (b_to_a, a_from_b) = mpsc::unbounded_channel();
-        let end = |remote, to_peer, from_peer| Conn {
+        let end = |remote, side, to_peer, from_peer| Conn {
             remote,
+            link: link.clone(),
+            side,
             to_peer,
             from_peer: Arc::new(tokio::sync::Mutex::new(from_peer)),
-            closer: closer.clone(),
+            _handle: Arc::new(Handle(link.clone(), side)),
         };
-        (end(b, a_to_b, a_from_b), end(a, b_to_a, b_from_a), closer)
+        (end(b, 0, a_to_b, a_from_b), end(a, 1, b_to_a, b_from_a))
     }
 
     pub fn remote_id(&self) -> EndpointId {
         self.remote
     }
 
-    fn is_closed(&self) -> bool {
-        *self.closer.borrow()
-    }
-
     pub fn open_bi(&self) -> Result<(Send, Recv)> {
-        if self.is_closed() {
+        if self.link.is_down(self.side) {
             bail!("connection lost");
         }
-        let (mine_out, theirs_in) = pipe(&self.closer);
-        let (theirs_out, mine_in) = pipe(&self.closer);
+        let theirs = 1 - self.side;
+        let (mine_out, theirs_in) = self.pipe(self.side, theirs);
+        let (theirs_out, mine_in) = self.pipe(theirs, self.side);
         if self.to_peer.send((theirs_out, theirs_in)).is_err() {
             bail!("connection lost");
         }
         Ok((mine_out, mine_in))
     }
 
+    /// One direction of a stream, from side `from` to side `to`.
+    fn pipe(&self, from: usize, to: usize) -> (Send, Recv) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (reading, stopped) = oneshot::channel();
+        let send = Send { tx: Some(tx), stopped, link: self.link.clone(), side: from };
+        let recv =
+            Recv { rx, pending: Vec::new(), _reading: reading, link: self.link.clone(), side: to };
+        (send, recv)
+    }
+
     pub async fn accept_bi(&self) -> Result<(Send, Recv)> {
-        let mut closed = self.closer.subscribe();
         let mut from_peer = self.from_peer.lock().await;
         tokio::select! {
             biased;
-            _ = closed.wait_for(|c| *c) => bail!("connection lost"),
-            streams = from_peer.recv() => streams.ok_or_else(|| anyhow::anyhow!("connection lost")),
+            _ = self.link.down(self.side) => bail!("connection lost"),
+            streams = from_peer.recv() => streams.ok_or_else(|| anyhow!("connection lost")),
         }
     }
 
     pub fn close(&self) {
-        self.closer.send_replace(true);
+        self.link.close_from(self.side);
     }
 
     pub async fn closed(&self) {
-        let _ = self.closer.subscribe().wait_for(|c| *c).await;
+        self.link.down(self.side).await
     }
-}
-
-/// One direction of a stream.
-fn pipe(closer: &Arc<watch::Sender<bool>>) -> (Send, Recv) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let (read_tx, read_rx) = oneshot::channel();
-    let send = Send { tx: Some(tx), stopped: read_rx, closed: closer.subscribe() };
-    let recv = Recv { rx, pending: Vec::new(), _reading: read_tx, closed: closer.subscribe() };
-    (send, recv)
 }
 
 pub(crate) struct Send {
@@ -204,12 +267,13 @@ pub(crate) struct Send {
     tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     /// Resolves (as an error) when the reading side is dropped.
     stopped: oneshot::Receiver<()>,
-    closed: watch::Receiver<bool>,
+    link: Arc<Link>,
+    side: usize,
 }
 
 impl Send {
     pub fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        if *self.closed.borrow() {
+        if self.link.is_down(self.side) {
             bail!("connection lost");
         }
         let Some(tx) = &self.tx else { bail!("stream already finished") };
@@ -232,7 +296,7 @@ impl Send {
     pub async fn stopped(&mut self) {
         tokio::select! {
             _ = &mut self.stopped => {}
-            _ = self.closed.wait_for(|c| *c) => {}
+            _ = self.link.down(self.side) => {}
         }
     }
 }
@@ -243,7 +307,8 @@ pub(crate) struct Recv {
     pending: Vec<u8>,
     /// Dropped with this side, which is what `Send::stopped` waits for.
     _reading: oneshot::Sender<()>,
-    closed: watch::Receiver<bool>,
+    link: Arc<Link>,
+    side: usize,
 }
 
 impl Recv {
@@ -251,9 +316,14 @@ impl Recv {
         if self.pending.is_empty() {
             tokio::select! {
                 biased;
-                _ = self.closed.wait_for(|c| *c) => bail!("connection lost"),
+                _ = self.link.down(self.side) => bail!("connection lost"),
                 chunk = self.rx.recv() => match chunk {
                     Some(chunk) => self.pending = chunk,
+                    // A sender that dropped out can't be heard finishing: just silence.
+                    None if *self.link.cut[1 - self.side].borrow() => {
+                        self.link.down(self.side).await;
+                        bail!("connection lost");
+                    }
                     None => return Ok(None),
                 },
             }
