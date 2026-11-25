@@ -4,6 +4,7 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+- After unpairing and pairing with someone new, they get only the messages written from then on. Before, they also received every message sent to the previous person. Editing or deleting those older messages stays on your computer.
 - Clicking the quote in a reply jumps to the original message even when it's further back than the history loaded so far. Before, it did nothing until you'd scrolled back that far.
 - A reply quoting a vanishing message shows "Message vanished" as soon as it vanishes, instead of "Deleted message" until the app restarts.
 

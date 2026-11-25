@@ -254,6 +254,76 @@ async fn a_new_session_replaces_a_half_dead_one() {
 
 // ---- Catch-up ------------------------------------------------------------------------
 
+#[test]
+fn only_entries_from_after_pairing_are_shared() {
+    let (me, peer) = ("me", "carol");
+    let at = |author: &str, seq| Ref { author: author.into(), seq };
+    let entry = |seq, kind| Entry { kind, ..Entry::message(me, seq, 1, "x") };
+    let after = 4;
+    assert!(!shares(&Entry::message(me, 4, 1, "for bob"), after, peer));
+    assert!(shares(&Entry::message(me, 5, 1, "for carol"), after, peer));
+    // About her messages, or mine since: shared.
+    assert!(shares(&entry(5, Kind::Reaction { to: at(peer, 1) }), after, peer));
+    assert!(shares(&entry(6, Kind::Edit { of: at(me, 5) }), after, peer));
+    // About mine from before, or bob's: kept here.
+    assert!(!shares(&entry(6, Kind::Edit { of: at(me, 3) }), after, peer));
+    assert!(!shares(&entry(6, Kind::Delete { of: at(me, 3) }), after, peer));
+    assert!(!shares(&entry(6, Kind::Reaction { to: at("bob", 2) }), after, peer));
+    // A reply's text is new, whatever it quotes.
+    let reply = Kind::Message { reply_to: Some(at("bob", 2)), vanish: None, file: None };
+    assert!(shares(&entry(6, reply), after, peer));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_peer_gets_only_what_is_written_after_pairing() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    let for_bob = alice.send_message("a secret for bob", None, None).unwrap();
+    let from_bob = bob.send_message("one for alice", None, None).unwrap();
+    until("both arrive", || alice.texts().len() == 2 && bob.texts().len() == 2).await;
+    alice.unpair().unwrap();
+    bob.stop().await;
+
+    let carol = world.start("carol", "Carol").await;
+    world.pair(&alice, &carol).await;
+    // Alice changes her old conversation: it stays on her computer.
+    let old = Ref { author: alice.id(), seq: for_bob.seq };
+    alice.edit(old.clone(), "still a secret").unwrap();
+    let bobs = Ref { author: from_bob.author.clone(), seq: from_bob.seq };
+    assert!(alice.react(bobs, "👍").is_err(), "bob's messages are no one's to react to now");
+    alice.delete(old.clone()).unwrap();
+    assert!(alice.find(&old).unwrap().deleted, "done here");
+
+    let hi = alice.send_message("hi carol", None, None).unwrap();
+    until("carol gets it", || carol.texts() == ["hi carol"]).await;
+    let to_carol = Ref { author: alice.id(), seq: hi.seq };
+    alice.edit(to_carol.clone(), "hi carol!").unwrap();
+    until("and the edit", || carol.find(&to_carol).is_some_and(|m| m.edited)).await;
+
+    let reached: Vec<_> = carol.db().since(&alice.id(), 0).unwrap();
+    assert_eq!(reached.len(), 2, "the message and its edit, nothing from before: {reached:?}");
+    until("delivered", || alice.status().peer_has == hi.seq + 1).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn pairing_again_with_the_same_key_still_catches_up() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    alice.send_message("before", None, None).unwrap();
+    until("bob gets it", || bob.texts() == ["before"]).await;
+    bob.stop().await;
+    until("alice notices", || !alice.status().connected).await;
+    alice.send_message("while he was off", None, None).unwrap();
+
+    // He asks again (say, from the pairing screen); she already trusts his key.
+    let bob = world.start("bob", "Bob").await;
+    until("reconnected", || alice.status().connected && bob.status().connected).await;
+    until("he catches up", || bob.texts() == ["before", "while he was off"]).await;
+    assert_eq!(alice.state().shared_after, 0, "the first pairing's floor stands");
+}
+
 #[tokio::test(start_paused = true)]
 async fn catch_up_after_being_offline() {
     let world = World::new();
