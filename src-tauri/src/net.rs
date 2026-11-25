@@ -19,13 +19,23 @@ use iroh::{
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use n0_future::{Stream, StreamExt};
 
+#[cfg(test)]
+mod memory;
+#[cfg(test)]
+pub(crate) use memory::Lan;
+
 /// What connections are for, so only other Tightbeam apps connect.
 const ALPN: &[u8] = b"tightbeam/1";
 /// mDNS service name, so we only see other Tightbeam apps (`_tightbeam._udp.local`).
 const SERVICE: &str = "tightbeam";
 
 pub(crate) enum Network {
-    Iroh { endpoint: Endpoint, mdns: MdnsAddressLookup },
+    Iroh {
+        endpoint: Endpoint,
+        mdns: MdnsAddressLookup,
+    },
+    #[cfg(test)]
+    Memory(memory::Node),
 }
 
 impl Network {
@@ -54,6 +64,8 @@ impl Network {
     pub fn id(&self) -> EndpointId {
         match self {
             Self::Iroh { endpoint, .. } => endpoint.id(),
+            #[cfg(test)]
+            Self::Memory(node) => node.id(),
         }
     }
 
@@ -65,6 +77,8 @@ impl Network {
                     if name.is_empty() { None } else { UserData::try_from(name.to_string()).ok() };
                 endpoint.set_user_data_for_address_lookup(data);
             }
+            #[cfg(test)]
+            Self::Memory(node) => node.advertise(name),
         }
     }
 
@@ -72,12 +86,16 @@ impl Network {
     pub async fn discoveries(&self) -> Discoveries {
         match self {
             Self::Iroh { mdns, .. } => Discoveries::Iroh(Box::pin(mdns.subscribe().await)),
+            #[cfg(test)]
+            Self::Memory(node) => node.discoveries(),
         }
     }
 
     pub async fn connect(&self, peer: EndpointId) -> Result<Conn> {
         match self {
             Self::Iroh { endpoint, .. } => Ok(Conn::Iroh(endpoint.connect(peer, ALPN).await?)),
+            #[cfg(test)]
+            Self::Memory(node) => Ok(Conn::Memory(node.connect(peer)?)),
         }
     }
 
@@ -85,6 +103,8 @@ impl Network {
     pub async fn accept(&self) -> Option<Accepting> {
         match self {
             Self::Iroh { endpoint, .. } => endpoint.accept().await.map(Accepting::Iroh),
+            #[cfg(test)]
+            Self::Memory(node) => node.accept().await,
         }
     }
 
@@ -92,6 +112,8 @@ impl Network {
     pub async fn close(&self) {
         match self {
             Self::Iroh { endpoint, .. } => endpoint.close().await,
+            #[cfg(test)]
+            Self::Memory(node) => node.close(),
         }
     }
 }
@@ -104,6 +126,8 @@ pub(crate) enum Discovery {
 
 pub(crate) enum Discoveries {
     Iroh(Pin<Box<dyn Stream<Item = DiscoveryEvent> + Send>>),
+    #[cfg(test)]
+    Memory(tokio::sync::mpsc::UnboundedReceiver<Discovery>),
 }
 
 impl Discoveries {
@@ -122,19 +146,27 @@ impl Discoveries {
                     _ => continue,
                 }
             },
+            #[cfg(test)]
+            Self::Memory(events) => events.recv().await,
         }
     }
 }
 
 /// A connection on its way in.
+// The small variant exists only in tests, so boxing the large one would cost the app.
+#[cfg_attr(test, allow(clippy::large_enum_variant))]
 pub(crate) enum Accepting {
     Iroh(Incoming),
+    #[cfg(test)]
+    Memory(memory::Conn),
 }
 
 impl Accepting {
     pub async fn connected(self) -> Result<Conn> {
         match self {
             Self::Iroh(incoming) => Ok(Conn::Iroh(incoming.await?)),
+            #[cfg(test)]
+            Self::Memory(conn) => Ok(Conn::Memory(conn)),
         }
     }
 }
@@ -142,6 +174,8 @@ impl Accepting {
 #[derive(Clone)]
 pub(crate) enum Conn {
     Iroh(iroh::endpoint::Connection),
+    #[cfg(test)]
+    Memory(memory::Conn),
 }
 
 /// The route a connection takes: the peer's address and the round trip in milliseconds.
@@ -154,6 +188,8 @@ impl Conn {
     pub fn remote_id(&self) -> EndpointId {
         match self {
             Self::Iroh(conn) => conn.remote_id(),
+            #[cfg(test)]
+            Self::Memory(conn) => conn.remote_id(),
         }
     }
 
@@ -162,6 +198,11 @@ impl Conn {
             Self::Iroh(conn) => {
                 let (send, recv) = conn.open_bi().await?;
                 Ok((SendStream::Iroh(send), RecvStream::Iroh(recv)))
+            }
+            #[cfg(test)]
+            Self::Memory(conn) => {
+                let (send, recv) = conn.open_bi()?;
+                Ok((SendStream::Memory(send), RecvStream::Memory(recv)))
             }
         }
     }
@@ -172,6 +213,11 @@ impl Conn {
                 let (send, recv) = conn.accept_bi().await?;
                 Ok((SendStream::Iroh(send), RecvStream::Iroh(recv)))
             }
+            #[cfg(test)]
+            Self::Memory(conn) => {
+                let (send, recv) = conn.accept_bi().await?;
+                Ok((SendStream::Memory(send), RecvStream::Memory(recv)))
+            }
         }
     }
 
@@ -179,6 +225,8 @@ impl Conn {
     pub fn close(&self, code: u32, reason: &[u8]) {
         match self {
             Self::Iroh(conn) => conn.close(code.into(), reason),
+            #[cfg(test)]
+            Self::Memory(conn) => conn.close(),
         }
     }
 
@@ -186,6 +234,8 @@ impl Conn {
     pub async fn closed(&self) {
         match self {
             Self::Iroh(conn) => drop(conn.closed().await),
+            #[cfg(test)]
+            Self::Memory(conn) => conn.closed().await,
         }
     }
 
@@ -197,18 +247,24 @@ impl Conn {
                 let (address, rtt) = (path.remote_addr().to_string(), path.rtt());
                 Some(Route { address, rtt_ms: rtt.as_secs_f64() * 1000.0 })
             }
+            #[cfg(test)]
+            Self::Memory(_) => None,
         }
     }
 }
 
 pub(crate) enum SendStream {
     Iroh(iroh::endpoint::SendStream),
+    #[cfg(test)]
+    Memory(memory::Send),
 }
 
 impl SendStream {
     pub async fn write_all(&mut self, buf: &[u8]) -> Result<()> {
         match self {
             Self::Iroh(send) => Ok(send.write_all(buf).await?),
+            #[cfg(test)]
+            Self::Memory(send) => send.write_all(buf),
         }
     }
 
@@ -216,6 +272,8 @@ impl SendStream {
     pub fn finish(&mut self) -> Result<()> {
         match self {
             Self::Iroh(send) => Ok(send.finish()?),
+            #[cfg(test)]
+            Self::Memory(send) => send.finish(),
         }
     }
 
@@ -223,12 +281,16 @@ impl SendStream {
     pub async fn stopped(&mut self) {
         match self {
             Self::Iroh(send) => drop(send.stopped().await),
+            #[cfg(test)]
+            Self::Memory(send) => send.stopped().await,
         }
     }
 }
 
 pub(crate) enum RecvStream {
     Iroh(iroh::endpoint::RecvStream),
+    #[cfg(test)]
+    Memory(memory::Recv),
 }
 
 impl RecvStream {
@@ -236,12 +298,16 @@ impl RecvStream {
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>> {
         match self {
             Self::Iroh(recv) => Ok(recv.read(buf).await?),
+            #[cfg(test)]
+            Self::Memory(recv) => recv.read(buf).await,
         }
     }
 
     pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
         match self {
             Self::Iroh(recv) => Ok(recv.read_exact(buf).await?),
+            #[cfg(test)]
+            Self::Memory(recv) => recv.read_exact(buf).await,
         }
     }
 }

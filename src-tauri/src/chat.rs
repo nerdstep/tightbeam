@@ -1745,6 +1745,9 @@ async fn read_json<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Res
 }
 
 #[cfg(test)]
+mod protocol_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
