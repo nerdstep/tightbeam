@@ -40,17 +40,17 @@ use tokio::{
 
 use crate::{
     db::{Cursor, Db, FileState, Hit, Message, Page},
-    entry::{Entry, FileInfo, Kind, Ref, Wire},
+    entry::{
+        Entry, FileInfo, Kind, MAX_EMOJI_CHARS, MAX_FILE_BYTES, MAX_TEXT_CHARS, Ref, VANISH_SECS,
+        Wire, checked_file, clean, is_hash,
+    },
 };
 
 pub const ALPN: &[u8] = b"tightbeam/1";
 /// mDNS service name, so we only see other Tightbeam apps (`_tightbeam._udp.local`).
 const SERVICE: &str = "tightbeam";
 const MAX_FRAME: usize = 64 * 1024;
-const MAX_TEXT_CHARS: usize = 4000;
 const MAX_NAME_CHARS: usize = 40;
-/// Room for an emoji made of several code points, like a family or a flag.
-const MAX_EMOJI_CHARS: usize = 16;
 const PAIR_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REDIAL_EVERY: Duration = Duration::from_secs(3);
@@ -58,17 +58,10 @@ const REDIAL_EVERY: Duration = Duration::from_secs(3);
 const NUDGE_EVERY: Duration = Duration::from_secs(3);
 /// This build's version, sent in `Hello`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// How long a vanishing message can last once seen: 5 seconds to 7 days.
-const VANISH_SECS: std::ops::RangeInclusive<u64> = 5..=7 * 24 * 60 * 60;
 /// Search shows at most this many matches, the newest.
 pub const SEARCH_LIMIT: usize = 100;
 /// An away note is a few words, like "lunch" or "back at 3".
 const MAX_NOTE_CHARS: usize = 100;
-/// The largest file that can be sent: 1 GB.
-pub const MAX_FILE_BYTES: u64 = 1 << 30;
-const MAX_FILE_NAME_CHARS: usize = 200;
-/// Room for a tiny JPEG preview as a `data:` URL.
-const MAX_PREVIEW_CHARS: usize = 8 * 1024;
 /// What this build can do beyond 0.6, said in `Hello`.
 const FEATURES: &[&str] = &[FILES];
 /// Feature: sends and receives files.
@@ -1149,47 +1142,8 @@ impl Core {
     ) -> Result<()> {
         loop {
             match read_frame(recv).await? {
-                Frame::Msg(Wire {
-                    seq,
-                    ts,
-                    hlc,
-                    text,
-                    reply_to,
-                    react_to,
-                    edit_of,
-                    delete_of,
-                    vanish,
-                    file,
-                }) => {
-                    // A reply to anyone but the two of us becomes a plain message. A
-                    // reaction to a stranger's message, or an edit or delete of anyone's
-                    // but the sender's own, is stored but never shown. A file that's too
-                    // big or badly described is left off.
-                    let kind = match (delete_of, edit_of, react_to) {
-                        (Some(of), ..) => Kind::Delete { of },
-                        (None, Some(of), _) => Kind::Edit { of },
-                        (None, None, Some(to)) => Kind::Reaction { to },
-                        (None, None, None) => {
-                            let reply_to = reply_to.filter(|to| self.is_ours(to, peer));
-                            let vanish =
-                                vanish.map(|v| v.clamp(*VANISH_SECS.start(), *VANISH_SECS.end()));
-                            let file = file.and_then(|f| checked_file(*f));
-                            Kind::Message { reply_to, vanish, file }
-                        }
-                    };
-                    let limit = if matches!(kind, Kind::Reaction { .. }) {
-                        MAX_EMOJI_CHARS
-                    } else {
-                        MAX_TEXT_CHARS
-                    };
-                    let entry = Entry {
-                        author: peer.to_string(),
-                        seq,
-                        ts,
-                        hlc: hlc.unwrap_or(ts),
-                        text: clean(&text, limit),
-                        kind,
-                    };
+                Frame::Msg(wire) => {
+                    let entry = wire.admit(peer, &self.id());
                     let (is_new, have) = {
                         let db = self.db();
                         (db.insert(&entry)?, db.max_seq(peer)?)
@@ -1721,52 +1675,6 @@ fn features_from(stored: Option<&str>) -> Vec<String> {
     stored.split(',').filter(|f| !f.is_empty()).map(String::from).collect()
 }
 
-/// A file's description, tidied, or `None` if it can't be accepted: no valid hash, empty,
-/// or over the size limit. Image details that don't make sense are dropped.
-fn checked_file(file: FileInfo) -> Option<FileInfo> {
-    if !is_hash(&file.hash) || file.size == 0 || file.size > MAX_FILE_BYTES {
-        return None;
-    }
-    let mut name = clean(&file.name, MAX_FILE_NAME_CHARS);
-    if name.is_empty() {
-        name = "file".into();
-    }
-    let mime = file.mime.trim().to_ascii_lowercase();
-    let mime_ok = mime.len() <= 100
-        && mime.contains('/')
-        && mime.chars().all(|c| c.is_ascii_alphanumeric() || "/.+-".contains(c));
-    let mime = if mime_ok { mime } else { "application/octet-stream".into() };
-    let dims = match (file.width, file.height) {
-        (Some(w), Some(h)) if (1..=100_000).contains(&w) && (1..=100_000).contains(&h) => {
-            Some((w, h))
-        }
-        _ => None,
-    };
-    let preview = file.preview.filter(|p| {
-        p.len() <= MAX_PREVIEW_CHARS
-            && ["data:image/jpeg;base64,", "data:image/png;base64,", "data:image/webp;base64,"]
-                .iter()
-                .any(|prefix| p.starts_with(prefix))
-            && p.split_once(',').is_some_and(|(_, data)| {
-                data.chars().all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
-            })
-    });
-    Some(FileInfo {
-        hash: file.hash,
-        name,
-        size: file.size,
-        mime,
-        width: dims.map(|d| d.0),
-        height: dims.map(|d| d.1),
-        preview: preview.filter(|_| dims.is_some()),
-    })
-}
-
-/// A BLAKE3 hash as files are named by: 64 lowercase hex digits.
-fn is_hash(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-
 fn hash_file(path: &Path) -> Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update_reader(std::fs::File::open(path)?)?;
@@ -1840,10 +1748,6 @@ impl Drop for Progress {
 /// The peer's name for messages, or a stand-in before they've named themselves.
 fn title_name(name: Option<String>) -> String {
     name.filter(|n| !n.is_empty()).unwrap_or_else(|| "the other person".into())
-}
-
-fn clean(s: &str, max_chars: usize) -> String {
-    s.trim().chars().take(max_chars).collect()
 }
 
 fn now_ms() -> i64 {
@@ -1997,39 +1901,5 @@ mod tests {
         let safe = safe_name(&long);
         assert_eq!(safe.chars().count(), 100);
         assert!(safe.ends_with(".jpeg"));
-    }
-
-    #[test]
-    fn file_details_are_checked() {
-        let good = FileInfo {
-            hash: "0f".repeat(32),
-            name: "  pic.png ".into(),
-            size: 10,
-            mime: "Image/PNG".into(),
-            width: Some(4),
-            height: Some(3),
-            preview: Some("data:image/jpeg;base64,AAAA".into()),
-        };
-        let checked = checked_file(good.clone()).unwrap();
-        assert_eq!((checked.name.as_str(), checked.mime.as_str()), ("pic.png", "image/png"));
-        assert_eq!(checked.preview, good.preview);
-
-        let bad_hash = FileInfo { hash: "../x".into(), ..good.clone() };
-        assert!(checked_file(bad_hash).is_none());
-        assert!(checked_file(FileInfo { hash: "0F".repeat(32), ..good.clone() }).is_none());
-        assert!(checked_file(FileInfo { size: MAX_FILE_BYTES + 1, ..good.clone() }).is_none());
-        assert!(checked_file(FileInfo { size: 0, ..good.clone() }).is_none());
-
-        let odd = checked_file(FileInfo {
-            mime: "text/html; charset=utf-8".into(),
-            width: Some(0),
-            preview: Some("data:image/svg+xml;base64,AAAA".into()),
-            ..good.clone()
-        })
-        .unwrap();
-        assert_eq!(odd.mime, "application/octet-stream");
-        assert_eq!((odd.width, odd.height, odd.preview), (None, None, None));
-        let script = Some("data:image/jpeg;base64,<script>".into());
-        assert!(checked_file(FileInfo { preview: script, ..good }).unwrap().preview.is_none());
     }
 }
