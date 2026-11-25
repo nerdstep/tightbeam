@@ -37,13 +37,16 @@ ui/src/store.ts           app state (TanStack Store), fed by events from Rust; h
 ui/src/commands.ts        slash commands
 ui/src/components/        the screens: Setup, Pair, Chat, Search, Files, PairDialog, Notice
 ui/src/components/ui/     shadcn/ui components (generated; update with the shadcn CLI)
-src-tauri/src/chat.rs     the engine: discovery, pairing, protocol, sync
+src-tauri/src/chat.rs     the engine: pairing, protocol, sync
+src-tauri/src/chat/protocol_tests.rs  the protocol between two engines, on the in-memory network
+src-tauri/src/net.rs      the network the engine runs on: iroh and mDNS, or in memory for tests
+src-tauri/src/clock.rs    wall-clock time, which tests move with tokio's paused clock
 src-tauri/src/entry.rs    log entries: each kind, its wire form, admission of a peer's
 src-tauri/src/db.rs       SQLite storage and history paging
 src-tauri/src/lib.rs      Tauri commands and events
 src-tauri/src/desktop.rs  tray, unread count, notifications
 src-tauri/src/updates.rs  automatic updates
-src-tauri/tests/          two real engines chatting; paging through 50,000 messages
+src-tauri/tests/          two real engines on the real network; paging through 50,000 messages
 src-tauri/examples/seed.rs  fills two test profiles with a long synthetic history
 ```
 
@@ -59,7 +62,7 @@ Needs Rust (via rustup) and bun. The Tauri CLI comes with `bun install`.
 bun install            # once
 bun tauri dev          # run the app; the UI hot-reloads as you edit
 bun tauri build        # make an installer in src-tauri/target/release/bundle/
-cd src-tauri; cargo test   # run the two-peer test (about 5 seconds)
+cd src-tauri; cargo test   # run the tests (about 5 seconds, mostly the real-network one)
 ```
 
 `bun run dev` alone starts only Vite. The UI needs the Tauri bridge, so it won't work in a regular browser.
