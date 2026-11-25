@@ -31,7 +31,7 @@ use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::entry::{Entry, FileInfo, Kind, Ref};
+use crate::entry::{DELETE, EDIT, Entry, FileInfo, Kind, MESSAGE, REACTION, Ref};
 
 /// Where a message's file has got to on this computer.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -130,12 +130,6 @@ pub struct Page {
     /// Whether there are messages older than the first one here.
     pub has_more: bool,
 }
-
-/// Values of the `kind` column.
-const MESSAGE: &str = "message";
-const REACTION: &str = "reaction";
-const EDIT: &str = "edit";
-const DELETE: &str = "delete";
 
 /// Values of `files.state`.
 const FILE_DONE: &str = "done";
@@ -604,13 +598,12 @@ impl Db {
 
     /// Stores an entry. Returns false if it was already stored.
     pub fn insert(&self, e: &Entry) -> Result<bool> {
-        let (kind, to, vanish, file) = match &e.kind {
-            Kind::Message { reply_to, vanish, file } => {
-                (MESSAGE, reply_to.as_ref(), *vanish, file.as_ref())
+        let (to, vanish, file) = match &e.kind {
+            Kind::Message { reply_to, vanish, file } => (reply_to.as_ref(), *vanish, file.as_ref()),
+            Kind::Reaction { to } | Kind::Edit { of: to } | Kind::Delete { of: to } => {
+                (Some(to), None, None)
             }
-            Kind::Reaction { to } => (REACTION, Some(to), None, None),
-            Kind::Edit { of } => (EDIT, Some(of), None, None),
-            Kind::Delete { of } => (DELETE, Some(of), None, None),
+            Kind::Inert { to, .. } => (to.as_ref(), None, None),
         };
         let changed = self.0.execute(
             "INSERT OR IGNORE INTO messages
@@ -622,7 +615,7 @@ impl Db {
                 e.ts,
                 e.hlc,
                 e.text,
-                kind,
+                e.kind.tag(),
                 to.map(|r| &r.author),
                 to.map(|r| r.seq as i64),
                 vanish.map(|v| v as i64),
@@ -635,8 +628,8 @@ impl Db {
         }
         match &e.kind {
             Kind::Message { .. } => self.index(&Ref { author: e.author.clone(), seq: e.seq })?,
-            // Only the author's own edits and deletes count (see `current`).
-            Kind::Edit { of } | Kind::Delete { of } if of.author == e.author => {
+            // Only the author's own edits and deletes get here; anyone else's are inert.
+            Kind::Edit { of } | Kind::Delete { of } => {
                 self.0.execute(
                     "DELETE FROM search WHERE author = ?1 AND seq = ?2",
                     params![of.author, of.seq as i64],
@@ -813,24 +806,27 @@ impl Db {
              FROM messages {filter}"
         ))?;
         let rows = stmt.query_map(p, |r| {
+            let author: String = r.get(0)?;
             let to = match (r.get::<_, Option<String>>(6)?, r.get::<_, Option<i64>>(7)?) {
                 (Some(author), Some(seq)) => Some(Ref { author, seq: seq as u64 }),
                 _ => None,
             };
-            let kind = match (r.get::<_, String>(5)?.as_str(), to) {
-                (REACTION, Some(to)) => Kind::Reaction { to },
-                (EDIT, Some(of)) => Kind::Edit { of },
-                (DELETE, Some(of)) => Kind::Delete { of },
-                (_, reply_to) => Kind::Message {
+            let tag: String = r.get(5)?;
+            let kind = match (tag.as_str(), to) {
+                (MESSAGE, reply_to) => Kind::Message {
                     reply_to,
                     vanish: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
                     file: r
                         .get::<_, Option<String>>(9)?
                         .and_then(|json| serde_json::from_str(&json).ok()),
                 },
+                (REACTION, Some(to)) => Kind::Reaction { to },
+                (EDIT | DELETE, Some(of)) => Kind::change(&author, &tag, of),
+                // A kind this build doesn't know, left by a newer one.
+                (_, to) => Kind::Inert { tag, to },
             };
             Ok(Entry {
-                author: r.get(0)?,
+                author,
                 seq: r.get::<_, i64>(1)? as u64,
                 ts: r.get(2)?,
                 hlc: r.get(3)?,
@@ -963,6 +959,51 @@ mod tests {
             "opens again without migrating twice"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn every_kind_survives_the_log() {
+        let db = Db::open(Path::new(":memory:")).unwrap();
+        let at = |author: &str, seq| Ref { author: author.into(), seq };
+        let file = FileInfo {
+            hash: "a".repeat(64),
+            name: "beach.jpg".into(),
+            size: 1000,
+            mime: "image/jpeg".into(),
+            width: Some(4),
+            height: Some(3),
+            preview: None,
+        };
+        let full = Entry {
+            hlc: 9,
+            kind: Kind::Message { reply_to: Some(at("me", 1)), vanish: Some(60), file: Some(file) },
+            ..msg("peer", 1)
+        };
+        let inert = Kind::Inert { tag: EDIT.into(), to: Some(at("me", 1)) };
+        let entries = [
+            full,
+            react("peer", 2, "👍", ("me", 1)),
+            edit("peer", 3, "fixed", ("peer", 1)),
+            delete("peer", 4, ("peer", 1)),
+            Entry { kind: inert.clone(), ..msg("peer", 5) },
+        ];
+        db.insert_many(&entries).unwrap();
+        assert_eq!(db.since("peer", 0).unwrap(), entries);
+
+        // Someone else's edit reads back as inert, however it was stored.
+        db.insert(&edit("peer", 6, "not yours", ("me", 1))).unwrap();
+        assert_eq!(db.since("peer", 5).unwrap()[0].kind, inert);
+
+        // A kind this build doesn't know, left by a newer one.
+        db.0.execute(
+            "INSERT INTO messages (author, seq, ts, hlc, text, kind, ref_author, ref_seq)
+             VALUES ('me', 1, 1, 1, 'x', 'pin', 'peer', 1)",
+            [],
+        )
+        .unwrap();
+        let pin = Kind::Inert { tag: "pin".into(), to: Some(at("peer", 1)) };
+        assert_eq!(db.since("me", 0).unwrap()[0].kind, pin);
+        assert!(db.all().unwrap().iter().all(|m| m.author == "peer"), "never shown");
     }
 
     #[test]

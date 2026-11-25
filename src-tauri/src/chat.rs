@@ -1094,8 +1094,10 @@ impl Core {
             }
             generation
         };
-        for entry in self.db().since(&self.id(), their_have)? {
-            let _ = out.send(Frame::Msg(entry.into_wire()));
+        for wire in
+            self.db().since(&self.id(), their_have)?.into_iter().filter_map(Entry::into_wire)
+        {
+            let _ = out.send(Frame::Msg(wire));
         }
         // Covers anything seen while we were apart.
         let _ = out.send(Frame::Seen { up_to: self.state().seen });
@@ -1545,8 +1547,8 @@ impl Core {
 
     /// Sends one of my entries now, if connected. Otherwise it goes with the catch-up.
     fn send_live(&self, entry: Entry) {
-        if let Some(s) = &self.state().session {
-            let _ = s.out.send(Frame::Msg(entry.into_wire()));
+        if let (Some(s), Some(wire)) = (&self.state().session, entry.into_wire()) {
+            let _ = s.out.send(Frame::Msg(wire));
         }
     }
 
@@ -1564,9 +1566,6 @@ impl Core {
             }
             Kind::Reaction { to } => self.updated(&to)?,
             Kind::Edit { of } | Kind::Delete { of } => {
-                if of.author != entry.author {
-                    return Ok(()); // not theirs to change
-                }
                 // Blank it if it's deleted. Also catches an edit sent after the delete.
                 if self.db().message(&of)?.is_some_and(|m| m.deleted) {
                     self.db().scrub(&of)?;
@@ -1574,6 +1573,7 @@ impl Core {
                 }
                 self.updated(&of)?;
             }
+            Kind::Inert { .. } => {} // nothing to show
         }
         Ok(())
     }
@@ -1845,7 +1845,7 @@ mod tests {
             kind: Kind::Message { reply_to: None, vanish: Some(60), file: None },
             ..Entry::message("me", 9, 1, "psst")
         };
-        let json = serde_json::to_string(&Frame::Msg(vanishing.into_wire())).unwrap();
+        let json = serde_json::to_string(&Frame::Msg(vanishing.into_wire().unwrap())).unwrap();
         assert_eq!(json, r#"{"t":"msg","seq":9,"ts":1,"hlc":1,"text":"psst","vanish":60}"#);
         let file = FileInfo {
             hash: "ab".repeat(32),
@@ -1860,7 +1860,7 @@ mod tests {
             kind: Kind::Message { reply_to: None, vanish: None, file: Some(file) },
             ..Entry::message("me", 10, 1, "")
         };
-        let json = serde_json::to_string(&Frame::Msg(photo.into_wire())).unwrap();
+        let json = serde_json::to_string(&Frame::Msg(photo.into_wire().unwrap())).unwrap();
         let hash = "ab".repeat(32);
         assert_eq!(
             json,
@@ -1869,7 +1869,7 @@ mod tests {
             )
         );
         // A plain message has the fields from before 0.4, plus `hlc` from 0.5.
-        let plain = Frame::Msg(Entry::message("me", 7, 1, "hi").into_wire());
+        let plain = Frame::Msg(Entry::message("me", 7, 1, "hi").into_wire().unwrap());
         let json = serde_json::to_string(&plain).unwrap();
         assert_eq!(json, r#"{"t":"msg","seq":7,"ts":1,"hlc":1,"text":"hi"}"#);
         let to = Ref { author: "x".into(), seq: 2 };
@@ -1878,7 +1878,7 @@ mod tests {
             kind: Kind::Reaction { to },
             ..Entry::message("me", 8, 1, "")
         };
-        let json = serde_json::to_string(&Frame::Msg(reaction.into_wire())).unwrap();
+        let json = serde_json::to_string(&Frame::Msg(reaction.into_wire().unwrap())).unwrap();
         assert_eq!(
             json,
             r#"{"t":"msg","seq":8,"ts":1,"hlc":1,"text":"👍","react_to":{"author":"x","seq":2}}"#
