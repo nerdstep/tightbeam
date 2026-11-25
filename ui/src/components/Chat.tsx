@@ -18,6 +18,7 @@ import { api, type Message as ChatMessage, type Quote, type Reaction } from '@/a
 import { type Command, parse, suggest } from '@/commands'
 import { describeFile, FileView, StagedFiles, Viewer } from '@/components/Files'
 import { Linkified } from '@/components/Linkified'
+import { NoteCard } from '@/components/Notice'
 import { SearchBar, SearchResults } from '@/components/Search'
 import { SettingsMenu } from '@/components/SettingsMenu'
 import { StatusDialog } from '@/components/StatusDialog'
@@ -63,6 +64,7 @@ import {
   run,
   setDeleting,
   setEditing,
+  setHint,
   setReplyingTo,
   stageDropped,
   stageFiles,
@@ -730,7 +732,6 @@ function fit(el: HTMLTextAreaElement) {
 
 function Composer() {
   const [text, setText] = useState('')
-  const [hint, setHint] = useState<string | null>(null)
   // Which suggestion is highlighted, and whether Escape closed the list.
   const [active, setActive] = useState(0)
   const [dismissed, setDismissed] = useState(false)
@@ -739,9 +740,10 @@ function Composer() {
   const textRef = useRef<HTMLTextAreaElement>(null)
   const typingSentRef = useRef(0)
   const { scrollToEnd } = useMessageScroller()
-  const { replyingTo, editing, peerName, myId, away, dndUntil, staged } = useSelector(
+  const { replyingTo, editing, peerName, myId, away, dndUntil, staged, hint } = useSelector(
     store,
     (s) => ({
+      hint: s.hint,
       replyingTo: s.replyingTo,
       editing: s.editing,
       peerName: s.status?.peer?.name || 'them',
@@ -756,6 +758,9 @@ function Composer() {
   const [showingStatus, setShowingStatus] = useState(false)
   // What was in the box before editing started; it comes back when editing ends.
   const draftRef = useRef<string | null>(null)
+
+  // A hint is about this message box; it doesn't outlive it.
+  useEffect(() => () => setHint(null), [])
 
   // Choosing Reply on a message: start typing straight away.
   useEffect(() => {
@@ -830,6 +835,7 @@ function Composer() {
     }
     const saved = await run(
       api.editMessage({ author: of.author, seq: of.seq }, value).then(() => true),
+      'composer',
     )
     if (saved) setEditing(null)
   }
@@ -866,6 +872,7 @@ function Composer() {
               .arrayBuffer()
               .then((bytes) => api.sendFile(bytes, s.details, withText, to))
           : api.sendStaged(s.source.disk, s.details, withText, to),
+        'composer',
       )
       if (!sent) {
         if (first) {
@@ -888,7 +895,7 @@ function Composer() {
     setReplyingTo(null)
     typingSentRef.current = 0 // the next message signals typing right away
     const to = reply ? { author: reply.author, seq: reply.seq } : undefined
-    const sent = await run(api.sendMessage(value, to, vanish))
+    const sent = await run(api.sendMessage(value, to, vanish), 'composer')
     if (sent) {
       addMessage(sent)
       scrollToEnd({ behavior: 'smooth' })
@@ -963,9 +970,12 @@ function Composer() {
         />
       )}
       {hint && (
-        <p className="absolute right-4 bottom-full left-4 mb-2 rounded-lg border bg-popover px-3 py-2 text-sm text-popover-foreground shadow-md">
+        <NoteCard
+          className="absolute right-4 bottom-full left-4 mb-2"
+          onDismiss={() => setHint(null)}
+        >
           {hint}
-        </p>
+        </NoteCard>
       )}
       {dnd && dndUntil !== null && (
         <div className="mb-2 flex items-center gap-2 rounded-md border-l-2 border-destructive bg-muted py-1 pr-1 pl-2 text-xs">

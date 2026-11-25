@@ -48,6 +48,11 @@ interface State {
   loadingOlder: boolean
   /** A UI-side error (a failed command), shown in place of the engine's notice. */
   error: string | null
+  /**
+   * A problem with what's being written (a file that can't go, a send that failed, a
+   * mistyped command), shown above the message box.
+   */
+  hint: string | null
   /** A downloaded update waiting for a restart. */
   update: UpdateReady | null
   /** Counts nudges, sent and received; each one shakes the window. */
@@ -77,6 +82,7 @@ export const store = createStore<State>({
   transcript: transcript.empty,
   loadingOlder: false,
   error: null,
+  hint: null,
   update: null,
   nudges: 0,
   replyingTo: null,
@@ -127,28 +133,31 @@ function updateMessage(updated: Message) {
 export async function stageFiles(files: File[]) {
   const fitting = files.filter((f) => f.size > 0 && f.size <= MAX_PASTED_BYTES)
   const left = files.find((f) => !fitting.includes(f))
+  let note = null
   if (left) {
-    const note = left.size
+    note = left.size
       ? `${left.name} is ${formatBytes(left.size)}. Drop it on the window or pick it with the paperclip to send it.`
       : `${left.name || 'That file'} is empty.`
-    store.setState((s) => ({ ...s, error: note }))
   }
+  setHint(note)
   addStaged(await Promise.all(fitting.map(stagePasted)))
 }
 
 /** Adds files dropped on the window to the message box. */
 export async function stageDropped(paths: string[]) {
-  await stageStaged(run(api.stagePaths(paths)))
+  await stageStaged(run(api.stagePaths(paths), 'composer'))
 }
 
 /** Asks which files to send, and adds them to the message box. */
 export async function pickFiles() {
-  await stageStaged(run(api.pickFiles()))
+  await stageStaged(run(api.pickFiles(), 'composer'))
 }
 
 async function stageStaged(result: Promise<StagedFiles | undefined>) {
-  const { staged = [], refused = [] } = (await result) ?? {}
-  if (refused.length) store.setState((s) => ({ ...s, error: refused.join(' ') }))
+  const outcome = await result
+  if (!outcome) return // the hint says why
+  const { staged, refused } = outcome
+  setHint(refused.length ? refused.join(' ') : null)
   addStaged(await Promise.all(staged.map(stageFromDisk)))
 }
 
@@ -160,7 +169,7 @@ function addStaged(ready: Staged[]) {
 export function unstageFile(id: number) {
   const gone = store.state.staged.find((s) => s.id === id)
   if (gone) unstage(gone)
-  store.setState((s) => ({ ...s, staged: s.staged.filter((x) => x.id !== id) }))
+  store.setState((s) => ({ ...s, staged: s.staged.filter((x) => x.id !== id), hint: null }))
 }
 
 /** Shows a picture full size, or closes it with `null`. */
@@ -265,18 +274,30 @@ export async function loadOlder() {
   }))
 }
 
-/** Runs a command; shows its error instead of throwing. Resolves to undefined on failure. */
-export async function run<T>(promise: Promise<T>): Promise<T | undefined> {
+/**
+ * Runs a command; shows its error instead of throwing. Resolves to undefined on failure.
+ * The error goes in the banner, or above the message box for something being written.
+ */
+export async function run<T>(
+  promise: Promise<T>,
+  where: 'banner' | 'composer' = 'banner',
+): Promise<T | undefined> {
   try {
     return await promise
   } catch (e) {
-    store.setState((s) => ({ ...s, error: String(e) }))
+    if (where === 'composer') setHint(String(e))
+    else store.setState((s) => ({ ...s, error: String(e) }))
     return undefined
   }
 }
 
 export function dismissError() {
   store.setState((s) => ({ ...s, error: null }))
+}
+
+/** Shows a problem with what's being written above the message box, or clears it. */
+export function setHint(hint: string | null) {
+  store.setState((s) => (s.hint === hint ? s : { ...s, hint }))
 }
 
 /** Shakes the window; with `sound`, chimes too (a nudge from the peer). */
