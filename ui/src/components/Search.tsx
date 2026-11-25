@@ -10,6 +10,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
 import { closeSearch, reveal, setSearchActive, setSearchQuery, store } from '@/store'
+import { messageKey } from '@/transcript'
 
 /** Matches past this many aren't shown (see SEARCH_LIMIT in chat.rs). */
 const LIMIT = 100
@@ -98,7 +99,7 @@ export function SearchResults() {
         <>
           <ul ref={listRef} className="p-2">
             {hits.map((hit, i) => (
-              <li key={`${hit.message.author}:${hit.message.seq}`}>
+              <li key={messageKey(hit.message)}>
                 <button
                   type="button"
                   className={`block w-full rounded-md px-3 py-2 text-left ${i === active ? 'bg-accent text-accent-foreground' : ''}`}

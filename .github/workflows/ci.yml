@@ -27,6 +27,8 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Type-check, lint, format check
         run: bun run check
+      - name: Tests
+        run: bun run test
 
   rust:
     name: Rust (${{ matrix.os }})

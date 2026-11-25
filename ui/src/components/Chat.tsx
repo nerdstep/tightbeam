@@ -55,7 +55,6 @@ import {
   addMessage,
   clearHistory,
   loadOlder,
-  messageKey,
   openSearch,
   run,
   setDeleting,
@@ -65,6 +64,7 @@ import {
   store,
   unstageFile,
 } from '@/store'
+import { messageKey } from '@/transcript'
 
 /** The reactions on offer. */
 const EMOJI = ['👍', '❤️', '😂', '😮', '😢', '🎉']
@@ -195,8 +195,8 @@ function Transcript() {
     useSelector(
       store,
       (s) => ({
-        messages: s.messages,
-        hasOlder: s.hasOlder,
+        messages: s.transcript.messages,
+        hasOlder: s.transcript.hasOlder,
         loadingOlder: s.loadingOlder,
         myId: s.status?.me.id ?? '',
         myName: s.status?.me.name || 'You',
@@ -930,7 +930,7 @@ function Composer() {
     }
     // Up in an empty box edits my last message.
     if (e.key === 'ArrowUp' && !text && !editing) {
-      const last = lastOfMine(store.state.messages, myId)
+      const last = lastOfMine(store.state.transcript.messages, myId)
       if (last) {
         e.preventDefault()
         setEditing(last)
