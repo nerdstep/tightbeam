@@ -2,7 +2,10 @@
 
 use std::time::Instant;
 
-use tightbeam_lib::db::{Cursor, Db, Entry, Message};
+use tightbeam_lib::{
+    db::{Cursor, Db, Message},
+    entry::Entry,
+};
 
 const COUNT: u64 = 50_000;
 

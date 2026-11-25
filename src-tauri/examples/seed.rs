@@ -10,7 +10,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use iroh::SecretKey;
-use tightbeam_lib::db::{Db, Entry};
+use tightbeam_lib::{db::Db, entry::Entry};
 
 const LINES: &[&str] = &[
     "hey",
