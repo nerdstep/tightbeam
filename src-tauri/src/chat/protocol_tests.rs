@@ -990,6 +990,7 @@ async fn any_file_goes_from_disk_by_path() {
     let sent = alice.send_file_from(&original, new).unwrap();
     let file = sent.file.unwrap();
     assert_eq!((file.state, file.info.size), (FileState::Done, bytes.len() as u64));
+    assert!(file.openable, "a PDF opens in its app");
 
     // Her copy is the store's own: changing the original afterwards changes nothing.
     std::fs::write(&original, b"edited").unwrap();

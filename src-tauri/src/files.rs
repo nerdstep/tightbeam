@@ -309,6 +309,24 @@ pub(crate) fn mime_for(name: &str) -> &'static str {
     }
 }
 
+/// Whether a file may open in its default app, by the end of its name. Opening runs that
+/// app on it, so this is an allow-list: pictures, documents without macros, audio and
+/// video. Anything else (programs, scripts, shortcuts, web pages, SVG, Office files with
+/// macros, disk images, archives) can only be shown in its folder.
+pub(crate) fn may_open(name: &str) -> bool {
+    const OPENABLE: &[&str] = &[
+        // Pictures.
+        "jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "heic", "heif", "tif", "tiff",
+        // Documents.
+        "pdf", "txt", "md", "csv", "docx", "xlsx", "pptx", "odt", "ods", "odp",
+        // Audio.
+        "mp3", "m4a", "aac", "wav", "flac", "ogg", // Video.
+        "mp4", "m4v", "mov", "webm", "mkv",
+    ];
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    OPENABLE.contains(&ext.as_str())
+}
+
 /// Types the webview may show as an image. Not SVG, which can carry scripts.
 pub(crate) fn may_show(mime: &str) -> bool {
     const SHOWABLE: &[&str] = &[
@@ -494,6 +512,38 @@ mod tests {
         assert!(!adding(&dir), "an interrupted copy goes at the next start");
         let _ = std::fs::remove_file(original);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_known_kinds_open() {
+        for name in ["beach.JPG", "Report.pdf", "notes.md", "budget.xlsx", "song.flac", "clip.mov"]
+        {
+            assert!(may_open(name), "{name}");
+        }
+        let unsafe_kinds = [
+            "setup.exe",
+            "install.msi",
+            "run.bat",
+            "script.ps1",
+            "link.lnk",
+            "site.url",
+            "page.html",
+            "logo.svg",
+            "macros.docm",
+            "sheet.xlsm",
+            "disk.iso",
+            "disk.dmg",
+            "archive.zip",
+            "Tool.app",
+            "go.command",
+            "go.sh",
+            "app.jar",
+            "no extension",
+            "trick.pdf.exe",
+        ];
+        for name in unsafe_kinds {
+            assert!(!may_open(name), "{name}");
+        }
     }
 
     #[test]

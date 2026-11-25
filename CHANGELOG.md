@@ -4,6 +4,8 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 
 ## Unreleased
 
+- Send any file, not just pictures: pick files with the paperclip, or drop them on the window. Files up to 1 GB go straight from disk, so big ones don't slow the app down. Changing or moving the original afterwards doesn't affect what was sent. The other side needs version 0.7 or later.
+- More kinds of received files open in their app with one click: PDFs, text and Office documents, audio and video, as well as pictures. Programs, scripts, web pages and archives can only be shown in their folder.
 - After unpairing and pairing with someone new, they get only the messages written from then on. Before, they also received every message sent to the previous person. Editing or deleting those older messages stays on your computer.
 - Messages from someone you were paired with before keep their name, instead of showing the name of whoever you're paired with now.
 - Clicking the quote in a reply jumps to the original message even when it's further back than the history loaded so far. Before, it did nothing until you'd scrolled back that far.

@@ -28,8 +28,8 @@ use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::clock::Clock;
 use crate::entry::{DELETE, EDIT, Entry, FileInfo, Kind, MESSAGE, REACTION, Ref};
+use crate::{clock::Clock, files::may_open};
 
 /// Where a message's file has got to on this computer.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -49,6 +49,9 @@ pub struct Attachment {
     #[serde(flatten)]
     pub info: FileInfo,
     pub state: FileState,
+    /// Whether it may open in its default app (`files::may_open`); if not, it can only be
+    /// shown in its folder.
+    pub openable: bool,
 }
 
 /// A file that's here: its name in the data folder, its type, and its size in bytes.
@@ -774,7 +777,10 @@ impl Db {
             None => None,
         };
         let file = match file {
-            Some(info) => Some(Attachment { state: self.file_state(&info.hash)?, info }),
+            Some(info) => {
+                let (state, openable) = (self.file_state(&info.hash)?, may_open(&info.name));
+                Some(Attachment { info, state, openable })
+            }
             None => None,
         };
         let reactions = self.reactions(&at)?;
