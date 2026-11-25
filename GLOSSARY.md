@@ -4,6 +4,26 @@ Private chat between two paired peers on the same network. Each person's history
 
 ## Language
 
+### Peers
+
+**Peer**:
+The one other person's app this one is paired with. Before pairing, the apps nearby are just nearby.
+_Avoid_: contact, friend, remote
+
+**Pairing**:
+Two apps agreeing to trust each other's key, after both screens show the same code. Each app pairs with one peer at a time.
+_Avoid_: linking, connecting
+
+**Session**:
+One connected stretch between two paired peers: from their greetings until the connection drops. A newer session replaces an older one.
+_Avoid_: connection (for the stretch of chat), call
+
+**Catch-up**:
+The entries a peer is missing, sent at the start of each session, before anything live.
+_Avoid_: sync (for this step), backfill
+
+### Logs
+
 **Log**:
 One author's history: an append-only, gap-free sequence of entries numbered from 1.
 _Avoid_: history, timeline (for the stored sequence)
