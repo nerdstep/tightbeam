@@ -257,7 +257,39 @@ impl Db {
             db.0.execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" })?;
             result?;
         }
+        if version < 6 {
+            // 0.8: everyone this computer has been paired with, by their last known name,
+            // so their messages keep it after pairing with someone new.
+            db.0.execute_batch(
+                "BEGIN;
+                 CREATE TABLE people (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO people (id, name)
+                     SELECT CAST(id.value AS TEXT), COALESCE(CAST(name.value AS TEXT), '')
+                     FROM settings id LEFT JOIN settings name ON name.key = 'peer_name'
+                     WHERE id.key = 'peer_id';
+                 PRAGMA user_version = 6;
+                 COMMIT;",
+            )?;
+        }
         Ok(db)
+    }
+
+    /// Everyone this computer has been paired with, as (id, last known name).
+    pub fn people(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.0.prepare_cached("SELECT id, name FROM people ORDER BY id")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Remembers `id`'s name, replacing an older one.
+    pub fn set_person(&self, id: &str, name: &str) -> Result<()> {
+        self.0
+            .prepare_cached(
+                "INSERT INTO people (id, name) VALUES (?1, ?2)
+                 ON CONFLICT (id) DO UPDATE SET name = excluded.name",
+            )?
+            .execute(params![id, name])?;
+        Ok(())
     }
 
     /// Starts the countdown on `author`'s vanishing messages up to `up_to` (they've been
@@ -1010,6 +1042,31 @@ mod tests {
         let pin = Kind::Inert { tag: "pin".into(), to: Some(at("peer", 1)) };
         assert_eq!(db.since("me", 0).unwrap()[0].kind, pin);
         assert!(db.all().unwrap().iter().all(|m| m.author == "peer"), "never shown");
+    }
+
+    #[test]
+    fn people_from_before_0_8_are_kept() {
+        let path = std::env::temp_dir().join(format!(
+            "tightbeam-people-{}.db",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        {
+            // A database from 0.7, paired with Bob.
+            let db = Db::open(&path).unwrap();
+            db.set("peer_id", "bob-id").unwrap();
+            db.set("peer_name", "Bob").unwrap();
+            db.0.execute_batch("DROP TABLE people; PRAGMA user_version = 5;").unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.people().unwrap(), [("bob-id".to_string(), "Bob".to_string())]);
+        db.set_person("bob-id", "Robert").unwrap();
+        db.set_person("carol-id", "Carol").unwrap();
+        let names: Vec<_> = db.people().unwrap().into_iter().map(|(_, name)| name).collect();
+        assert_eq!(names, ["Robert", "Carol"]);
+        drop(db);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

@@ -161,6 +161,9 @@ pub struct Status {
     /// Highest of my sequence numbers the peer has seen. Mine at or below are seen.
     pub peer_seen: u64,
     pub nearby: Vec<Person>,
+    /// Everyone I've been paired with, by their last known name, to label their messages
+    /// (the peer's, and anyone's from before).
+    pub people: Vec<Person>,
     pub pairing: Option<PairPrompt>,
     pub notice: Option<String>,
     /// Set when I went away with `/away`. Away from being idle isn't shown: by the time I
@@ -257,6 +260,8 @@ struct State {
     /// write after it (see `shares`). 0 for pairings from before 0.8.
     shared_after: u64,
     nearby: BTreeMap<String, String>,
+    /// See `Status::people`: id to name.
+    people: BTreeMap<String, String>,
     pairing: Option<Pairing>,
     session: Option<Session>,
     next_generation: u64,
@@ -348,6 +353,7 @@ impl Core {
         let peer_version = db.get_str("peer_version")?;
         let peer_features = features_from(db.get_str("peer_features")?.as_deref());
         let dnd_until = db.get_str("dnd_until")?.and_then(|s| s.parse().ok());
+        let people = db.people()?.into_iter().collect();
 
         let net = network(secret).await?;
         let discoveries = net.discoveries().await;
@@ -367,6 +373,7 @@ impl Core {
                 seen,
                 shared_after,
                 nearby: BTreeMap::new(),
+                people,
                 pairing: None,
                 session: None,
                 next_generation: 0,
@@ -424,6 +431,11 @@ impl Core {
             peer_seen: st.peer_seen,
             nearby: st
                 .nearby
+                .iter()
+                .map(|(id, name)| Person { id: id.clone(), name: name.clone() })
+                .collect(),
+            people: st
+                .people
                 .iter()
                 .map(|(id, name)| Person { id: id.clone(), name: name.clone() })
                 .collect(),
@@ -1203,6 +1215,7 @@ impl Core {
             let db = self.db();
             db.set("peer_id", id.to_string())?;
             db.set("peer_name", name)?;
+            db.set_person(&id.to_string(), name)?;
             let shared_after = if known { None } else { Some(db.max_seq(&self.id())?) };
             if let Some(after) = shared_after {
                 db.set("shared_after", after.to_string())?;
@@ -1212,6 +1225,7 @@ impl Core {
         {
             let mut st = self.state();
             st.peer = Some((id, name.to_string()));
+            st.people.insert(id.to_string(), name.to_string());
             if let Some(after) = shared_after {
                 st.shared_after = after;
             }
@@ -1223,12 +1237,18 @@ impl Core {
     fn update_peer_name(&self, name: &str) -> Result<()> {
         let name = clean(name, MAX_NAME_CHARS);
         let mut st = self.state();
-        if let Some((_, current)) = &mut st.peer
+        if let Some((id, current)) = &mut st.peer
             && *current != name
         {
             *current = name.clone();
+            let id = id.to_string();
+            st.people.insert(id.clone(), name.clone());
             drop(st);
-            self.db().set("peer_name", &name)?;
+            {
+                let db = self.db();
+                db.set("peer_name", &name)?;
+                db.set_person(&id, &name)?;
+            }
             self.changed();
         }
         Ok(())
