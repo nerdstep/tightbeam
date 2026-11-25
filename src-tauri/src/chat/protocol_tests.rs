@@ -4,10 +4,13 @@
 //!
 //! `two_peers.rs` checks the same engine on the real network.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use super::*;
-use crate::net::Lan;
+use crate::{db::FileState, net::Lan};
 
 /// Where the test clock starts: November 2027.
 const EPOCH_MS: i64 = 1_826_000_000_000;

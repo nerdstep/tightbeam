@@ -15,7 +15,7 @@
 
 use std::{
     collections::{BTreeMap, HashSet},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -24,18 +24,19 @@ use anyhow::{Context, Result, bail, ensure};
 use iroh::{EndpointId, SecretKey};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt},
     sync::{Notify, mpsc, oneshot},
     time::timeout,
 };
 
 use crate::{
     clock::Clock,
-    db::{Cursor, Db, FileState, Hit, Message, Page},
+    db::{Cursor, Db, Hit, Message, Page},
     entry::{
         Entry, FileInfo, Kind, MAX_EMOJI_CHARS, MAX_FILE_BYTES, MAX_TEXT_CHARS, Ref, VANISH_SECS,
-        Wire, checked_file, clean, is_hash,
+        Wire, checked_file, clean,
     },
+    files::{FileStore, Found},
     net::{Accepting, Conn, Discoveries, Discovery, Network, RecvStream, SendStream},
 };
 
@@ -286,8 +287,8 @@ pub struct Core {
     db: Mutex<Db>,
     /// Wall-clock time, shared with `db`.
     clock: Clock,
-    /// Where files are kept: `<hash>/<name>`, plus `<hash>.part` while one arrives.
-    files_dir: PathBuf,
+    /// The files messages carry.
+    files: FileStore,
     /// Wakes the session's downloader when a message with a file arrives.
     files_wanted: Notify,
     state: Mutex<State>,
@@ -363,7 +364,7 @@ impl Core {
             net,
             db: Mutex::new(db),
             clock,
-            files_dir: data_dir.join("files"),
+            files: FileStore::new(data_dir.join("files")),
             files_wanted: Notify::new(),
             state: Mutex::new(State {
                 name,
@@ -566,15 +567,7 @@ impl Core {
             preview: new.preview,
         })
         .context("That file can't be sent.")?;
-        if self.db().file_state(&hash)? != FileState::Done {
-            let name = safe_name(&info.name);
-            let dir = self.files_dir.join(&hash);
-            std::fs::create_dir_all(&dir)?;
-            let part = self.files_dir.join(format!("{hash}.part"));
-            std::fs::write(&part, bytes)?;
-            std::fs::rename(&part, dir.join(&name))?;
-            self.db().set_file(&hash, &name, FileState::Done)?;
-        }
+        self.files.put_bytes(&self.db(), &info, bytes)?;
         let text = clean(&new.text, MAX_TEXT_CHARS);
         self.post(text, Kind::Message { reply_to: new.reply_to, vanish: None, file: Some(info) })
     }
@@ -585,23 +578,21 @@ impl Core {
     /// whose size changed, counts as not here: it goes back to waiting, and the
     /// downloader gets it again from the peer.
     pub fn file(&self, hash: &str) -> Result<Option<(PathBuf, String)>> {
-        if !is_hash(hash) {
-            return Ok(None);
+        let found = self.files.get(&self.db(), hash)?;
+        match found {
+            Found::Here { path, mime } => Ok(Some((path, mime))),
+            Found::Lost => {
+                self.lost_file(hash)?;
+                Ok(None)
+            }
+            Found::NotHere => Ok(None),
         }
-        let Some(stored) = self.db().stored_file(hash)? else { return Ok(None) };
-        let path = self.files_dir.join(hash).join(&stored.name);
-        let intact = std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() == stored.size);
-        if !intact {
-            self.lost_file(hash)?;
-            return Ok(None);
-        }
-        Ok(Some((path, stored.mime)))
     }
 
     /// A file went missing or changed outside the app: wait for it again, from the peer.
     /// If they don't have it either, it ends up gone.
     fn lost_file(&self, hash: &str) -> Result<()> {
-        self.db().forget_file(hash)?;
+        self.files.lost(&self.db(), hash)?;
         self.file_changed(hash)?;
         self.files_wanted.notify_one();
         Ok(())
@@ -1358,9 +1349,7 @@ impl Core {
         let request: FileRequest = read_json(&mut recv).await?;
         let found = match self.file(&request.hash)? {
             Some((path, _)) => {
-                let check = path.clone();
-                let hash = tokio::task::spawn_blocking(move || hash_file(&check)).await??;
-                if hash == request.hash {
+                if self.files.unchanged(&path, &request.hash).await? {
                     Some(path)
                 } else {
                     self.lost_file(&request.hash)?;
@@ -1422,63 +1411,29 @@ impl Core {
     }
 
     async fn fetch_file(&self, conn: &Conn, file: &FileInfo) -> Result<()> {
-        tokio::fs::create_dir_all(&self.files_dir).await?;
-        let part_path = self.files_dir.join(format!("{}.part", file.hash));
-        let mut part = tokio::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&part_path)
-            .await?;
-        let mut have = part.metadata().await?.len();
-        if have > file.size {
-            have = 0;
-        }
-        part.set_len(have).await?;
-        part.seek(std::io::SeekFrom::Start(have)).await?;
-
+        let mut part = self.files.receive(file).await?;
         let (mut send, mut recv) = conn.open_bi().await?;
-        write_json(&mut send, &FileRequest { hash: file.hash.clone(), from: have }).await?;
+        write_json(&mut send, &FileRequest { hash: file.hash.clone(), from: part.have() }).await?;
         send.finish()?;
         let reply: FileReply = timeout(FILE_REPLY_TIMEOUT, read_json(&mut recv))
             .await
             .context("no answer to a file request")??;
         if !reply.found {
             drop(part);
-            let _ = tokio::fs::remove_file(&part_path).await;
-            self.db().set_file(&file.hash, "", FileState::Gone)?;
+            self.files.gone(&self.db(), &file.hash)?;
             return self.file_changed(&file.hash);
         }
-        let mut progress = Progress::new(&file.hash, have, file.size, &self.emit);
+        let mut progress = Progress::new(&file.hash, part.have(), file.size, &self.emit);
         let mut buf = vec![0u8; 256 * 1024];
         while let Some(n) = recv.read(&mut buf).await? {
-            have += n as u64;
-            ensure!(have <= file.size, "the file is bigger than they said");
-            part.write_all(&buf[..n]).await?;
+            part.write(&buf[..n]).await?;
             progress.add(n as u64);
         }
-        part.flush().await?;
-        drop(part);
-        ensure!(have == file.size, "the file ended early");
-
-        let path = part_path.clone();
-        let hash = tokio::task::spawn_blocking(move || hash_file(&path)).await??;
-        if hash != file.hash {
-            let _ = tokio::fs::remove_file(&part_path).await;
-            bail!("{} didn't match its hash", file.name);
-        }
-        // Deleted while it was on its way: don't keep it.
-        if !self.db().file_in_use(&file.hash)? {
-            let _ = tokio::fs::remove_file(&part_path).await;
-            return Ok(());
-        }
-        let name = safe_name(&file.name);
-        let dir = self.files_dir.join(&file.hash);
-        tokio::fs::create_dir_all(&dir).await?;
-        tokio::fs::rename(&part_path, dir.join(&name)).await?;
-        self.db().set_file(&file.hash, &name, FileState::Done)?;
+        let arrived = part.finish().await?;
+        // Not kept if it was deleted while on its way.
+        let kept = self.files.keep(&self.db(), arrived)?;
         drop(progress);
-        self.file_changed(&file.hash)
+        if kept { self.file_changed(&file.hash) } else { Ok(()) }
     }
 
     /// Tells the UI about each message with this file.
@@ -1492,28 +1447,7 @@ impl Core {
 
     /// Removes files no message has any more, and partial downloads of them.
     fn prune_files(&self) {
-        let result = (|| -> Result<()> {
-            let unused = self.db().unused_files()?;
-            for hash in unused {
-                let dir = self.files_dir.join(&hash);
-                if dir.exists() {
-                    std::fs::remove_dir_all(&dir)?;
-                }
-                self.db().forget_file(&hash)?;
-            }
-            let Ok(entries) = std::fs::read_dir(&self.files_dir) else { return Ok(()) };
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if let Some(hash) = name.strip_suffix(".part")
-                    && !self.db().file_in_use(hash)?
-                {
-                    // Fails while it's still being written; the download checks again.
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-            Ok(())
-        })();
-        if let Err(e) = result {
+        if let Err(e) = self.files.prune(&self.db()) {
             eprintln!("removing unused files: {e:#}");
         }
     }
@@ -1691,41 +1625,6 @@ struct TheirHello {
 fn features_from(stored: Option<&str>) -> Vec<String> {
     let stored = stored.unwrap_or_default();
     stored.split(',').filter(|f| !f.is_empty()).map(String::from).collect()
-}
-
-fn hash_file(path: &Path) -> Result<String> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(std::fs::File::open(path)?)?;
-    Ok(hasher.finalize().to_hex().to_string())
-}
-
-/// A file name that's safe to store on Windows and macOS, keeping its extension.
-fn safe_name(name: &str) -> String {
-    const MAX: usize = 100;
-    let name: String = name
-        .chars()
-        .map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c })
-        .collect();
-    let name = name.trim().trim_start_matches('.').trim_end_matches(['.', ' ']);
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && ext.chars().count() <= 10 => (stem, ext),
-        _ => (name, ""),
-    };
-    let room = MAX - ext.chars().count() - 1;
-    let mut stem: String = stem.chars().take(room).collect::<String>().trim_end().to_string();
-    if stem.is_empty() {
-        stem = "file".into();
-    }
-    // Names Windows reserves for devices, with or without an extension.
-    let device = stem.to_ascii_uppercase();
-    let reserved = ["CON", "PRN", "AUX", "NUL"].contains(&device.as_str())
-        || (device.len() == 4
-            && (device.starts_with("COM") || device.starts_with("LPT"))
-            && device.as_bytes()[3].is_ascii_digit());
-    if reserved {
-        stem.insert(0, '_');
-    }
-    if ext.is_empty() { stem } else { format!("{stem}.{ext}") }
 }
 
 /// Reports a transfer's progress to the UI, a few times a second. Dropping it says the
@@ -1923,23 +1822,5 @@ mod tests {
             json,
             r#"{"t":"msg","seq":8,"ts":1,"hlc":1,"text":"👍","react_to":{"author":"x","seq":2}}"#
         );
-    }
-
-    #[test]
-    fn file_names_are_safe_to_store() {
-        assert_eq!(safe_name("beach.jpg"), "beach.jpg");
-        assert_eq!(safe_name("../../etc/passwd"), "_.._etc_passwd");
-        assert_eq!(safe_name(r"C:\Windows\a:b?.png"), "C__Windows_a_b_.png");
-        assert_eq!(safe_name(".hidden"), "hidden");
-        assert_eq!(safe_name("trailing. . "), "trailing");
-        assert_eq!(safe_name("con.txt"), "_con.txt");
-        assert_eq!(safe_name("COM1"), "_COM1");
-        assert_eq!(safe_name("company.txt"), "company.txt");
-        assert_eq!(safe_name("..."), "file");
-        assert_eq!(safe_name(""), "file");
-        let long = format!("{}.jpeg", "x".repeat(300));
-        let safe = safe_name(&long);
-        assert_eq!(safe.chars().count(), 100);
-        assert!(safe.ends_with(".jpeg"));
     }
 }
