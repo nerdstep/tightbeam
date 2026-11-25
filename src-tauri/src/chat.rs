@@ -40,7 +40,7 @@ use tokio::{
 
 use crate::{
     db::{Cursor, Db, FileState, Hit, Message, Page},
-    entry::{Entry, FileInfo, Kind, Ref},
+    entry::{Entry, FileInfo, Kind, Ref, Wire},
 };
 
 pub const ALPN: &[u8] = b"tightbeam/1";
@@ -104,40 +104,8 @@ enum Frame {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         features: Vec<String>,
     },
-    /// An entry in the sender's log. Plain, it's a message.
-    Msg {
-        seq: u64,
-        ts: i64,
-        /// Display order (see `Entry::hlc`). Added in 0.5; without it, `ts` is used.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        hlc: Option<i64>,
-        text: String,
-        /// The message this one answers. Added in 0.4; older peers show a plain message.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reply_to: Option<Ref>,
-        /// Makes this a reaction to that message: `text` is the emoji, or "" to take
-        /// the sender's reaction back. Added in 0.4; older peers show the emoji as a
-        /// message.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        react_to: Option<Ref>,
-        /// Makes this new text for one of the sender's own messages. Added in 0.4; older
-        /// peers show the new text as a message.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        edit_of: Option<Ref>,
-        /// Deletes one of the sender's own messages; `text` is "". Added in 0.4; older
-        /// peers show an empty message.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        delete_of: Option<Ref>,
-        /// A vanishing message: each side erases it this many seconds after the
-        /// recipient has seen it. Added in 0.6, and only sent to peers that say their
-        /// version in `Hello`: older ones would keep it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        vanish: Option<u64>,
-        /// A file, with `text` as its caption. Added in 0.7, and only sent to peers whose
-        /// `Hello` lists the `files` feature.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        file: Option<Box<FileInfo>>,
-    },
+    /// An entry in the sender's log (see `entry::Wire`).
+    Msg(Wire),
     Ack {
         have: u64,
     },
@@ -1134,7 +1102,7 @@ impl Core {
             generation
         };
         for entry in self.db().since(&self.id(), their_have)? {
-            let _ = out.send(to_frame(entry));
+            let _ = out.send(Frame::Msg(entry.into_wire()));
         }
         // Covers anything seen while we were apart.
         let _ = out.send(Frame::Seen { up_to: self.state().seen });
@@ -1181,7 +1149,7 @@ impl Core {
     ) -> Result<()> {
         loop {
             match read_frame(recv).await? {
-                Frame::Msg {
+                Frame::Msg(Wire {
                     seq,
                     ts,
                     hlc,
@@ -1192,7 +1160,7 @@ impl Core {
                     delete_of,
                     vanish,
                     file,
-                } => {
+                }) => {
                     // A reply to anyone but the two of us becomes a plain message. A
                     // reaction to a stranger's message, or an edit or delete of anyone's
                     // but the sender's own, is stored but never shown. A file that's too
@@ -1624,7 +1592,7 @@ impl Core {
     /// Sends one of my entries now, if connected. Otherwise it goes with the catch-up.
     fn send_live(&self, entry: Entry) {
         if let Some(s) = &self.state().session {
-            let _ = s.out.send(to_frame(entry));
+            let _ = s.out.send(Frame::Msg(entry.into_wire()));
         }
     }
 
@@ -1731,21 +1699,6 @@ fn is_lan(addr: &TransportAddr, allow_loopback: bool) -> bool {
         },
         _ => false,
     }
-}
-
-fn to_frame(entry: Entry) -> Frame {
-    let (mut reply_to, mut react_to, mut edit_of, mut delete_of) = (None, None, None, None);
-    let (mut vanish, mut file) = (None, None);
-    match entry.kind {
-        Kind::Message { reply_to: to, vanish: v, file: f } => {
-            (reply_to, vanish, file) = (to, v, f.map(Box::new))
-        }
-        Kind::Reaction { to } => react_to = Some(to),
-        Kind::Edit { of } => edit_of = Some(of),
-        Kind::Delete { of } => delete_of = Some(of),
-    }
-    let (seq, ts, hlc, text) = (entry.seq, entry.ts, Some(entry.hlc), entry.text);
-    Frame::Msg { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of, vanish, file }
 }
 
 /// My `Hello`: who I am, the last of their entries I have, and what this build does.
@@ -1944,10 +1897,12 @@ mod tests {
     fn extra_fields_on_known_frames_are_ignored() {
         let frame =
             parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","pinned_by":{"author":"x","seq":2}}"#);
-        assert!(matches!(frame, Frame::Msg { seq: 7, hlc: None, ref text, .. } if text == "hi"));
+        assert!(
+            matches!(frame, Frame::Msg(Wire { seq: 7, hlc: None, ref text, .. }) if text == "hi")
+        );
         let frame =
             parse(r#"{"t":"msg","seq":7,"ts":1,"text":"hi","reply_to":{"author":"x","seq":2}}"#);
-        assert!(matches!(frame, Frame::Msg { reply_to: Some(Ref { seq: 2, .. }), .. }));
+        assert!(matches!(frame, Frame::Msg(Wire { reply_to: Some(Ref { seq: 2, .. }), .. })));
     }
 
     #[test]
@@ -1986,7 +1941,7 @@ mod tests {
             kind: Kind::Message { reply_to: None, vanish: Some(60), file: None },
             ..Entry::message("me", 9, 1, "psst")
         };
-        let json = serde_json::to_string(&to_frame(vanishing)).unwrap();
+        let json = serde_json::to_string(&Frame::Msg(vanishing.into_wire())).unwrap();
         assert_eq!(json, r#"{"t":"msg","seq":9,"ts":1,"hlc":1,"text":"psst","vanish":60}"#);
         let file = FileInfo {
             hash: "ab".repeat(32),
@@ -2001,7 +1956,7 @@ mod tests {
             kind: Kind::Message { reply_to: None, vanish: None, file: Some(file) },
             ..Entry::message("me", 10, 1, "")
         };
-        let json = serde_json::to_string(&to_frame(photo)).unwrap();
+        let json = serde_json::to_string(&Frame::Msg(photo.into_wire())).unwrap();
         let hash = "ab".repeat(32);
         assert_eq!(
             json,
@@ -2010,7 +1965,7 @@ mod tests {
             )
         );
         // A plain message has the fields from before 0.4, plus `hlc` from 0.5.
-        let plain = to_frame(Entry::message("me", 7, 1, "hi"));
+        let plain = Frame::Msg(Entry::message("me", 7, 1, "hi").into_wire());
         let json = serde_json::to_string(&plain).unwrap();
         assert_eq!(json, r#"{"t":"msg","seq":7,"ts":1,"hlc":1,"text":"hi"}"#);
         let to = Ref { author: "x".into(), seq: 2 };
@@ -2019,7 +1974,7 @@ mod tests {
             kind: Kind::Reaction { to },
             ..Entry::message("me", 8, 1, "")
         };
-        let json = serde_json::to_string(&to_frame(reaction)).unwrap();
+        let json = serde_json::to_string(&Frame::Msg(reaction.into_wire())).unwrap();
         assert_eq!(
             json,
             r#"{"t":"msg","seq":8,"ts":1,"hlc":1,"text":"👍","react_to":{"author":"x","seq":2}}"#
