@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Tightbeam is private chat between two people on the same LAN: a Rust backend (Tauri 2, iroh, SQLite) in `src-tauri/` and a React UI in `ui/`. `README.md` explains the protocol, sync and layout; read it before touching either. `ROADMAP.md` has what's next and why.
+Tightbeam is private chat between two people on the same LAN: a Rust backend (Tauri 2, iroh, SQLite) in `src-tauri/` and a React UI in `ui/`. `README.md` explains the protocol, sync and layout; read it before touching either. `ROADMAP.md` has what's next and why. `GLOSSARY.md` holds the domain terms: use them when naming code or writing docs, and add one when you introduce a new concept.
 
 ## Done
 
