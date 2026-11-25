@@ -253,6 +253,9 @@ struct State {
     peer_seen: u64,
     /// Highest of the peer's sequence numbers I've seen; what our `Seen` frames say.
     seen: u64,
+    /// My highest sequence number when I paired with this peer: they get only what I
+    /// write after it (see `shares`). 0 for pairings from before 0.8.
+    shared_after: u64,
     nearby: BTreeMap<String, String>,
     pairing: Option<Pairing>,
     session: Option<Session>,
@@ -336,8 +339,12 @@ impl Core {
         };
         let counter =
             |key| -> Result<u64> { Ok(db.get_str(key)?.and_then(|s| s.parse().ok()).unwrap_or(0)) };
-        let (peer_has, peer_seen, seen) =
-            (counter("peer_has")?, counter("peer_seen")?, counter("seen")?);
+        let (peer_has, peer_seen, seen, shared_after) = (
+            counter("peer_has")?,
+            counter("peer_seen")?,
+            counter("seen")?,
+            counter("shared_after")?,
+        );
         let peer_version = db.get_str("peer_version")?;
         let peer_features = features_from(db.get_str("peer_features")?.as_deref());
         let dnd_until = db.get_str("dnd_until")?.and_then(|s| s.parse().ok());
@@ -358,6 +365,7 @@ impl Core {
                 peer_has,
                 peer_seen,
                 seen,
+                shared_after,
                 nearby: BTreeMap::new(),
                 pairing: None,
                 session: None,
@@ -800,6 +808,7 @@ impl Core {
             db.delete("seen")?;
             db.delete("peer_version")?;
             db.delete("peer_features")?;
+            db.delete("shared_after")?;
         }
         let session = {
             let mut st = self.state();
@@ -807,6 +816,7 @@ impl Core {
             st.peer_has = 0;
             st.peer_seen = 0;
             st.seen = 0;
+            st.shared_after = 0;
             st.peer_version = None;
             st.peer_features.clear();
             st.session.take()
@@ -1075,9 +1085,10 @@ impl Core {
             }
             generation
         };
-        for wire in
-            self.db().since(&self.id(), their_have)?.into_iter().filter_map(Entry::into_wire)
-        {
+        let shared_after = self.state().shared_after;
+        let mine = self.db().since(&self.id(), their_have.max(shared_after))?;
+        let shared = mine.into_iter().filter(|e| shares(e, shared_after, &peer_str));
+        for wire in shared.filter_map(Entry::into_wire) {
             let _ = out.send(Frame::Msg(wire));
         }
         // Covers anything seen while we were apart.
@@ -1184,13 +1195,27 @@ impl Core {
         self.net.advertise(&self.name());
     }
 
+    /// Pairs with `id`. Someone new gets only what I write from now on; pairing again
+    /// with the same key carries on as before.
     fn save_peer(&self, id: EndpointId, name: &str) -> Result<()> {
-        {
+        let known = self.peer_id() == Some(id);
+        let shared_after = {
             let db = self.db();
             db.set("peer_id", id.to_string())?;
             db.set("peer_name", name)?;
+            let shared_after = if known { None } else { Some(db.max_seq(&self.id())?) };
+            if let Some(after) = shared_after {
+                db.set("shared_after", after.to_string())?;
+            }
+            shared_after
+        };
+        {
+            let mut st = self.state();
+            st.peer = Some((id, name.to_string()));
+            if let Some(after) = shared_after {
+                st.shared_after = after;
+            }
         }
-        self.state().peer = Some((id, name.to_string()));
         self.changed();
         Ok(())
     }
@@ -1527,7 +1552,11 @@ impl Core {
 
     /// Sends one of my entries now, if connected. Otherwise it goes with the catch-up.
     fn send_live(&self, entry: Entry) {
-        if let (Some(s), Some(wire)) = (&self.state().session, entry.into_wire()) {
+        let st = self.state();
+        let (Some(s), Some((peer, _))) = (&st.session, &st.peer) else { return };
+        if shares(&entry, st.shared_after, &peer.to_string())
+            && let Some(wire) = entry.into_wire()
+        {
             let _ = s.out.send(Frame::Msg(wire));
         }
     }
@@ -1712,6 +1741,20 @@ impl Drop for Progress {
     fn drop(&mut self) {
         self.send(self.size);
     }
+}
+
+/// Whether one of my entries goes to `peer`: only what I wrote after pairing with them
+/// (`shared_after`), and only about messages they have, theirs or mine since then. A
+/// reply always goes: its text is new, and a quote they don't have shows as missing.
+fn shares(entry: &Entry, shared_after: u64, peer: &str) -> bool {
+    let about = match &entry.kind {
+        Kind::Reaction { to } | Kind::Edit { of: to } | Kind::Delete { of: to } => Some(to),
+        Kind::Message { .. } | Kind::Inert { .. } => None,
+    };
+    entry.seq > shared_after
+        && about.is_none_or(|to| {
+            to.author == peer || (to.author == entry.author && to.seq > shared_after)
+        })
 }
 
 /// Aborts a task when dropped.

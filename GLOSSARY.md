@@ -11,7 +11,7 @@ The one other person's app this one is paired with. Before pairing, the apps nea
 _Avoid_: contact, friend, remote
 
 **Pairing**:
-Two apps agreeing to trust each other's key, after both screens show the same code. Each app pairs with one peer at a time.
+Two apps agreeing to trust each other's key, after both screens show the same code. Each app pairs with one peer at a time, and a new peer gets only what's written after pairing with them.
 _Avoid_: linking, connecting
 
 **Session**:
