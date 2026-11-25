@@ -94,9 +94,18 @@ export function update(t: Transcript, updated: Message): Transcript {
   }
 }
 
-/** What a reply shows of the message it quotes. */
-export function quoteOf(m: Message): Pick<Quote, 'text' | 'deleted' | 'file'> {
-  return { text: m.deleted ? null : m.text, deleted: m.deleted, file: m.file }
+/**
+ * What a reply shows of the message it quotes, as Rust's `Db::show` builds it: nothing of
+ * a deleted or vanished one but the fact.
+ */
+export function quoteOf(m: Message): Pick<Quote, 'text' | 'deleted' | 'vanished' | 'file'> {
+  const gone = m.deleted || m.vanished
+  return {
+    text: gone ? null : m.text,
+    deleted: gone,
+    vanished: m.vanished,
+    file: gone ? null : m.file,
+  }
 }
 
 export function find(t: Transcript, at: Ref): Message | undefined {
