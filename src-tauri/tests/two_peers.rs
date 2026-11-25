@@ -14,7 +14,8 @@ use std::{
 
 use tightbeam_lib::{
     chat::{Away, Core, Emit, Event, NewFile},
-    db::{FileState, Ref},
+    db::FileState,
+    entry::Ref,
 };
 
 fn quiet() -> Emit {

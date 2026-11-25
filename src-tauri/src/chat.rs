@@ -38,7 +38,10 @@ use tokio::{
     time::timeout,
 };
 
-use crate::db::{Cursor, Db, Entry, FileInfo, FileState, Hit, Kind, Message, Page, Ref};
+use crate::{
+    db::{Cursor, Db, FileState, Hit, Message, Page},
+    entry::{Entry, FileInfo, Kind, Ref},
+};
 
 pub const ALPN: &[u8] = b"tightbeam/1";
 /// mDNS service name, so we only see other Tightbeam apps (`_tightbeam._udp.local`).

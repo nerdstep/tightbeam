@@ -1,14 +1,16 @@
 pub mod chat;
 pub mod db;
 mod desktop;
+pub mod entry;
 mod idle;
 mod updates;
 
 use std::{path::PathBuf, sync::Arc};
 
 use chat::{ConnectionInfo, Core, Emit, Event, NewFile, Status};
-use db::{Cursor, Hit, Message, Page, Ref};
+use db::{Cursor, Hit, Message, Page};
 use desktop::{Desktop, MAIN_WINDOW, MINIMIZED_ARG};
+use entry::Ref;
 use serde::Serialize;
 use tauri::{
     Emitter, Manager, RunEvent, State, WindowEvent,
