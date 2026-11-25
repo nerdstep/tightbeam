@@ -10,6 +10,7 @@ Changes people using Tightbeam will notice. Add a line under **Unreleased** as t
 - Messages from someone you were paired with before keep their name, instead of showing the name of whoever you're paired with now.
 - Clicking the quote in a reply jumps to the original message even when it's further back than the history loaded so far. Before, it did nothing until you'd scrolled back that far.
 - A reply quoting a vanishing message shows "Message vanished" as soon as it vanishes, instead of "Deleted message" until the app restarts.
+- A problem with what you're sending, like a file that's too big or a message that didn't go, shows just above the message box instead of at the top of the window.
 
 ## 0.7.0 — 2026-11-24
 
