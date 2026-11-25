@@ -17,7 +17,7 @@ use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -39,6 +39,7 @@ use tokio::{
 };
 
 use crate::{
+    clock::Clock,
     db::{Cursor, Db, FileState, Hit, Message, Page},
     entry::{
         Entry, FileInfo, Kind, MAX_EMOJI_CHARS, MAX_FILE_BYTES, MAX_TEXT_CHARS, Ref, VANISH_SECS,
@@ -268,8 +269,9 @@ struct State {
     session: Option<Session>,
     next_generation: u64,
     notice: Option<String>,
-    nudge_sent: Option<Instant>,
-    nudge_received: Option<Instant>,
+    /// tokio's clock, so tests can move past the limit.
+    nudge_sent: Option<tokio::time::Instant>,
+    nudge_received: Option<tokio::time::Instant>,
     away: Option<Away>,
     /// `away` came from `/away`, so it lasts until `/back` or a message, not until input.
     away_by_hand: bool,
@@ -285,6 +287,8 @@ pub struct Core {
     endpoint: Endpoint,
     me: EndpointId,
     db: Mutex<Db>,
+    /// Wall-clock time, shared with `db`.
+    clock: Clock,
     /// Where files are kept: `<hash>/<name>`, plus `<hash>.part` while one arrives.
     files_dir: PathBuf,
     /// Wakes the session's downloader when a message with a file arrives.
@@ -314,7 +318,8 @@ impl Core {
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating {}", data_dir.display()))?;
-        let db = Db::open(&data_dir.join("tightbeam.db"))?;
+        let clock = Clock::system();
+        let db = Db::open_with(&data_dir.join("tightbeam.db"), clock.clone())?;
 
         let secret = match db.get("secret_key")? {
             Some(bytes) => {
@@ -361,6 +366,7 @@ impl Core {
             me: endpoint.id(),
             endpoint,
             db: Mutex::new(db),
+            clock,
             files_dir: data_dir.join("files"),
             files_wanted: Notify::new(),
             state: Mutex::new(State {
@@ -434,7 +440,7 @@ impl Core {
             notice: st.notice.clone(),
             away: st.away.clone().filter(|_| st.away_by_hand),
             peer_away: st.peer_away.clone(),
-            dnd_until: st.dnd_until.filter(|&t| t > now_ms()),
+            dnd_until: st.dnd_until.filter(|&t| t > self.clock.now_ms()),
             peer_dnd_until: st.peer_dnd_until,
         }
     }
@@ -462,7 +468,7 @@ impl Core {
 
     /// Whether my do not disturb is on: no notifications, and nudges are refused.
     pub fn dnd(&self) -> bool {
-        self.state().dnd_until.is_some_and(|t| t > now_ms())
+        self.state().dnd_until.is_some_and(|t| t > self.clock.now_ms())
     }
 
     /// The whole history, oldest first. The UI uses `page` instead.
@@ -650,7 +656,7 @@ impl Core {
 
     /// `/dnd`: no notifications until `until` (ms), and the peer sees it. `None` ends it.
     pub fn set_dnd(&self, until: Option<i64>) -> Result<()> {
-        let until = until.filter(|&t| t > now_ms());
+        let until = until.filter(|&t| t > self.clock.now_ms());
         match until {
             Some(t) => self.db().set("dnd_until", t.to_string())?,
             None => self.db().delete("dnd_until")?,
@@ -739,7 +745,7 @@ impl Core {
                 .map(|s| s.out.clone())
                 .context("Not connected, so the nudge can't reach them.")?;
             ensure!(
-                !st.peer_dnd_until.is_some_and(|t| t > now_ms()),
+                !st.peer_dnd_until.is_some_and(|t| t > self.clock.now_ms()),
                 "{} has do not disturb on, so nudges are paused.",
                 title_name(st.peer.as_ref().map(|(_, n)| n.clone()))
             );
@@ -747,7 +753,7 @@ impl Core {
                 !st.nudge_sent.is_some_and(|t| t.elapsed() < NUDGE_EVERY),
                 "You just nudged. Give it a few seconds."
             );
-            st.nudge_sent = Some(Instant::now());
+            st.nudge_sent = Some(tokio::time::Instant::now());
             out
         };
         let _ = out.send(Frame::Nudge);
@@ -1083,8 +1089,12 @@ impl Core {
             let mut st = self.state();
             st.next_generation += 1;
             let generation = st.next_generation;
-            let session =
-                Session { generation, since: now_ms(), out: out.clone(), conn: conn.clone() };
+            let session = Session {
+                generation,
+                since: self.clock.now_ms(),
+                out: out.clone(),
+                conn: conn.clone(),
+            };
             let old = st.session.replace(session);
             // They say so again if they still are.
             st.peer_away = None;
@@ -1104,7 +1114,7 @@ impl Core {
         if let Some(Away { note }) = self.state().away.clone() {
             let _ = out.send(Frame::Away { note });
         }
-        if let Some(until) = self.state().dnd_until.filter(|&t| t > now_ms()) {
+        if let Some(until) = self.state().dnd_until.filter(|&t| t > self.clock.now_ms()) {
             let _ = out.send(Frame::Dnd { until: Some(until) });
         }
         self.changed();
@@ -1268,7 +1278,7 @@ impl Core {
 
     /// `author`'s vanishing messages up to `up_to` have been seen: start their clocks.
     fn start_vanish(&self, author: &str, up_to: u64) -> Result<()> {
-        let started = self.db().start_vanish(author, up_to, now_ms())?;
+        let started = self.db().start_vanish(author, up_to, self.clock.now_ms())?;
         for at in started {
             self.updated(&at)?;
         }
@@ -1278,7 +1288,7 @@ impl Core {
     /// Adds an entry to my log.
     fn append(&self, text: String, kind: Kind) -> Result<Entry> {
         let db = self.db();
-        let (seq, ts) = (db.max_seq(&self.id())? + 1, now_ms());
+        let (seq, ts) = (db.max_seq(&self.id())? + 1, self.clock.now_ms());
         let entry = Entry { author: self.id(), seq, ts, hlc: db.next_hlc(ts)?, text, kind };
         db.insert(&entry)?;
         Ok(entry)
@@ -1498,7 +1508,7 @@ impl Core {
         let mut ticks = tokio::time::interval(Duration::from_secs(1));
         loop {
             ticks.tick().await;
-            let gone = self.db().expire(now_ms());
+            let gone = self.db().expire(self.clock.now_ms());
             match gone {
                 Ok(gone) => {
                     for at in &gone {
@@ -1606,7 +1616,7 @@ impl Core {
             if st.nudge_received.is_some_and(|t| t.elapsed() < NUDGE_EVERY) {
                 return;
             }
-            st.nudge_received = Some(Instant::now());
+            st.nudge_received = Some(tokio::time::Instant::now());
         }
         (self.emit)(Event::Nudge);
     }
@@ -1748,10 +1758,6 @@ impl Drop for Progress {
 /// The peer's name for messages, or a stand-in before they've named themselves.
 fn title_name(name: Option<String>) -> String {
     name.filter(|n| !n.is_empty()).unwrap_or_else(|| "the other person".into())
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 async fn write_frame(send: &mut SendStream, frame: &Frame) -> Result<()> {

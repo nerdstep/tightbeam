@@ -1,4 +1,5 @@
 pub mod chat;
+mod clock;
 pub mod db;
 mod desktop;
 pub mod entry;
