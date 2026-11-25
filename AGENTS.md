@@ -11,7 +11,7 @@ Tightbeam is private chat between two people on the same LAN: a Rust backend (Ta
 
 The two peers routinely run different builds, and both keep their history across upgrades.
 
-- **Wire format** (`Frame` in `src-tauri/src/chat.rs`): grow it by adding frame types and optional fields. Existing frames keep their meaning. Older peers skip unknown types (`Frame::Unknown`); `Hello` and `PairRequest` stay strict.
+- **Wire format** (`Frame` in `src-tauri/src/chat.rs`, and a `msg` frame's body, `Wire`, in `src-tauri/src/entry.rs`): grow it by adding frame types and optional fields. Existing frames keep their meaning. Older peers skip unknown types (`Frame::Unknown`); `Hello` and `PairRequest` stay strict.
 - **Message log**: append-only per author. Edits, deletes, reactions and replies are new entries that refer to `(author, seq)`. The one change in place: a delete blanks the text of the message it deletes and of that message's edits.
 - **SQLite**: a schema change migrates existing databases in place.
 
