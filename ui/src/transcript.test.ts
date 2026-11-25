@@ -147,6 +147,12 @@ describe('updates', () => {
     expect(shown).toMatchObject({ text: null, deleted: true })
   })
 
+  test('a message that vanishes says so in the quotes of it', () => {
+    const vanished = { ...original, text: '', deleted: true, vanished: true }
+    const shown = find(update(t, vanished), reply)?.reply_to
+    expect(shown).toMatchObject({ text: null, deleted: true, vanished: true, file: null })
+  })
+
   test('of messages not loaded change nothing', () => {
     expect(keys(update(t, msg('c', 1)))).toEqual(['a:1', 'b:1'])
   })
