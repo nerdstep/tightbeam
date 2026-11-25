@@ -227,24 +227,20 @@ export function Viewer() {
   )
 }
 
-/** The pictures waiting in the message box, each with a button to take it out. */
+/** The files waiting in the message box, each with a button to take it out. */
 export function StagedFiles({ sending }: { sending: boolean }) {
   const staged = useSelector(store, (s) => s.staged)
   if (staged.length === 0) return null
   return (
-    <ul className="mb-2 flex gap-2 overflow-x-auto pb-1" aria-label="Pictures to send">
+    <ul className="mb-2 flex gap-2 overflow-x-auto pb-1" aria-label="Files to send">
       {staged.map((s) => (
-        <li
-          key={s.id}
-          className="relative shrink-0"
-          title={`${s.file.name} · ${formatBytes(s.file.size)}`}
-        >
+        <li key={s.id} className="relative shrink-0" title={`${s.name} · ${formatBytes(s.size)}`}>
           {s.url ? (
-            <img src={s.url} alt={s.file.name} className="size-16 rounded-md object-cover" />
+            <img src={s.url} alt={s.name} className="size-16 rounded-md object-cover" />
           ) : (
             <div className="flex size-16 flex-col items-center justify-center gap-1 rounded-md bg-muted p-1 text-[10px] text-muted-foreground">
               <FileIcon className="size-5" />
-              <span className="w-full truncate text-center">{s.file.name}</span>
+              <span className="w-full truncate text-center">{s.name}</span>
             </div>
           )}
           {!sending && (
@@ -254,7 +250,7 @@ export function StagedFiles({ sending }: { sending: boolean }) {
               size="icon-xs"
               // Inside the corner: the scrolling list would clip it outside.
               className="absolute top-1 right-1 rounded-full shadow"
-              aria-label={`Remove ${s.file.name}`}
+              aria-label={`Remove ${s.name}`}
               onClick={() => unstageFile(s.id)}
             >
               <XIcon />

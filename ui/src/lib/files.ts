@@ -1,64 +1,94 @@
-// Getting pictures ready to send: their size, and a tiny preview the other side shows
-// until the file arrives.
+// Getting files ready to send: their details, and for a picture its size and a tiny
+// preview the other side shows until the file arrives.
+//
+// Files from disk (dropped or picked) are staged in Rust and go by path, so a big one is
+// never read into the webview. Pasted files have no path, so they go as bytes.
 
-import type { NewFile } from '@/api'
+import { api, type NewFile, type StagedFile } from '@/api'
 
 /** The largest file that can be sent: 1 GB, as in Rust. */
 export const MAX_FILE_BYTES = 1024 ** 3
 
+/** Pasted files pass through the webview's memory, so they're kept smaller. */
+export const MAX_PASTED_BYTES = 100 * 1000 * 1000
+
+/** Pictures from disk get a preview when they're at most this big (as in Rust). */
+const MAX_PREVIEW_SOURCE = 50 * 1024 * 1024
+
 /** The preview's longest side, in pixels. It's shown blurred, so tiny is fine. */
 const PREVIEW_PX = 24
 
-/** Picture extensions, for files whose type the system doesn't report (HEIC on Windows). */
-const PICTURE_EXTENSIONS = /\.(jpe?g|png|gif|webp|avif|bmp|heic|heif|tiff?)$/i
-
-/** A picture chosen to send, waiting in the message box. */
+/** A file chosen to send, waiting in the message box. */
 export interface Staged {
   /** Tells staged files apart. */
   id: number
-  file: File
+  name: string
+  size: number
+  /** Where its bytes come from: pasted, or a file on disk Rust staged under that id. */
+  source: { pasted: File } | { disk: number }
   details: NewFile
-  /** For the thumbnail in the message box. `null` if this webview can't show it. */
+  /** For the thumbnail in the message box. `null` if it isn't a picture this webview shows. */
   url: string | null
 }
 
 let staged = 0
 
-/** Whether a file is a picture, by its type or its name. */
-export const isPicture = (file: File) =>
-  file.type.startsWith('image/') || PICTURE_EXTENSIONS.test(file.name)
+/** Pictures the webview can try to show. SVG can carry scripts: always a plain file. */
+const showable = (mime: string) => mime.startsWith('image/') && mime !== 'image/svg+xml'
 
-/**
- * Reads a picture's size and makes its preview. One this webview can't open (HEIC on
- * Windows, say) is still sent, without them; the other side shows it as a file.
- */
-export async function stage(file: File): Promise<Staged> {
-  const details: NewFile = {
-    name: file.name || 'picture',
-    mime: file.type || 'application/octet-stream',
-    width: null,
-    height: null,
-    preview: null,
-  }
-  // SVG can carry scripts: always a plain file.
-  if (file.type !== 'image/svg+xml') {
-    try {
-      const bitmap = await createImageBitmap(file)
-      details.width = bitmap.width
-      details.height = bitmap.height
-      details.preview = preview(bitmap)
-      bitmap.close()
-    } catch {
-      // Not something this webview can show.
-    }
-  }
-  const url = details.width === null ? null : URL.createObjectURL(file)
-  return { id: ++staged, file, details, url }
+/** A pasted file, such as a screenshot. */
+export async function stagePasted(file: File): Promise<Staged> {
+  const name = file.name || 'pasted file'
+  const details = plain(name, file.type || 'application/octet-stream')
+  const url = showable(details.mime) ? await describePicture(file, details) : null
+  return { id: ++staged, name, size: file.size, source: { pasted: file }, details, url }
 }
 
-/** Frees a staged file's thumbnail. */
+/** A file from disk that Rust has staged. */
+export async function stageFromDisk(file: StagedFile): Promise<Staged> {
+  const details = plain(file.name, file.mime)
+  let url: string | null = null
+  if (showable(file.mime) && file.size <= MAX_PREVIEW_SOURCE) {
+    const picture = await api
+      .stagedPicture(file.id)
+      .then((bytes) => new Blob([bytes], { type: file.mime }))
+      .catch(() => null)
+    if (picture) url = await describePicture(picture, details)
+  }
+  const { name, size } = file
+  return { id: ++staged, name, size, source: { disk: file.id }, details, url }
+}
+
+/** Frees a staged file's thumbnail, and its place in Rust. */
 export function unstage(s: Staged) {
   if (s.url) URL.revokeObjectURL(s.url)
+  if ('disk' in s.source) void api.unstage(s.source.disk).catch(() => {})
+}
+
+const plain = (name: string, mime: string): NewFile => ({
+  name,
+  mime,
+  width: null,
+  height: null,
+  preview: null,
+})
+
+/**
+ * Reads a picture's size and makes its preview, into `details`, and returns a thumbnail
+ * URL. One this webview can't open (HEIC on Windows, say) is still sent, without them;
+ * the other side shows it as a file.
+ */
+async function describePicture(picture: Blob, details: NewFile): Promise<string | null> {
+  try {
+    const bitmap = await createImageBitmap(picture)
+    details.width = bitmap.width
+    details.height = bitmap.height
+    details.preview = preview(bitmap)
+    bitmap.close()
+    return URL.createObjectURL(picture)
+  } catch {
+    return null // not something this webview can show
+  }
 }
 
 function preview(bitmap: ImageBitmap): string | null {

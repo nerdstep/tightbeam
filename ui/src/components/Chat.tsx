@@ -1,8 +1,9 @@
 import { shallow, useSelector } from '@tanstack/react-store'
 import { useVirtualizer } from '@tanstack/react-virtual'
+import { getCurrentWebview } from '@tauri-apps/api/webview'
 import {
   EllipsisIcon,
-  ImagePlusIcon,
+  PaperclipIcon,
   PencilIcon,
   ReplyIcon,
   SearchIcon,
@@ -57,11 +58,13 @@ import {
   clearHistory,
   loadOlder,
   openSearch,
+  pickFiles,
   reveal,
   run,
   setDeleting,
   setEditing,
   setReplyingTo,
+  stageDropped,
   stageFiles,
   store,
   unstageFile,
@@ -73,9 +76,6 @@ const EMOJI = ['👍', '❤️', '😂', '😮', '😢', '🎉']
 
 /** While typing, tell the peer this often. Their "typing…" lapses a little after. */
 const TYPING_EVERY_MS = 2500
-
-/** Whether something dragged over the window is files. */
-const carriesFiles = (e: React.DragEvent) => e.dataTransfer.types.includes('Files')
 
 /** Paired: the conversation. */
 export function Chat() {
@@ -91,31 +91,24 @@ export function Chat() {
     return () => window.removeEventListener('keydown', onKey)
   }, [])
 
-  // Pictures dragged onto the window go in the message box.
+  // Files dragged onto the window go in the message box. Tauri hands over their paths,
+  // so they're sent from disk, not read into the webview.
   const [dragging, setDragging] = useState(false)
+  useEffect(() => {
+    const stop = getCurrentWebview().onDragDropEvent(({ payload }) => {
+      if (payload.type === 'enter' || payload.type === 'over') setDragging(true)
+      else if (payload.type === 'leave') setDragging(false)
+      else {
+        setDragging(false)
+        if (payload.paths.length) void stageDropped(payload.paths)
+      }
+    })
+    return () => void stop.then((unlisten) => unlisten())
+  }, [])
 
   return (
     <MessageScrollerProvider defaultScrollPosition="end">
-      <section
-        className="relative flex h-full flex-col"
-        onDragOver={(e) => {
-          if (!carriesFiles(e)) return
-          e.preventDefault()
-          e.dataTransfer.dropEffect = 'copy'
-          setDragging(true)
-        }}
-        onDragLeave={(e) => {
-          // Leaving the window, not just moving between the elements inside it.
-          const to = e.relatedTarget
-          if (!(to instanceof Node && e.currentTarget.contains(to))) setDragging(false)
-        }}
-        onDrop={(e) => {
-          if (!carriesFiles(e)) return
-          e.preventDefault()
-          setDragging(false)
-          void stageFiles([...e.dataTransfer.files])
-        }}
-      >
+      <section className="relative flex h-full flex-col">
         <Header />
         <SearchBar />
         <div className="relative flex min-h-0 flex-1 flex-col">
@@ -127,7 +120,7 @@ export function Chat() {
         <Viewer />
         {dragging && (
           <div className="pointer-events-none absolute inset-2 z-40 grid place-items-center rounded-xl border-2 border-dashed border-primary bg-background/85 text-sm font-medium">
-            Drop pictures to send
+            Drop files to send
           </div>
         )}
       </section>
@@ -744,7 +737,6 @@ function Composer() {
   const [clearing, setClearing] = useState(false)
   const [sending, setSending] = useState(false)
   const textRef = useRef<HTMLTextAreaElement>(null)
-  const pickerRef = useRef<HTMLInputElement>(null)
   const typingSentRef = useRef(0)
   const { scrollToEnd } = useMessageScroller()
   const { replyingTo, editing, peerName, myId, away, dndUntil, staged } = useSelector(
@@ -867,10 +859,13 @@ function Composer() {
     for (const [i, s] of store.state.staged.entries()) {
       const first = i === 0
       const to = first && reply ? { author: reply.author, seq: reply.seq } : undefined
+      const withText = first ? caption : ''
       const sent = await run(
-        s.file
-          .arrayBuffer()
-          .then((bytes) => api.sendFile(bytes, s.details, first ? caption : '', to)),
+        'pasted' in s.source
+          ? s.source.pasted
+              .arrayBuffer()
+              .then((bytes) => api.sendFile(bytes, s.details, withText, to))
+          : api.sendStaged(s.source.disk, s.details, withText, to),
       )
       if (!sent) {
         if (first) {
@@ -1049,23 +1044,12 @@ function Composer() {
               type="button"
               variant="ghost"
               size="icon-lg"
-              aria-label="Add pictures"
-              title="Add pictures (or paste, or drop them here)"
-              onClick={() => pickerRef.current?.click()}
+              aria-label="Attach files"
+              title="Attach files (or drop them here, or paste a picture)"
+              onClick={() => void pickFiles()}
             >
-              <ImagePlusIcon />
+              <PaperclipIcon />
             </Button>
-            <input
-              ref={pickerRef}
-              type="file"
-              accept="image/*,.heic,.heif"
-              multiple
-              hidden
-              onChange={(e) => {
-                void stageFiles([...(e.target.files ?? [])])
-                e.target.value = '' // so the same picture can be chosen again
-              }}
-            />
           </>
         )}
         <Textarea

@@ -96,6 +96,20 @@ export interface Attachment extends FileInfo {
   state: 'pending' | 'done' | 'gone'
 }
 
+/** A file from disk, staged in Rust to be sent by path. */
+export interface StagedFile {
+  id: number
+  name: string
+  size: number
+  mime: string
+}
+
+/** What came of staging files from disk: the ones staged, and why the others weren't. */
+export interface StagedFiles {
+  staged: StagedFile[]
+  refused: string[]
+}
+
 /** What the UI says about a file it sends, besides the bytes. */
 export interface NewFile {
   name: string
@@ -202,6 +216,16 @@ export const api = {
     invoke<Message>('send_file', bytes, {
       headers: { 'x-tightbeam-file': asciiJson({ ...file, text, reply_to: replyTo ?? null }) },
     }),
+  /** Stages files dropped on the window. */
+  stagePaths: (paths: string[]) => invoke<StagedFiles>('stage_paths', { paths }),
+  /** Asks which files to send, then stages them. */
+  pickFiles: () => invoke<StagedFiles>('pick_files'),
+  /** Sends a staged file, by path. */
+  sendStaged: (id: number, file: NewFile, text: string, replyTo?: Ref) =>
+    invoke<Message>('send_staged', { id, details: { ...file, text, reply_to: replyTo ?? null } }),
+  unstage: (id: number) => invoke<void>('unstage', { id }),
+  /** A staged picture's bytes, to make its preview. */
+  stagedPicture: (id: number) => invoke<ArrayBuffer>('staged_picture', { id }),
   /** Where the webview loads a file that's here. */
   fileUrl: (hash: string) => convertFileSrc(hash, 'tbfile'),
   /** Opens a picture in its default app. */
