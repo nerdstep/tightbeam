@@ -3,6 +3,7 @@ mod clock;
 pub mod db;
 mod desktop;
 pub mod entry;
+mod files;
 mod idle;
 mod net;
 mod updates;
