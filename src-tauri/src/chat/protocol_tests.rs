@@ -932,3 +932,37 @@ async fn do_not_disturb_ends_on_its_own() {
     assert!(bob.set_dnd(Some(world.clock.now_ms() - 1)).is_ok(), "a time past turns it off");
     assert!(!bob.dnd());
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_new_pairing_starts_clean() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    alice.send_message("hi", None, None).unwrap();
+    bob.send_message("hi yourself", None, None).unwrap();
+    until("both arrive", || alice.texts().len() == 2 && bob.texts().len() == 2).await;
+    alice.mark_seen().unwrap();
+    bob.mark_seen().unwrap();
+    until("receipts", || alice.status().peer_seen == 1).await;
+    alice.unpair().unwrap();
+    bob.stop().await;
+
+    let clean = |alice: &Peer| {
+        let (status, info) = (alice.status(), alice.connection_info());
+        assert!(status.peer.is_none());
+        assert_eq!((status.peer_has, status.peer_seen), (0, 0));
+        assert_eq!(info.peer_version, None);
+    };
+    clean(&alice);
+    alice.stop().await;
+    let alice = world.start("alice", "Alice").await;
+    clean(&alice); // nothing of bob's came back from the log either
+
+    // Someone new, on an older build: nothing bob's build allowed carries over.
+    let mut old = Played::pair(&world, &alice, hello_from(None, &[])).await;
+    let seen = old.next("her seen receipt", |f| matches!(f, Frame::Seen { .. })).await;
+    assert!(matches!(seen, Frame::Seen { up_to: 0 }), "she's seen nothing of theirs: {seen:?}");
+    assert!(alice.send_message("psst", None, Some(60)).is_err(), "no vanishing messages");
+    assert!(alice.send_file(b"png", picture()).is_err(), "no files");
+    assert_eq!((alice.status().peer_has, alice.status().peer_seen), (0, 0));
+}
