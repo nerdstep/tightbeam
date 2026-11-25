@@ -64,9 +64,39 @@ pub enum Kind {
     Edit { of: Ref },
     /// Deletes one of the author's own messages.
     Delete { of: Ref },
+    /// Kept in the author's log, but never applied, shown or sent: an edit or delete of
+    /// someone else's message, or a kind this build doesn't know (left by a newer one).
+    /// `tag` and `to` are what it was stored as.
+    Inert { tag: String, to: Option<Ref> },
 }
 
+/// Names of the kinds, as the log stores them.
+pub(crate) const MESSAGE: &str = "message";
+pub(crate) const REACTION: &str = "reaction";
+pub(crate) const EDIT: &str = "edit";
+pub(crate) const DELETE: &str = "delete";
+
 impl Kind {
+    /// The kind's name in the log.
+    pub(crate) fn tag(&self) -> &str {
+        match self {
+            Kind::Message { .. } => MESSAGE,
+            Kind::Reaction { .. } => REACTION,
+            Kind::Edit { .. } => EDIT,
+            Kind::Delete { .. } => DELETE,
+            Kind::Inert { tag, .. } => tag,
+        }
+    }
+
+    /// An edit or delete by `author`: it counts only on their own message.
+    pub(crate) fn change(author: &str, tag: &str, of: Ref) -> Kind {
+        match tag {
+            EDIT if of.author == author => Kind::Edit { of },
+            DELETE if of.author == author => Kind::Delete { of },
+            _ => Kind::Inert { tag: tag.to_string(), to: Some(of) },
+        }
+    }
+
     /// The longest text an entry of this kind carries.
     pub(crate) fn max_chars(&self) -> usize {
         match self {
@@ -83,8 +113,9 @@ impl Entry {
         Self { author, seq, ts, hlc: ts, text, kind }
     }
 
-    /// How this entry goes over the wire, in a `msg` frame.
-    pub(crate) fn into_wire(self) -> Wire {
+    /// How this entry goes over the wire, in a `msg` frame. An inert entry isn't sent:
+    /// the peer's `have` is the highest entry it holds, so a gap in what it gets is fine.
+    pub(crate) fn into_wire(self) -> Option<Wire> {
         let (mut reply_to, mut react_to, mut edit_of, mut delete_of) = (None, None, None, None);
         let (mut vanish, mut file) = (None, None);
         match self.kind {
@@ -94,9 +125,10 @@ impl Entry {
             Kind::Reaction { to } => react_to = Some(to),
             Kind::Edit { of } => edit_of = Some(of),
             Kind::Delete { of } => delete_of = Some(of),
+            Kind::Inert { .. } => return None,
         }
         let (seq, ts, hlc, text) = (self.seq, self.ts, Some(self.hlc), self.text);
-        Wire { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of, vanish, file }
+        Some(Wire { seq, ts, hlc, text, reply_to, react_to, edit_of, delete_of, vanish, file })
     }
 }
 
@@ -143,14 +175,15 @@ impl Wire {
     /// computer's id.
     ///
     /// Only one of `delete_of`, `edit_of` and `react_to` counts, in that order. A reply
-    /// to anyone but the two of us becomes a plain message. A reaction to a stranger's
-    /// message, or an edit or delete of anyone's but the sender's own, is stored but
-    /// never shown. Text is cut to the kind's limit, a lifetime is brought into range,
-    /// and a file that's too big or badly described is left off.
+    /// to anyone but the two of us becomes a plain message. An edit or delete of anyone's
+    /// message but the sender's own is inert. A reaction to a stranger's message is kept
+    /// but never shown, since no such message is stored here. Text is cut to the kind's
+    /// limit, a lifetime is brought into range, and a file that's too big or badly
+    /// described is left off.
     pub(crate) fn admit(self, author: &str, me: &str) -> Entry {
         let kind = match (self.delete_of, self.edit_of, self.react_to) {
-            (Some(of), ..) => Kind::Delete { of },
-            (None, Some(of), _) => Kind::Edit { of },
+            (Some(of), ..) => Kind::change(author, DELETE, of),
+            (None, Some(of), _) => Kind::change(author, EDIT, of),
             (None, None, Some(to)) => Kind::Reaction { to },
             (None, None, None) => Kind::Message {
                 reply_to: self.reply_to.filter(|to| to.author == me || to.author == author),
@@ -264,9 +297,25 @@ mod tests {
             Entry { kind: Kind::Delete { of: at(PEER, 2) }, ..Entry::message(PEER, 5, 5, "") },
         ];
         for entry in entries {
-            let json = serde_json::to_string(&entry.clone().into_wire()).unwrap();
+            let json = serde_json::to_string(&entry.clone().into_wire().unwrap()).unwrap();
             assert_eq!(wire(&json).admit(PEER, ME), entry, "{json}");
         }
+    }
+
+    #[test]
+    fn changes_to_someone_elses_message_are_inert() {
+        let edit = wire(r#"{"seq":1,"ts":1,"text":"x","edit_of":{"author":"me","seq":1}}"#);
+        let inert = Kind::Inert { tag: EDIT.into(), to: Some(at(ME, 1)) };
+        assert_eq!(edit.admit(PEER, ME).kind, inert);
+        let delete = wire(r#"{"seq":1,"ts":1,"text":"","delete_of":{"author":"me","seq":1}}"#);
+        let inert = Kind::Inert { tag: DELETE.into(), to: Some(at(ME, 1)) };
+        assert_eq!(delete.admit(PEER, ME).kind, inert);
+
+        // Never sent, whatever it was.
+        let entry = Entry { kind: inert, ..Entry::message(ME, 1, 1, "") };
+        assert!(entry.into_wire().is_none());
+        let unknown = Kind::Inert { tag: "pin".into(), to: None };
+        assert!(Entry { kind: unknown, ..Entry::message(ME, 2, 1, "") }.into_wire().is_none());
     }
 
     #[test]
