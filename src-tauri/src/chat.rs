@@ -1100,10 +1100,11 @@ impl Core {
         // Files go on streams of their own: the ones they ask me for, and the ones I want.
         let serving = tokio::spawn(self.clone().serve_files(conn.clone()));
         let fetching = tokio::spawn(self.clone().fetch_files(conn.clone()));
+        // Stopped however this ends, including when the session itself is dropped (the
+        // dialer's, at shutdown), so none of them outlives it.
+        let tasks = [writer, serving, fetching].map(|task| AbortOnDrop(task.abort_handle()));
         let result = self.read_loop(&mut recv, &peer_str, &out).await;
-        writer.abort();
-        serving.abort();
-        fetching.abort();
+        drop(tasks);
         conn.close(0, b"bye");
         {
             let mut st = self.state();
@@ -1710,6 +1711,15 @@ impl Progress {
 impl Drop for Progress {
     fn drop(&mut self) {
         self.send(self.size);
+    }
+}
+
+/// Aborts a task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
