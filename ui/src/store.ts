@@ -4,7 +4,16 @@
 
 import { createStore } from '@tanstack/react-store'
 
-import { api, type Attachment, type Hit, type Message, type Status, type UpdateReady } from './api'
+import {
+  api,
+  type Attachment,
+  type Cursor,
+  type Hit,
+  type Message,
+  type Ref,
+  type Status,
+  type UpdateReady,
+} from './api'
 import { chime } from './lib/chime'
 import { formatBytes, isPicture, MAX_FILE_BYTES, type Staged, stage, unstage } from './lib/files'
 import * as transcript from './transcript'
@@ -46,7 +55,7 @@ interface State {
   /** The search bar, while it's open. */
   search: Search | null
   /** A message for the transcript to scroll to and highlight. `n` tells repeats apart. */
-  jump: { key: string; n: number } | null
+  jump: { at: Ref; n: number } | null
   /** Pictures waiting in the message box to be sent. */
   staged: Staged[]
   /** Files on their way, to or from here, by hash: how far along, 0 to 1. */
@@ -200,15 +209,19 @@ export function setSearchActive(active: number) {
 
 let jumps = 0
 
-/** Scrolls the transcript to a message, loading the history back to it first if needed. */
-export async function reveal(m: Message) {
-  const gap = transcript.gapTo(store.state.transcript, transcript.cursorOf(m))
+/**
+ * Scrolls the transcript to a message, from a search hit or a reply, loading the history
+ * back to it first if needed.
+ */
+export async function reveal(target: Cursor) {
+  const gap = transcript.gapTo(store.state.transcript, target)
   if (gap) {
     const missing = await run(api.getMessagesBetween(gap.from, gap.before))
     // Against the latest transcript, in case a page of older messages arrived meanwhile.
     store.setState((s) => ({ ...s, transcript: transcript.fill(s.transcript, missing ?? []) }))
   }
-  store.setState((s) => ({ ...s, jump: { key: messageKey(m), n: ++jumps } }))
+  const at = { author: target.author, seq: target.seq }
+  store.setState((s) => ({ ...s, jump: { at, n: ++jumps } }))
 }
 
 /** Loads the page before the oldest loaded message. Safe to call repeatedly. */

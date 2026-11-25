@@ -10,6 +10,7 @@ import {
   fromPage,
   gapTo,
   indexOf,
+  targetOf,
   messageKey,
   prepend,
   update,
@@ -39,6 +40,7 @@ function quote(of: Message): Quote {
   return {
     author: of.author,
     seq: of.seq,
+    hlc: of.hlc,
     text: of.text,
     deleted: false,
     vanished: false,
@@ -115,6 +117,14 @@ describe('reaching a message that is not loaded', () => {
     const filled = fill(t, gap)
     expect(keys(filled)).toEqual(['b:1', 'a:4', 'a:5', 'a:6'])
     expect(indexOf(filled, target)).toBe(0)
+  })
+
+  test('from a reply: loads back to the message it quotes', () => {
+    const quoted = quote(msg('b', 1, 10))
+    const target = targetOf(quoted)
+    expect(target).toEqual({ hlc: 10, author: 'b', seq: 1 })
+    expect(target && gapTo(t, target)?.from).toEqual(target)
+    expect(targetOf({ ...quoted, hlc: null, text: null })).toBeNull() // not on this computer
   })
 
   test('needs nothing when it is here, or nothing is', () => {
