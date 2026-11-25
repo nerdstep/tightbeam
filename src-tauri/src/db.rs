@@ -22,15 +22,13 @@
 //! which the sender no longer has ('gone'). No row means still on its way. A delete
 //! blanks the message's file details along with its text.
 
-use std::{
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::path::Path;
 
 use anyhow::{Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
+use crate::clock::Clock;
 use crate::entry::{DELETE, EDIT, Entry, FileInfo, Kind, MESSAGE, REACTION, Ref};
 
 /// Where a message's file has got to on this computer.
@@ -145,10 +143,15 @@ struct Current {
     deleted: bool,
 }
 
-pub struct Db(Connection);
+pub struct Db(Connection, Clock);
 
 impl Db {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, Clock::system())
+    }
+
+    /// Opens the log with `clock` for the time vanishing messages are judged by.
+    pub(crate) fn open_with(path: &Path, clock: Clock) -> Result<Self> {
         let conn = Connection::open(path)?;
         // Freed space is zeroed, so deleted and cleared text doesn't linger in the file.
         conn.execute_batch(
@@ -200,7 +203,7 @@ impl Db {
                  COMMIT;",
             )?;
         }
-        let db = Self(conn);
+        let db = Self(conn, clock);
         if version < 5 {
             // One transaction, so the search index is filled using the finished schema.
             db.0.execute_batch("BEGIN")?;
@@ -286,7 +289,7 @@ impl Db {
 
     /// Whether a vanishing message's time is up.
     fn vanished(&self, at: &Ref) -> Result<bool> {
-        Ok(self.expires(at)?.is_some_and(|t| t <= now_ms()))
+        Ok(self.expires(at)?.is_some_and(|t| t <= self.1.now_ms()))
     }
 
     /// When a message vanishes, if its countdown has started.
@@ -701,7 +704,7 @@ impl Db {
         let at = Ref { author: e.author, seq: e.seq };
         let current = self.current(&at, e.text)?;
         let expires = self.expires(&at)?;
-        let vanished = expires.is_some_and(|t| t <= now_ms());
+        let vanished = expires.is_some_and(|t| t <= self.1.now_ms());
         let (author, seq, ts, hlc) = (at.author.clone(), at.seq, e.ts, e.hlc);
         if current.deleted || vanished {
             let (text, reply_to, reactions) = (String::new(), None, Vec::new());
@@ -836,10 +839,6 @@ impl Db {
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 #[cfg(test)]

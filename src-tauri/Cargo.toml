@@ -37,4 +37,6 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# Paused time for the protocol tests.
+tokio = { version = "1.54", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
