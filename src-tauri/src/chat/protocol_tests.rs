@@ -75,12 +75,22 @@ impl Peer {
         self.messages().unwrap().into_iter().map(|m| m.text).collect()
     }
 
+    fn find(&self, at: &Ref) -> Option<Message> {
+        self.messages().unwrap().into_iter().find(|m| m.author == at.author && m.seq == at.seq)
+    }
+
+    fn reactions(&self, at: &Ref) -> Vec<String> {
+        self.find(at).unwrap().reactions.into_iter().map(|r| r.emoji).collect()
+    }
+
     fn count(&self, matches: impl Fn(&Event) -> bool) -> usize {
         self.events.lock().unwrap().iter().filter(|e| matches(e)).count()
     }
 
+    /// Quits the app, and waits until its last task has let go of it (and its log).
     async fn stop(self) {
         self.core.shutdown().await;
+        until("the app has stopped", || Arc::strong_count(&self.core) == 1).await;
     }
 }
 
@@ -240,4 +250,125 @@ async fn a_new_session_replaces_a_half_dead_one() {
     assert_eq!(other.status().peer_away, lunch, "said again on the new session");
     other.send_message("still there?", None, None).unwrap();
     until("it arrives", || dialer.texts().contains(&"still there?".into())).await;
+}
+
+// ---- Catch-up ------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn catch_up_after_being_offline() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    alice.send_message("hi bob", None, None).unwrap();
+    until("bob gets it", || bob.texts() == ["hi bob"]).await;
+    bob.mark_seen().unwrap();
+    until("alice sees he saw it", || alice.status().peer_seen == 1).await;
+
+    // Bob is off; Alice writes twice and reacts to her own message.
+    bob.stop().await;
+    until("alice notices", || !alice.status().connected).await;
+    alice.send_message("you there?", None, None).unwrap();
+    alice.send_message("guess not", None, None).unwrap();
+    let first = Ref { author: alice.id(), seq: 1 };
+    alice.react(first.clone(), "👍").unwrap();
+    assert_eq!(alice.status().peer_has, 1, "not delivered while he's off");
+
+    let bob = world.start("bob", "Bob").await;
+    until("reconnected", || alice.status().connected && bob.status().connected).await;
+    until("alice sees it all delivered", || alice.status().peer_has == 4).await;
+    assert_eq!(bob.texts(), ["hi bob", "you there?", "guess not"]);
+    assert_eq!(bob.reactions(&first), ["👍"]);
+    assert_eq!(alice.status().peer_seen, 1, "seen survives the restart, and doesn't grow");
+    bob.mark_seen().unwrap();
+    until("alice sees he saw it all", || alice.status().peer_seen == 4).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn sessions_coming_and_going_never_duplicate() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    let (dialer, other) = dialer_first(&alice, &bob);
+    for round in 0..3 {
+        dialer.send_message(&format!("from the dialer {round}"), None, None).unwrap();
+        other.send_message(&format!("from the other {round}"), None, None).unwrap();
+        world.lan.drop_out(dialer.me);
+        until("the dialer notices", || !dialer.status().connected).await;
+        // Written while the dialer is off: it arrives with the catch-up.
+        other.send_message(&format!("while it was off {round}"), None, None).unwrap();
+        until("back", || dialer.status().connected).await;
+    }
+    until("all arrive", || dialer.texts().len() == 9 && other.texts().len() == 9).await;
+    assert_eq!(dialer.texts(), other.texts());
+    let arrivals = |peer: &Peer| peer.count(|e| matches!(e, Event::Message(_)));
+    assert_eq!((arrivals(dialer), arrivals(other)), (9, 9), "each message shown once");
+    until("all delivered", || dialer.status().peer_has == 3 && other.status().peer_has == 6).await;
+}
+
+/// The log's files in `folder`, the way a backup would copy them.
+fn copy_log(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().flatten() {
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_peer_that_lost_history_gets_it_again() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    alice.send_message("one", None, None).unwrap();
+    until("bob gets it", || bob.texts() == ["one"]).await;
+    bob.mark_seen().unwrap();
+    until("seen", || alice.status().peer_seen == 1).await;
+    bob.stop().await;
+    let (folder, backup) = (world.root.join("bob"), world.root.join("backup"));
+    copy_log(&folder, &backup);
+
+    let bob = world.start("bob", "Bob").await;
+    alice.send_message("two", None, None).unwrap();
+    alice.send_message("three", None, None).unwrap();
+    until("bob gets them", || bob.texts().len() == 3).await;
+    bob.mark_seen().unwrap();
+    until("seen", || alice.status().peer_seen == 3).await;
+
+    // Bob restores the backup from when he had only the first.
+    bob.stop().await;
+    std::fs::remove_dir_all(&folder).unwrap();
+    copy_log(&backup, &folder);
+    let bob = world.start("bob", "Bob").await;
+    until("he has them all again", || bob.texts() == ["one", "two", "three"]).await;
+    until("delivered again", || alice.status().peer_has == 3).await;
+    assert_eq!(alice.status().peer_seen, 1, "he hasn't seen the ones he lost");
+}
+
+// ---- Vanishing messages --------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_vanishing_message_lasts_from_when_it_is_seen() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    let sent = alice.send_message("the code is 1234", None, Some(5)).unwrap();
+    let at = Ref { author: alice.id(), seq: sent.seq };
+    until("bob gets it", || bob.find(&at).is_some()).await;
+
+    // Unseen, it stays, however long.
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    let waiting = bob.find(&at).unwrap();
+    assert_eq!((waiting.text.as_str(), waiting.expires), ("the code is 1234", None));
+
+    bob.mark_seen().unwrap();
+    until("both clocks run", || {
+        alice.find(&at).unwrap().expires.is_some() && bob.find(&at).unwrap().expires.is_some()
+    })
+    .await;
+    within(7, "it vanishes on both sides", || {
+        alice.find(&at).unwrap().vanished && bob.find(&at).unwrap().vanished
+    })
+    .await;
+    assert!(alice.find(&at).unwrap().text.is_empty() && bob.find(&at).unwrap().text.is_empty());
 }
