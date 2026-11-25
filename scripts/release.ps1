@@ -75,7 +75,7 @@ if ($current -ne $Version) {
   if ($LASTEXITCODE -ne 0) { throw 'cargo update failed' }
 }
 
-Invoke-Git commit --quiet -m "Release $tag" -- $changelog $manifest src-tauri/Cargo.lock
+Invoke-Git commit --quiet -m "chore(release): $tag" -- $changelog $manifest src-tauri/Cargo.lock
 Invoke-Git tag -a $tag -m "Tightbeam $Version"
 # Both or neither, so a tag never points at a commit GitHub doesn't have.
 Invoke-Git push --atomic origin main $tag

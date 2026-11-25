@@ -6,6 +6,7 @@ Tightbeam is private chat between two people on the same LAN: a Rust backend (Ta
 
 - A change is done when the checks in `.github/workflows/ci.yml` pass locally: the UI check from the project root, and fmt, clippy and tests in `src-tauri/`.
 - A change people will notice also gets a line under `## Unreleased` in `CHANGELOG.md`. That section becomes the release text.
+- Commit messages and PR titles follow Conventional Commits (`feat:`, `fix:`, `refactor:`, `docs:`, `chore:` …). PRs squash-merge, so the title becomes the commit on `main`.
 
 ## Compatibility between versions
 
