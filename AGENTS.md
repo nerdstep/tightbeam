@@ -28,3 +28,17 @@ The two peers routinely run different builds, and both keep their history across
 ## Public repo
 
 Everything committed is public. Machine-specific details (hostnames, IPs, account names, SSH setup) go in gitignored `*.local.md` files. Secrets, such as the updater signing key, go in GitHub repository secrets.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in this repo's GitHub Issues, managed with the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default triage roles, each label named after its role. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` and `docs/adr/` at the repo root. See `docs/agents/domain.md`.
