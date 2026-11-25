@@ -10,15 +10,22 @@
 //! (hashing, a file arriving) takes no `Db`, so the caller never holds its lock across
 //! an `await`.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::{Result, bail, ensure};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::{
     db::{Db, FileState},
-    entry::{FileInfo, is_hash},
+    entry::{FileInfo, MAX_FILE_BYTES, is_hash},
 };
+
+/// While a file from disk is copied in, before its hash is known.
+const ADDING: &str = ".adding";
 
 pub(crate) struct FileStore {
     dir: PathBuf,
@@ -37,8 +44,62 @@ pub(crate) enum Found {
 }
 
 impl FileStore {
+    /// The store in `dir`. Copies left half-done when the app last closed are removed.
     pub fn new(dir: PathBuf) -> Self {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().ends_with(ADDING) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         Self { dir }
+    }
+
+    /// Copies a file from disk into the folder, hashing it on the way, never all in
+    /// memory. Blocking, and it doesn't touch the log, so it can take its time; then
+    /// `adopt` keeps it.
+    pub fn copy_in(&self, from: &Path) -> Result<Copied> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let mut source = std::fs::File::open(from)?;
+        let size = source.metadata()?.len();
+        ensure!(size > 0, "That file is empty.");
+        ensure!(size <= MAX_FILE_BYTES, "Files can be up to 1 GB.");
+        std::fs::create_dir_all(&self.dir)?;
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temp = self.dir.join(format!("{}-{n}{ADDING}", std::process::id()));
+        // Removes the copy if anything below fails.
+        let mut copied = Copied { temp: Some(temp.clone()), hash: String::new(), size: 0 };
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&temp)?);
+        let (mut hasher, mut buf, mut total) = (blake3::Hasher::new(), vec![0u8; 256 * 1024], 0);
+        loop {
+            let n = source.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            ensure!(total <= MAX_FILE_BYTES, "Files can be up to 1 GB.");
+            hasher.update(&buf[..n]);
+            out.write_all(&buf[..n])?;
+        }
+        out.flush()?;
+        ensure!(total > 0, "That file is empty.");
+        (copied.hash, copied.size) = (hasher.finalize().to_hex().to_string(), total);
+        Ok(copied)
+    }
+
+    /// Keeps a copied file under `name`, unless the same file is here already.
+    pub fn adopt(&self, db: &Db, mut copied: Copied, name: &str) -> Result<()> {
+        let Some(temp) = copied.temp.take() else { bail!("already kept") };
+        if db.file_state(&copied.hash)? == FileState::Done {
+            let _ = std::fs::remove_file(&temp);
+            return Ok(());
+        }
+        let name = safe_name(name);
+        let dir = self.dir.join(&copied.hash);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::rename(&temp, dir.join(&name))?;
+        db.set_file(&copied.hash, &name, FileState::Done)
     }
 
     /// Keeps `bytes` as the file `info` describes, unless it's here already. Blocking.
@@ -146,6 +207,22 @@ impl FileStore {
     }
 }
 
+/// A file from disk, copied in and hashed (`FileStore::copy_in`). Removed if dropped
+/// before it's kept.
+pub(crate) struct Copied {
+    temp: Option<PathBuf>,
+    pub hash: String,
+    pub size: u64,
+}
+
+impl Drop for Copied {
+    fn drop(&mut self) {
+        if let Some(temp) = &self.temp {
+            let _ = std::fs::remove_file(temp);
+        }
+    }
+}
+
 /// A file on its way in.
 pub(crate) struct Part {
     /// `None` once finished.
@@ -190,6 +267,61 @@ impl Part {
         }
         Ok(Arrived { path: self.path, info: self.info })
     }
+}
+
+/// A file's type, from the end of its name, for files from disk. Others are just bytes.
+pub(crate) fn mime_for(name: &str) -> &'static str {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "heic" => "image/heic",
+        "heif" => "image/heif",
+        "tif" | "tiff" => "image/tiff",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" => "text/plain",
+        "md" => "text/markdown",
+        "csv" => "text/csv",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "odt" => "application/vnd.oasis.opendocument.text",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        "odp" => "application/vnd.oasis.opendocument.presentation",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        "mp4" => "video/mp4",
+        "m4v" => "video/x-m4v",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Types the webview may show as an image. Not SVG, which can carry scripts.
+pub(crate) fn may_show(mime: &str) -> bool {
+    const SHOWABLE: &[&str] = &[
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/avif",
+        "image/bmp",
+        "image/heic",
+        "image/heif",
+    ];
+    SHOWABLE.contains(&mime)
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -324,6 +456,53 @@ mod tests {
         assert!(!dir.join(&info.hash).exists());
         assert_eq!(db.file_state(&info.hash).unwrap(), FileState::Pending, "forgotten");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_from_disk_is_copied_in_and_kept_once() {
+        let (store, db, info, bytes, dir) = setup("copy");
+        let original = dir.with_extension("original.jpg");
+        std::fs::write(&original, &bytes).unwrap();
+        let copied = store.copy_in(&original).unwrap();
+        assert_eq!((copied.hash.as_str(), copied.size), (info.hash.as_str(), info.size));
+        attach(&db, &info, 1);
+        store.adopt(&db, copied, "beach.jpg").unwrap();
+        assert!(matches!(store.get(&db, &info.hash).unwrap(), Found::Here { .. }));
+
+        // The original can change or go: the store has its own copy.
+        std::fs::remove_file(&original).unwrap();
+        assert!(matches!(store.get(&db, &info.hash).unwrap(), Found::Here { .. }));
+
+        // Copying the same file again keeps the one copy; one never kept leaves nothing.
+        std::fs::write(&original, &bytes).unwrap();
+        let again = store.copy_in(&original).unwrap();
+        store.adopt(&db, again, "beach.jpg").unwrap();
+        drop(store.copy_in(&original).unwrap());
+        let adding = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().ends_with(ADDING))
+        };
+        assert!(!adding(&dir), "nothing half-copied left behind");
+
+        std::fs::write(&original, b"").unwrap();
+        let refused = store.copy_in(&original).err().unwrap().to_string();
+        assert_eq!(refused, "That file is empty.");
+        std::fs::write(dir.join(format!("9-9{ADDING}")), b"interrupted").unwrap();
+        let _ = FileStore::new(dir.clone());
+        assert!(!adding(&dir), "an interrupted copy goes at the next start");
+        let _ = std::fs::remove_file(original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn types_come_from_the_name() {
+        assert_eq!(mime_for("Report.PDF"), "application/pdf");
+        assert_eq!(mime_for("song.flac"), "audio/flac");
+        assert_eq!(mime_for("setup.exe"), "application/octet-stream");
+        assert_eq!(mime_for("no extension"), "application/octet-stream");
+        assert!(may_show("image/png") && !may_show("image/svg+xml") && !may_show("text/html"));
     }
 
     #[test]

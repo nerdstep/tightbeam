@@ -11,11 +11,19 @@ import {
   type Hit,
   type Message,
   type Ref,
+  type StagedFiles,
   type Status,
   type UpdateReady,
 } from './api'
 import { chime } from './lib/chime'
-import { formatBytes, isPicture, MAX_FILE_BYTES, type Staged, stage, unstage } from './lib/files'
+import {
+  formatBytes,
+  MAX_PASTED_BYTES,
+  type Staged,
+  stageFromDisk,
+  stagePasted,
+  unstage,
+} from './lib/files'
 import * as transcript from './transcript'
 import { messageKey, type Transcript } from './transcript'
 
@@ -56,7 +64,7 @@ interface State {
   search: Search | null
   /** A message for the transcript to scroll to and highlight. `n` tells repeats apart. */
   jump: { at: Ref; n: number } | null
-  /** Pictures waiting in the message box to be sent. */
+  /** Files waiting in the message box to be sent. */
   staged: Staged[]
   /** Files on their way, to or from here, by hash: how far along, 0 to 1. */
   transfers: Record<string, number>
@@ -112,24 +120,43 @@ function updateMessage(updated: Message) {
 }
 
 /**
- * Adds pictures to the message box, to go with the next message. Anything else, or
- * anything over 1 GB, is turned away with a note.
+ * Adds pasted files to the message box, to go with the next message. They pass through
+ * the webview, so one over 100 MB is turned away with a note: dropped or picked, it goes
+ * from disk instead.
  */
 export async function stageFiles(files: File[]) {
-  const pictures = files.filter(isPicture)
-  const fitting = pictures.filter((f) => f.size > 0 && f.size <= MAX_FILE_BYTES)
-  if (fitting.length < files.length) {
-    const tooBig = pictures.find((f) => f.size > MAX_FILE_BYTES)
-    const note = tooBig
-      ? `${tooBig.name} is ${formatBytes(tooBig.size)}. Files can be up to 1 GB.`
-      : 'Only pictures can be sent for now.'
+  const fitting = files.filter((f) => f.size > 0 && f.size <= MAX_PASTED_BYTES)
+  const left = files.find((f) => !fitting.includes(f))
+  if (left) {
+    const note = left.size
+      ? `${left.name} is ${formatBytes(left.size)}. Drop it on the window or pick it with the paperclip to send it.`
+      : `${left.name || 'That file'} is empty.`
     store.setState((s) => ({ ...s, error: note }))
   }
-  const ready = await Promise.all(fitting.map(stage))
+  addStaged(await Promise.all(fitting.map(stagePasted)))
+}
+
+/** Adds files dropped on the window to the message box. */
+export async function stageDropped(paths: string[]) {
+  await stageStaged(run(api.stagePaths(paths)))
+}
+
+/** Asks which files to send, and adds them to the message box. */
+export async function pickFiles() {
+  await stageStaged(run(api.pickFiles()))
+}
+
+async function stageStaged(result: Promise<StagedFiles | undefined>) {
+  const { staged = [], refused = [] } = (await result) ?? {}
+  if (refused.length) store.setState((s) => ({ ...s, error: refused.join(' ') }))
+  addStaged(await Promise.all(staged.map(stageFromDisk)))
+}
+
+function addStaged(ready: Staged[]) {
   if (ready.length) store.setState((s) => ({ ...s, staged: [...s.staged, ...ready] }))
 }
 
-/** Takes a picture out of the message box. */
+/** Takes a file out of the message box. */
 export function unstageFile(id: number) {
   const gone = store.state.staged.find((s) => s.id === id)
   if (gone) unstage(gone)

@@ -138,7 +138,7 @@ struct FileReply {
 }
 
 /// What the UI says about a file it sends. The bytes come separately.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct NewFile {
     pub name: String,
     pub mime: String,
@@ -541,9 +541,30 @@ impl Core {
     /// Sends a file, with `new.text` as its caption. Blocking: it hashes and stores the
     /// file, so call it off the UI thread.
     pub fn send_file(&self, bytes: &[u8], new: NewFile) -> Result<Message> {
-        let peer = self.peer_id().context("not paired with anyone yet")?;
+        self.may_send_file(&new)?;
         ensure!(!bytes.is_empty(), "That file is empty.");
         ensure!(bytes.len() as u64 <= MAX_FILE_BYTES, "Files can be up to 1 GB.");
+        let hash = blake3::hash(bytes).to_hex().to_string();
+        let info = described(new.clone(), hash, bytes.len() as u64)?;
+        self.files.put_bytes(&self.db(), &info, bytes)?;
+        self.post_file(new, info)
+    }
+
+    /// Sends the file at `path`, with `new.text` as its caption. The store copies it in,
+    /// so changing or moving the original afterwards makes no difference. Blocking: it
+    /// hashes and copies the file, so call it off the UI thread.
+    pub fn send_file_from(&self, path: &std::path::Path, new: NewFile) -> Result<Message> {
+        self.may_send_file(&new)?;
+        let copied = self.files.copy_in(path)?;
+        let info = described(new.clone(), copied.hash.clone(), copied.size)?;
+        self.files.adopt(&self.db(), copied, &info.name)?;
+        self.post_file(new, info)
+    }
+
+    /// Whether a file can go to the peer now: their build takes files, and a reply is to
+    /// one of us.
+    fn may_send_file(&self, new: &NewFile) -> Result<()> {
+        let peer = self.peer_id().context("not paired with anyone yet")?;
         {
             let st = self.state();
             ensure!(
@@ -556,18 +577,10 @@ impl Core {
         if let Some(to) = &new.reply_to {
             ensure!(self.is_ours(to, &peer.to_string()), "can't reply to that");
         }
-        let hash = blake3::hash(bytes).to_hex().to_string();
-        let info = checked_file(FileInfo {
-            hash: hash.clone(),
-            name: new.name,
-            size: bytes.len() as u64,
-            mime: new.mime,
-            width: new.width,
-            height: new.height,
-            preview: new.preview,
-        })
-        .context("That file can't be sent.")?;
-        self.files.put_bytes(&self.db(), &info, bytes)?;
+        Ok(())
+    }
+
+    fn post_file(&self, new: NewFile, info: FileInfo) -> Result<Message> {
         let text = clean(&new.text, MAX_TEXT_CHARS);
         self.post(text, Kind::Message { reply_to: new.reply_to, vanish: None, file: Some(info) })
     }
@@ -1660,6 +1673,13 @@ impl Drop for Progress {
     fn drop(&mut self) {
         self.send(self.size);
     }
+}
+
+/// What a file I'm sending says about itself, checked like one that arrives.
+fn described(new: NewFile, hash: String, size: u64) -> Result<FileInfo> {
+    let NewFile { name, mime, width, height, preview, .. } = new;
+    checked_file(FileInfo { hash, name, size, mime, width, height, preview })
+        .context("That file can't be sent.")
 }
 
 /// Whether one of my entries goes to `peer`: only what I wrote after pairing with them

@@ -8,12 +8,16 @@ mod idle;
 mod net;
 mod updates;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use chat::{ConnectionInfo, Core, Emit, Event, NewFile, Status};
 use db::{Cursor, Hit, Message, Page};
 use desktop::{Desktop, MAIN_WINDOW, MINIMIZED_ARG};
-use entry::Ref;
+use entry::{MAX_FILE_BYTES, Ref};
 use serde::Serialize;
 use tauri::{
     Emitter, Manager, RunEvent, State, WindowEvent,
@@ -114,6 +118,147 @@ async fn send_file(
         .map_err(err)
 }
 
+/// Files from disk waiting in the message box, by id. They go by path, never through the
+/// webview, so a big one isn't read into memory.
+#[derive(Default)]
+struct Staging(Mutex<StagingState>);
+
+#[derive(Default)]
+struct StagingState {
+    next: u64,
+    files: HashMap<u64, Staged>,
+}
+
+struct Staged {
+    path: PathBuf,
+    mime: &'static str,
+    size: u64,
+}
+
+/// A file from disk, staged, as the UI sees it.
+#[derive(Serialize)]
+struct StagedFile {
+    id: u64,
+    name: String,
+    size: u64,
+    mime: String,
+}
+
+/// What came of staging some paths: the ones staged, and why the others weren't.
+#[derive(Serialize)]
+struct StagedFiles {
+    staged: Vec<StagedFile>,
+    refused: Vec<String>,
+}
+
+impl Staging {
+    fn add(&self, paths: impl IntoIterator<Item = PathBuf>) -> StagedFiles {
+        let (mut staged, mut refused) = (Vec::new(), Vec::new());
+        let mut st = self.0.lock().unwrap();
+        for path in paths {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+            let name = name.unwrap_or_else(|| path.to_string_lossy().into_owned());
+            match std::fs::metadata(&path) {
+                Ok(m) if m.is_dir() => {
+                    refused.push(format!("{name} is a folder. Only files can be sent."))
+                }
+                Ok(m) if m.len() == 0 => refused.push(format!("{name} is empty.")),
+                Ok(m) if m.len() > MAX_FILE_BYTES => {
+                    refused.push(format!("{name} is too big. Files can be up to 1 GB."))
+                }
+                Ok(m) => {
+                    st.next += 1;
+                    let (id, mime, size) = (st.next, files::mime_for(&name), m.len());
+                    st.files.insert(id, Staged { path, mime, size });
+                    staged.push(StagedFile { id, name, size, mime: mime.into() });
+                }
+                Err(_) => refused.push(format!("{name} can't be read.")),
+            }
+        }
+        StagedFiles { staged, refused }
+    }
+}
+
+/// Stages files dropped on the window.
+#[tauri::command]
+fn stage_paths(staging: State<Staging>, paths: Vec<PathBuf>) -> StagedFiles {
+    staging.add(paths)
+}
+
+/// Asks which files to send, then stages them.
+#[tauri::command]
+async fn pick_files(
+    app: tauri::AppHandle,
+    staging: State<'_, Staging>,
+) -> Result<StagedFiles, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().file().set_title("Send files").pick_files(move |chosen| {
+        let _ = tx.send(chosen);
+    });
+    let chosen = rx.await.map_err(err)?.unwrap_or_default();
+    Ok(staging.add(chosen.into_iter().filter_map(|p| p.into_path().ok())))
+}
+
+/// Sends a staged file. It stays staged if that fails, so it can be tried again.
+#[tauri::command]
+async fn send_staged(
+    core: State<'_, Arc<Core>>,
+    staging: State<'_, Staging>,
+    id: u64,
+    details: NewFile,
+) -> Result<Message, String> {
+    let path = staging.0.lock().unwrap().files.get(&id).map(|s| s.path.clone());
+    let path = path.ok_or("That file isn't waiting to be sent any more.")?;
+    let core = core.inner().clone();
+    // Hashing and copying a big file takes a moment.
+    let sent = tauri::async_runtime::spawn_blocking(move || core.send_file_from(&path, details))
+        .await
+        .map_err(err)?
+        .map_err(err)?;
+    staging.0.lock().unwrap().files.remove(&id);
+    Ok(sent)
+}
+
+/// Takes a file out of the message box.
+#[tauri::command]
+fn unstage(staging: State<Staging>, id: u64) {
+    staging.0.lock().unwrap().files.remove(&id);
+}
+
+/// Previews of staged pictures are made from at most this much.
+const MAX_PREVIEW_SOURCE: u64 = 50 * 1024 * 1024;
+
+/// A staged picture's bytes, for the webview to make its preview. Only pictures it can
+/// show, up to 50 MB; nothing else on disk. Raw bytes over IPC, not a fetch from a URI
+/// scheme: that would be cross-origin, and the webview would refuse it without CORS.
+#[tauri::command]
+async fn staged_picture(
+    staging: State<'_, Staging>,
+    id: u64,
+) -> Result<tauri::ipc::Response, String> {
+    let path = {
+        let st = staging.0.lock().unwrap();
+        let s = st.files.get(&id).ok_or("That file isn't waiting to be sent any more.")?;
+        let fits = files::may_show(s.mime) && s.size <= MAX_PREVIEW_SOURCE;
+        fits.then(|| s.path.clone()).ok_or("That file has no preview.")?
+    };
+    let bytes = tauri::async_runtime::spawn_blocking(move || std::fs::read(path))
+        .await
+        .map_err(err)?
+        .map_err(err)?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+fn uncached(status: StatusCode, mime: &str, body: Vec<u8>) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .body(body)
+        .unwrap_or_default()
+}
+
 /// Kinds of file that open in their default app. Anything else, like a program, can only
 /// be shown in its folder.
 const OPENABLE: &[&str] =
@@ -172,38 +317,17 @@ async fn save_file_copy(
 const MISSING: &str =
     "That file was moved or changed outside Tightbeam, so it's being fetched again.";
 
-/// Types the webview may show as an image. Not SVG, which can carry scripts.
-const SHOWABLE: &[&str] = &[
-    "image/jpeg",
-    "image/png",
-    "image/gif",
-    "image/webp",
-    "image/avif",
-    "image/bmp",
-    "image/heic",
-    "image/heif",
-];
-
 /// `tbfile://localhost/<hash>` (`http://tbfile.localhost/<hash>` on Windows): a stored
 /// file, for the webview to show. Only files still attached to a message, and never
 /// cached, so a deleted picture doesn't linger in the webview's cache.
 fn file_response(app: &tauri::AppHandle, path: &str) -> Response<Vec<u8>> {
-    let respond = |status: StatusCode, mime: &str, body: Vec<u8>| {
-        Response::builder()
-            .status(status)
-            .header(header::CONTENT_TYPE, mime)
-            .header(header::CACHE_CONTROL, "no-store")
-            .header("X-Content-Type-Options", "nosniff")
-            .body(body)
-            .unwrap_or_default()
-    };
+    let respond = uncached;
     let hash = path.trim_start_matches('/');
     let found = app.try_state::<Arc<Core>>().and_then(|core| core.file(hash).ok().flatten());
     let Some((file, mime)) = found else {
         return respond(StatusCode::NOT_FOUND, "text/plain", Vec::new());
     };
-    let mime =
-        if SHOWABLE.contains(&mime.as_str()) { mime } else { "application/octet-stream".into() };
+    let mime = if files::may_show(&mime) { mime } else { "application/octet-stream".into() };
     match std::fs::read(file) {
         Ok(bytes) => respond(StatusCode::OK, &mime, bytes),
         Err(_) => respond(StatusCode::NOT_FOUND, "text/plain", Vec::new()),
@@ -403,6 +527,7 @@ pub fn run() {
             let loopback = std::env::var_os("TIGHTBEAM_LOOPBACK").is_some();
 
             app.manage(Desktop::new());
+            app.manage(Staging::default());
             let handle = app.handle().clone();
             let emit: Emit = Arc::new(move |event| {
                 match &event {
@@ -449,6 +574,11 @@ pub fn run() {
             set_name,
             send_message,
             send_file,
+            stage_paths,
+            pick_files,
+            send_staged,
+            staged_picture,
+            unstage,
             open_file,
             show_file,
             save_file_copy,

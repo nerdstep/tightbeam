@@ -969,3 +969,37 @@ async fn a_new_pairing_starts_clean() {
     assert!(alice.send_file(b"png", picture()).is_err(), "no files");
     assert_eq!((alice.status().peer_has, alice.status().peer_seen), (0, 0));
 }
+
+#[tokio::test(start_paused = true)]
+async fn any_file_goes_from_disk_by_path() {
+    let world = World::new();
+    let (alice, bob) = (world.start("alice", "Alice").await, world.start("bob", "Bob").await);
+    world.pair(&alice, &bob).await;
+    let bytes = photo_bytes();
+    let original = world.root.join("Report.pdf");
+    std::fs::write(&original, &bytes).unwrap();
+    let new = NewFile {
+        name: "Report.pdf".into(),
+        mime: "application/pdf".into(),
+        width: None,
+        height: None,
+        preview: None,
+        text: "the numbers".into(),
+        reply_to: None,
+    };
+    let sent = alice.send_file_from(&original, new).unwrap();
+    let file = sent.file.unwrap();
+    assert_eq!((file.state, file.info.size), (FileState::Done, bytes.len() as u64));
+
+    // Her copy is the store's own: changing the original afterwards changes nothing.
+    std::fs::write(&original, b"edited").unwrap();
+    let at = Ref { author: alice.id(), seq: sent.seq };
+    until("bob has it", || file_state(&bob, &at) == Some(FileState::Done)).await;
+    let (path, mime) = bob.file(&file.info.hash).unwrap().unwrap();
+    assert_eq!((std::fs::read(&path).unwrap(), mime.as_str()), (bytes, "application/pdf"));
+    assert_eq!(path.file_name().unwrap(), "Report.pdf");
+    assert_eq!(bob.find(&at).unwrap().text, "the numbers");
+
+    let missing = world.root.join("not there.pdf");
+    assert!(alice.send_file_from(&missing, picture()).is_err());
+}
