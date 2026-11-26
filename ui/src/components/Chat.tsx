@@ -71,7 +71,7 @@ import {
   store,
   unstageFile,
 } from '@/store'
-import { indexOf, messageKey, targetOf } from '@/transcript'
+import { indexOf, messageKey, refOf, targetOf } from '@/transcript'
 
 /** The reactions on offer. */
 const EMOJI = ['👍', '❤️', '😂', '😮', '😢', '🎉']
@@ -407,9 +407,7 @@ const Row = memo(function Row({
   const myReaction = message.reactions.find((r) => r.author === myId)?.emoji
   // Picking my current reaction again takes it back.
   const react = (emoji: string) =>
-    void run(
-      api.react({ author: message.author, seq: message.seq }, emoji === myReaction ? '' : emoji),
-    )
+    void run(api.react(refOf(message), emoji === myReaction ? '' : emoji))
   const footer = groupEnd && (
     <MessageFooter className="text-[11px] font-normal">
       {when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}
@@ -834,7 +832,7 @@ function Composer() {
       return
     }
     const saved = await run(
-      api.editMessage({ author: of.author, seq: of.seq }, value).then(() => true),
+      api.editMessage(refOf(of), value).then(() => true),
       'composer',
     )
     if (saved) setEditing(null)
@@ -864,7 +862,7 @@ function Composer() {
     setSending(true)
     for (const [i, s] of store.state.staged.entries()) {
       const first = i === 0
-      const to = first && reply ? { author: reply.author, seq: reply.seq } : undefined
+      const to = first && reply ? refOf(reply) : undefined
       const withText = first ? caption : ''
       const sent = await run(
         'pasted' in s.source
@@ -894,7 +892,7 @@ function Composer() {
     reset()
     setReplyingTo(null)
     typingSentRef.current = 0 // the next message signals typing right away
-    const to = reply ? { author: reply.author, seq: reply.seq } : undefined
+    const to = reply ? refOf(reply) : undefined
     const sent = await run(api.sendMessage(value, to, vanish), 'composer')
     if (sent) {
       addMessage(sent)
@@ -1192,8 +1190,7 @@ function DeleteDialog() {
             onClick={() => {
               // AlertDialogAction is a plain button: it doesn't close the dialog itself.
               setDeleting(null)
-              if (deleting)
-                void run(api.deleteMessage({ author: deleting.author, seq: deleting.seq }))
+              if (deleting) void run(api.deleteMessage(refOf(deleting)))
             }}
           >
             Delete

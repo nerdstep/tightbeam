@@ -19,6 +19,9 @@ export const empty: Transcript = { messages: [], keys: new Set(), hasOlder: fals
 
 export const messageKey = (m: Ref) => `${m.author}:${m.seq}`
 
+/** Just the author and sequence number, as commands take them. */
+export const refOf = (m: Ref): Ref => ({ author: m.author, seq: m.seq })
+
 export const cursorOf = (m: Message): Cursor => ({ hlc: m.hlc, author: m.author, seq: m.seq })
 
 /** Display order. The UI's one copy of the log's SQL `ORDER BY hlc, author, seq`. */
