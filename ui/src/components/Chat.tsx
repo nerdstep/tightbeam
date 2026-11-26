@@ -732,22 +732,30 @@ function Composer() {
   const textRef = useRef<HTMLTextAreaElement>(null)
   const typingSentRef = useRef(0)
   const { scrollToEnd } = useMessageScroller()
-  const { replyingTo, editing, peerName, myId, myName, away, dndUntil, staged, hint } = useSelector(
-    store,
-    (s) => ({
-      hint: s.hint,
-      replyingTo: s.replyingTo,
-      editing: s.editing,
-      peerName: s.status?.peer?.name || 'them',
-      myId: s.status?.me.id ?? '',
-      myName: s.status?.me.name || 'You',
-      away: s.status?.away ? (s.status.away.note ?? '') : null,
-      dndUntil: s.status?.dnd_until ?? null,
-      staged: s.staged.length,
-    }),
-    { compare: shallow },
-  )
+  const { replyingTo, editing, peerName, myId, myName, people, away, dndUntil, staged, hint } =
+    useSelector(
+      store,
+      (s) => ({
+        hint: s.hint,
+        replyingTo: s.replyingTo,
+        editing: s.editing,
+        peerName: s.status?.peer?.name || 'them',
+        myId: s.status?.me.id ?? '',
+        myName: s.status?.me.name || 'You',
+        people: peopleKey(s.status?.people),
+        away: s.status?.away ? (s.status.away.note ?? '') : null,
+        dndUntil: s.status?.dnd_until ?? null,
+        staged: s.staged.length,
+      }),
+      { compare: shallow },
+    )
   const dnd = useUntil(dndUntil)
+  // Replying to someone I was paired with before names them, not whoever's paired now.
+  const nameOf = useMemo(() => namer(people, myId, peerName), [people, myId, peerName])
+  const actorOf = useMemo(
+    () => namer(people, myId, peerName, myName),
+    [people, myId, peerName, myName],
+  )
   const [showingStatus, setShowingStatus] = useState(false)
   // What was in the box before editing started; it comes back when editing ends.
   const draftRef = useRef<string | null>(null)
@@ -1005,10 +1013,10 @@ function Composer() {
         <div className="mb-2 flex items-center gap-2 rounded-md border-l-2 border-primary bg-muted py-1 pr-1 pl-2 text-xs">
           <div className="min-w-0 flex-1">
             <div className="font-medium">
-              Replying to {replyingTo.author === myId ? 'yourself' : peerName}
+              Replying to {replyingTo.author === myId ? 'yourself' : nameOf(replyingTo.author)}
             </div>
             <div className="truncate text-muted-foreground">
-              {summaryOf(replyingTo, replyingTo.author === myId ? myName : peerName)}
+              {summaryOf(replyingTo, actorOf(replyingTo.author))}
             </div>
           </div>
           <Button

@@ -12,6 +12,11 @@ test('each author keeps their own name', () => {
   expect(['me', 'bob', 'carol'].map(nameOf)).toEqual(['You', 'Bob', 'Carol'])
 })
 
+test('an action names me by my name', () => {
+  const actorOf = namer(peopleKey(people), 'me', 'Carol', 'Alex')
+  expect(['me', 'bob'].map(actorOf)).toEqual(['Alex', 'Bob'])
+})
+
 test('anyone unknown gets the fallback', () => {
   expect(namer(peopleKey(undefined), 'me', 'Them')('stranger')).toBe('Them')
   expect(namer(peopleKey([{ id: 'x', name: '' }]), 'me', 'Them')('x')).toBe('Them')

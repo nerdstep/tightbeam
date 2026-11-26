@@ -10,8 +10,16 @@ import type { Person } from './api'
 export const peopleKey = (people: Person[] | undefined) =>
   JSON.stringify((people ?? []).map((p) => [p.id, p.name]))
 
-/** Names authors: "You" for me, otherwise their last known name, or else `fallback`. */
-export function namer(key: string, myId: string, fallback: string): (author: string) => string {
+/**
+ * Names authors: `me` for me ("You", or my name where an action needs a sentence: "Alex
+ * waves"), otherwise their last known name, or else `fallback`.
+ */
+export function namer(
+  key: string,
+  myId: string,
+  fallback: string,
+  me = 'You',
+): (author: string) => string {
   const names = new Map<string, string>(JSON.parse(key))
-  return (author) => (author === myId ? 'You' : names.get(author) || fallback)
+  return (author) => (author === myId ? me : names.get(author) || fallback)
 }
