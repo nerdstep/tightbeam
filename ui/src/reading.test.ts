@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { Attachment, Message, Quote } from './api'
-import { actionOf, goneText, readingOf, summaryOf } from './reading'
+import type { Attachment, Hit, Message, Quote } from './api'
+import { actionInSnippet, actionOf, goneText, readingOf, summaryOf } from './reading'
 
 function msg(more: Partial<Message> = {}): Message {
   return {
@@ -94,17 +94,41 @@ describe('placeholders', () => {
 describe('a message in one line', () => {
   const cases: [string, Message | Quote, string][] = [
     ['text', quote(), 'hello'],
-    ['an action', quote({ text: '/me waves' }), '* waves'],
+    ['an action, as the transcript says it', quote({ text: '/me waves' }), 'Alex waves'],
+    ['an action in the reply bar', msg({ text: '/me waves' }), 'Alex waves'],
     ['a caption', quote({ text: 'look', file: picture }), 'look'],
+    ['a caption that starts with /me', msg({ text: '/me waves', file: picture }), '/me waves'],
     ['a picture alone', quote({ text: '', file: picture }), 'Picture'],
     ['a file alone', quote({ text: '', file: pdf }), 'Report.pdf'],
-    ['deleted', quote({ text: null, deleted: true }), 'Deleted message'],
+    ['deleted', quote({ text: null, deleted: true }), 'Message deleted'],
+    ['deleted, in the reply bar', msg(deleted), 'Message deleted'],
     ['vanished', quote({ text: null, deleted: true, vanished: true }), 'Message vanished'],
     ['not on this computer', quote({ text: null }), 'A message that isn’t on this computer'],
   ]
   for (const [name, m, line] of cases) {
-    test(name, () => expect(summaryOf(m)).toBe(line))
+    test(name, () => expect(summaryOf(m, 'Alex')).toBe(line))
   }
+})
+
+/** A match on `/me waves at everyone`, unless `more` says otherwise. */
+const hit = (snippet: string, more: Partial<Message> = {}): Hit => ({
+  message: msg({ text: '/me waves at everyone', ...more }),
+  snippet,
+})
+
+describe('a search match', () => {
+  test('on an action loses the /me, keeping its highlights', () => {
+    expect(actionInSnippet(hit('/me \u0002waves\u0003 at everyone'))).toBe(
+      '\u0002waves\u0003 at everyone',
+    )
+  })
+  test('that starts mid-message stays as it is', () => {
+    expect(actionInSnippet(hit('…\u0002waves\u0003 at everyone'))).toBeNull()
+  })
+  test('on anything else stays as it is', () => {
+    expect(actionInSnippet(hit('/me \u0002waves\u0003', { file: picture }))).toBeNull()
+    expect(actionInSnippet(hit('\u0002hello\u0003', { text: 'hello' }))).toBeNull()
+  })
 })
 
 describe('actions', () => {

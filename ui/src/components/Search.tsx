@@ -9,6 +9,7 @@ import type { Hit } from '@/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
+import { actionInSnippet } from '@/reading'
 import { closeSearch, reveal, setSearchActive, setSearchQuery, store } from '@/store'
 import { messageKey } from '@/transcript'
 
@@ -69,11 +70,12 @@ export function SearchBar() {
 }
 
 export function SearchResults() {
-  const { search, myId, peerName } = useSelector(
+  const { search, myId, myName, peerName } = useSelector(
     store,
     (s) => ({
       search: s.search,
       myId: s.status?.me.id ?? '',
+      myName: s.status?.me.name || 'You',
       peerName: s.status?.peer?.name || 'Them',
     }),
     { compare: shallow },
@@ -112,7 +114,7 @@ export function SearchResults() {
                     </span>
                     <span>{when(hit.message.ts)}</span>
                   </div>
-                  <Snippet text={hit.snippet} />
+                  <Snippet hit={hit} actor={hit.message.author === myId ? myName : peerName} />
                 </button>
               </li>
             ))}
@@ -141,11 +143,16 @@ function when(ts: number) {
   return `${date}, ${d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
 }
 
-/** A snippet from Rust, with the matches (between \u0002 and \u0003) highlighted. */
-function Snippet({ text }: { text: string }) {
-  const [before, ...rest] = text.split('\u0002')
+/**
+ * A match's snippet from Rust, with the matches (between \u0002 and \u0003) highlighted.
+ * An action reads as the transcript shows it: "Alex waves", with `actor` as the name.
+ */
+function Snippet({ hit, actor }: { hit: Hit; actor: string }) {
+  const action = actionInSnippet(hit)
+  const [before, ...rest] = (action ?? hit.snippet).split('\u0002')
   return (
-    <p className="mt-0.5 line-clamp-2 text-sm break-words">
+    <p className={`mt-0.5 line-clamp-2 text-sm break-words ${action === null ? '' : 'italic'}`}>
+      {action !== null && <span className="font-semibold not-italic">{actor} </span>}
       {before}
       {rest.map((part, i) => {
         const [match, after = ''] = part.split('\u0003')
