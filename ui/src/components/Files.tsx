@@ -6,7 +6,7 @@ import { useSelector } from '@tanstack/react-store'
 import { DownloadIcon, ExternalLinkIcon, FileIcon, FolderOpenIcon, XIcon } from 'lucide-react'
 import { useState } from 'react'
 
-import { api, type Attachment, type FileInfo } from '@/api'
+import { api, type Attachment } from '@/api'
 import { Button } from '@/components/ui/button'
 import { fitWithin, formatBytes } from '@/lib/files'
 import { run, setViewing, store, unstageFile } from '@/store'
@@ -17,9 +17,6 @@ const PICTURE_MAX = { width: 260, height: 300 }
 const onMac = navigator.userAgent.includes('Mac')
 const SHOW_IN_FOLDER = onMac ? 'Show in Finder' : 'Show in folder'
 const SAVE_A_COPY = 'Save a copy…'
-
-/** A picture, or a file's name: for quotes, the reply bar, and notifications. */
-export const describeFile = (file: FileInfo) => (file.width ? 'Picture' : file.name)
 
 /** A message's file: the picture itself, or a card for any other file. */
 export function FileView({ file, peer }: { file: Attachment; peer: string }) {

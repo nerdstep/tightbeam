@@ -44,6 +44,14 @@ _Avoid_: ignored entry, unknown entry
 What the transcript shows for a message entry: its current text with later edits, deletes and reactions folded in.
 _Avoid_: entry (when meaning the shown result), post
 
+**Action**:
+A message whose text starts with `/me`, shown as what its author does ("Alex waves") instead of as something said. A message with a file is never an action.
+_Avoid_: emote, me-message
+
+**Summary**:
+A message in one line, where it's quoted or listed rather than shown in full: its text or caption, what its file is, or that it's gone.
+_Avoid_: preview (that's a picture's), excerpt, snippet (that's a search match's)
+
 **Transcript**:
 The messages shown, in display order, as far back as they're loaded. Older ones load as the reader scrolls up, or when a search hit or a reply's quote reaches back to them.
 _Avoid_: chat log, history (for what's shown), feed

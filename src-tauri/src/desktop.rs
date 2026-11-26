@@ -108,7 +108,8 @@ pub fn on_message(app: &AppHandle, message: &Message) {
     let unread = desktop.unread.fetch_add(1, Ordering::Relaxed) + 1;
     show_unread(app, &window, unread);
     if desktop.notifications() && !core.dnd() && !recently_notified(&desktop) {
-        // A vanishing message's text would outlive it in the notification center.
+        // A vanishing message's text would outlive it in the notification center. The
+        // rest follows how the UI words a message (`ui/src/reading.ts`).
         let text = match message.text.strip_prefix("/me ") {
             _ if message.vanish.is_some() => "Vanishing message".to_string(),
             Some(action) => format!("{} {action}", title(core.peer_name(), "They")),
