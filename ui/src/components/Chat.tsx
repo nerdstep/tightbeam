@@ -16,7 +16,7 @@ import { memo, useEffect, useMemo, useRef, useState } from 'react'
 
 import { api, type Message as ChatMessage, type Quote, type Reaction } from '@/api'
 import { type Command, parse, suggest } from '@/commands'
-import { describeFile, FileView, StagedFiles, Viewer } from '@/components/Files'
+import { FileView, StagedFiles, Viewer } from '@/components/Files'
 import { Linkified } from '@/components/Linkified'
 import { NoteCard } from '@/components/Notice'
 import { SearchBar, SearchResults } from '@/components/Search'
@@ -54,6 +54,7 @@ import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
 import { formatDuration, formatUntil } from '@/lib/duration'
 import { namer, peopleKey } from '@/people'
+import { describeFile, goneText, readingOf, summaryOf } from '@/reading'
 import {
   addMessage,
   clearHistory,
@@ -415,7 +416,8 @@ const Row = memo(function Row({
     </MessageFooter>
   )
 
-  if (message.deleted) {
+  const reading = readingOf(message)
+  if (reading.kind === 'gone') {
     return (
       <div className={groupStart ? 'pt-3' : 'pt-0.5'}>
         {newDay && <DayMarker when={when} />}
@@ -423,11 +425,7 @@ const Row = memo(function Row({
           <MessageContent className="gap-1">
             <Bubble variant="outline" align={align}>
               <BubbleContent className="text-muted-foreground italic" title={when.toLocaleString()}>
-                {message.vanished
-                  ? 'Message vanished'
-                  : mine
-                    ? 'You deleted this message'
-                    : 'Message deleted'}
+                {goneText(reading.why, mine)}
               </BubbleContent>
             </Bubble>
             {footer}
@@ -438,7 +436,7 @@ const Row = memo(function Row({
   }
 
   // `/me waves`: an action line, "Alex waves", instead of a bubble.
-  const action = message.text.startsWith('/me ') && !message.file ? message.text.slice(4) : null
+  const action = reading.kind === 'action' ? reading.action : null
   const { file } = message
   const words = (
     <>
@@ -591,17 +589,7 @@ function QuoteButton({
       onClick={() => onJump(quote)}
     >
       <span className="font-medium">{name}</span>
-      <span className="line-clamp-2 opacity-80">
-        {quote.vanished
-          ? 'Message vanished'
-          : quote.deleted
-            ? 'Deleted message'
-            : quote.file && !quote.text
-              ? describeFile(quote.file)
-              : quote.text?.startsWith('/me ')
-                ? `* ${quote.text.slice(4)}`
-                : (quote.text ?? 'A message that isn’t on this computer')}
-      </span>
+      <span className="line-clamp-2 opacity-80">{summaryOf(quote)}</span>
     </button>
   )
 }
