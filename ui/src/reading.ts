@@ -1,9 +1,10 @@
 // How a message reads: the one place that decides its wording, wherever it's shown. The
-// transcript lays out a message's reading; quotes and the reply bar show its summary.
+// transcript lays out a message's reading; quotes, the reply bar and search show its
+// summary.
 //
 // Notifications are worded in Rust (`desktop::on_message`). Keep the two in step.
 
-import type { FileInfo, Message, Quote } from './api'
+import type { FileInfo, Hit, Message, Quote } from './api'
 
 /** What a message reads as. */
 export type Reading =
@@ -44,10 +45,21 @@ export function goneText(why: Gone, mine: boolean) {
 /** A file, in a word: "Picture", or its name. */
 export const describeFile = (file: FileInfo) => (file.width ? 'Picture' : file.name)
 
-/** A message in one line, for a reply's quote. */
-export function summaryOf(m: Message | Quote): string {
+/**
+ * A message in one line, for a reply's quote or the reply bar. `actor`: its author's name,
+ * for an action ("Alex waves").
+ */
+export function summaryOf(m: Message | Quote, actor: string): string {
   const r = readingOf(m)
-  if (r.kind === 'gone') return r.why === 'deleted' ? 'Deleted message' : goneText(r.why, false)
-  if (r.kind === 'action') return `* ${r.action}`
+  if (r.kind === 'gone') return goneText(r.why, false)
+  if (r.kind === 'action') return `${actor} ${r.action}`
   return r.text || (r.file ? describeFile(r.file) : '')
+}
+
+/**
+ * A search match on an action: its snippet without the `/me `, to show after its author's
+ * name. `null` for anything else, and for a snippet that starts mid-message.
+ */
+export function actionInSnippet(hit: Hit): string | null {
+  return readingOf(hit.message).kind === 'action' ? actionOf(hit.snippet) : null
 }

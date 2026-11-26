@@ -54,7 +54,7 @@ import { Spinner } from '@/components/ui/spinner'
 import { Textarea } from '@/components/ui/textarea'
 import { formatDuration, formatUntil } from '@/lib/duration'
 import { namer, peopleKey } from '@/people'
-import { describeFile, goneText, readingOf, summaryOf } from '@/reading'
+import { goneText, readingOf, summaryOf } from '@/reading'
 import {
   addMessage,
   clearHistory,
@@ -406,6 +406,8 @@ const Row = memo(function Row({
   const mine = receipt !== null
   const align = mine ? 'end' : 'start'
   const myReaction = message.reactions.find((r) => r.author === myId)?.emoji
+  // Who does an action: my name, not "You", so "Alex waves" reads as a sentence.
+  const actorOf = (author: string) => (author === myId ? myName : nameOf(author))
   // Picking my current reaction again takes it back.
   const react = (emoji: string) =>
     void run(api.react(refOf(message), emoji === myReaction ? '' : emoji))
@@ -444,7 +446,7 @@ const Row = memo(function Row({
         <Linkified text={message.text} />
       ) : (
         <span className="italic">
-          <span className="font-semibold not-italic">{mine ? myName : nameOf(message.author)}</span>{' '}
+          <span className="font-semibold not-italic">{actorOf(message.author)}</span>{' '}
           <Linkified text={action} />
         </span>
       )}
@@ -475,6 +477,7 @@ const Row = memo(function Row({
                 <QuoteButton
                   quote={message.reply_to}
                   name={nameOf(message.reply_to.author)}
+                  actor={actorOf(message.reply_to.author)}
                   onJump={onJump}
                 />
               )}
@@ -576,10 +579,13 @@ function jumpToQuote(quote: Quote) {
 function QuoteButton({
   quote,
   name,
+  actor,
   onJump,
 }: {
   quote: Quote
   name: string
+  /** Its author as an action names them: my name rather than "You". */
+  actor: string
   onJump: (quote: Quote) => void
 }) {
   return (
@@ -589,7 +595,7 @@ function QuoteButton({
       onClick={() => onJump(quote)}
     >
       <span className="font-medium">{name}</span>
-      <span className="line-clamp-2 opacity-80">{summaryOf(quote)}</span>
+      <span className="line-clamp-2 opacity-80">{summaryOf(quote, actor)}</span>
     </button>
   )
 }
@@ -726,7 +732,7 @@ function Composer() {
   const textRef = useRef<HTMLTextAreaElement>(null)
   const typingSentRef = useRef(0)
   const { scrollToEnd } = useMessageScroller()
-  const { replyingTo, editing, peerName, myId, away, dndUntil, staged, hint } = useSelector(
+  const { replyingTo, editing, peerName, myId, myName, away, dndUntil, staged, hint } = useSelector(
     store,
     (s) => ({
       hint: s.hint,
@@ -734,6 +740,7 @@ function Composer() {
       editing: s.editing,
       peerName: s.status?.peer?.name || 'them',
       myId: s.status?.me.id ?? '',
+      myName: s.status?.me.name || 'You',
       away: s.status?.away ? (s.status.away.note ?? '') : null,
       dndUntil: s.status?.dnd_until ?? null,
       staged: s.staged.length,
@@ -1001,7 +1008,7 @@ function Composer() {
               Replying to {replyingTo.author === myId ? 'yourself' : peerName}
             </div>
             <div className="truncate text-muted-foreground">
-              {replyingTo.text || (replyingTo.file && describeFile(replyingTo.file))}
+              {summaryOf(replyingTo, replyingTo.author === myId ? myName : peerName)}
             </div>
           </div>
           <Button
