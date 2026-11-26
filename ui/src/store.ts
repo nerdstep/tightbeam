@@ -256,7 +256,7 @@ export async function reveal(target: Cursor) {
     // Against the latest transcript, in case a page of older messages arrived meanwhile.
     store.setState((s) => ({ ...s, transcript: transcript.fill(s.transcript, missing ?? []) }))
   }
-  const at = { author: target.author, seq: target.seq }
+  const at = transcript.refOf(target)
   store.setState((s) => ({ ...s, jump: { at, n: ++jumps } }))
 }
 

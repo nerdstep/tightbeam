@@ -13,6 +13,7 @@ import {
   targetOf,
   messageKey,
   prepend,
+  refOf,
   update,
 } from './transcript'
 
@@ -56,6 +57,12 @@ describe('display order', () => {
     const shuffled = [order[3], order[1], order[0], order[2]]
     // oxlint-disable-next-line unicorn/no-array-sort -- a fresh array
     expect(shuffled.sort(compare)).toEqual(order)
+  })
+})
+
+describe('refs', () => {
+  test('carry only the author and number, as commands take them', () => {
+    expect(refOf(msg('a', 7, 3, { text: 'hi' }))).toEqual({ author: 'a', seq: 7 })
   })
 })
 
