@@ -3,12 +3,13 @@
 
 import { shallow, useSelector } from '@tanstack/react-store'
 import { SearchIcon, XIcon } from 'lucide-react'
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 
 import type { Hit } from '@/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Spinner } from '@/components/ui/spinner'
+import { namer, peopleKey } from '@/people'
 import { actionInSnippet } from '@/reading'
 import { closeSearch, reveal, setSearchActive, setSearchQuery, store } from '@/store'
 import { messageKey } from '@/transcript'
@@ -70,15 +71,22 @@ export function SearchBar() {
 }
 
 export function SearchResults() {
-  const { search, myId, myName, peerName } = useSelector(
+  const { search, myId, myName, peerName, people } = useSelector(
     store,
     (s) => ({
       search: s.search,
       myId: s.status?.me.id ?? '',
       myName: s.status?.me.name || 'You',
       peerName: s.status?.peer?.name || 'Them',
+      people: peopleKey(s.status?.people),
     }),
     { compare: shallow },
+  )
+  // A match from someone I was paired with before names them, as the transcript does.
+  const nameOf = useMemo(() => namer(people, myId, peerName), [people, myId, peerName])
+  const actorOf = useMemo(
+    () => namer(people, myId, peerName, myName),
+    [people, myId, peerName, myName],
   )
   const listRef = useRef<HTMLUListElement>(null)
   const active = search?.active ?? 0
@@ -110,11 +118,11 @@ export function SearchResults() {
                 >
                   <div className="flex items-baseline justify-between gap-3 text-xs text-muted-foreground">
                     <span className="font-medium text-foreground">
-                      {hit.message.author === myId ? 'You' : peerName}
+                      {nameOf(hit.message.author)}
                     </span>
                     <span>{when(hit.message.ts)}</span>
                   </div>
-                  <Snippet hit={hit} actor={hit.message.author === myId ? myName : peerName} />
+                  <Snippet hit={hit} actor={actorOf(hit.message.author)} />
                 </button>
               </li>
             ))}
